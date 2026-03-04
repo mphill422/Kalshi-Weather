@@ -1,178 +1,158 @@
-
-import streamlit as st
 import requests
-import pandas as pd
+import streamlit as st
 from datetime import datetime
+from math import floor
 
 st.set_page_config(page_title="Kalshi Weather Trading Dashboard", layout="centered")
 
-st.title("Kalshi Weather Trading Dashboard")
-
-# --- City list (you can add more later) ---
+# --- Cities (add/remove here) ---
 CITIES = {
-    "Austin":  (30.2672, -97.7431),
-    "Dallas":  (32.7767, -96.7970),
-    "Houston": (29.7604, -95.3698),
-    "Phoenix": (33.4484, -112.0740),
+    "Austin, TX": {"lat": 30.2672, "lon": -97.7431},
+    "Dallas, TX": {"lat": 32.7767, "lon": -96.7970},
+    "Houston, TX": {"lat": 29.7604, "lon": -95.3698},
+    "Phoenix, AZ": {"lat": 33.4484, "lon": -112.0740},
+    "Las Vegas, NV": {"lat": 36.1699, "lon": -115.1398},
 }
 
-# Open-Meteo supports multiple forecast models. Using a small set gives you a simple "range".
-# If a model isn't available for your location/time, we gracefully fall back.
-MODELS = ["gfs_seamless", "ecmwf_ifs04", "gem_seamless"]  # keep as-is for now
+OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
 
+def f_to_display(x):
+    return f"{x:.1f}" if isinstance(x, (int, float)) else "—"
 
-def fetch_open_meteo(lat: float, lon: float, model: str | None = None) -> dict:
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "timezone": "auto",
-        "temperature_unit": "fahrenheit",
-        "wind_speed_unit": "mph",
-        # hourly temps so we can find "peak time"
-        "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m",
-        # daily max/min is handy for quick display
-        "daily": "temperature_2m_max,temperature_2m_min",
-        "forecast_days": 7,
-    }
-    if model:
-        params["models"] = model
-
-    r = requests.get(url, params=params, timeout=20)
+def safe_get(url, params):
+    r = requests.get(url, params=params, timeout=12)
     r.raise_for_status()
     return r.json()
 
+def suggested_bracket(temp_f, bracket_size):
+    """
+    Example:
+      temp_f=83.2, bracket_size=2 -> 82–83 or 84–85 depending on convention.
+    We'll use inclusive ranges like:
+      82–83, 84–85, etc. (size 2)
+    """
+    # Convert to integer-ish for bracketing
+    t = float(temp_f)
 
-def to_hourly_df(data: dict) -> pd.DataFrame:
-    h = data.get("hourly", {})
-    df = pd.DataFrame({
-        "time": pd.to_datetime(h.get("time", [])),
-        "temp_f": h.get("temperature_2m", []),
-        "humidity": h.get("relative_humidity_2m", []),
-        "wind_mph": h.get("wind_speed_10m", []),
-    })
-    if df.empty:
-        return df
-    df["date"] = df["time"].dt.date
-    return df
+    if bracket_size == 1:
+        lo = floor(t)
+        hi = lo
+    else:
+        lo = int(floor(t / bracket_size) * bracket_size)
+        hi = lo + (bracket_size - 1)
 
+    return lo, hi
 
-def to_daily_df(data: dict) -> pd.DataFrame:
-    d = data.get("daily", {})
-    df = pd.DataFrame({
-        "date": pd.to_datetime(d.get("time", [])).dt.date,
-        "tmax_f": d.get("temperature_2m_max", []),
-        "tmin_f": d.get("temperature_2m_min", []),
-    })
-    return df
-
-
-def safe_fetch_models(lat: float, lon: float) -> dict:
-    """Try multiple models; if some fail, keep the ones that work."""
-    results = {}
-    for m in MODELS:
-        try:
-            results[m] = fetch_open_meteo(lat, lon, model=m)
-        except Exception:
-            continue
-
-    # Fallback: at least try default (no model specified)
-    if not results:
-        results["default"] = fetch_open_meteo(lat, lon, model=None)
-
-    return results
-
-
-# --- UI ---
-city = st.selectbox("Select City", list(CITIES.keys()))
-lat, lon = CITIES[city]
-
-with st.spinner("Fetching forecast models (no API key)…"):
-    model_payloads = safe_fetch_models(lat, lon)
-
-# Build per-model daily highs from HOURLY data (better peak time + consistency)
-per_model = {}
-for model_name, payload in model_payloads.items():
-    hourly_df = to_hourly_df(payload)
-    if hourly_df.empty:
-        continue
-    # daily high from hourly temps
-    daily_highs = (
-        hourly_df.groupby("date")["temp_f"]
-        .max()
-        .rename("high_f")
-        .reset_index()
-    )
-    per_model[model_name] = {
-        "hourly": hourly_df,
-        "daily_highs": daily_highs,
-        "daily": to_daily_df(payload),
+def get_forecast(lat, lon):
+    # Daily high (temperature_2m_max) + hourly temps to estimate peak hour
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "temperature_2m_max",
+        "hourly": "temperature_2m",
+        "temperature_unit": "fahrenheit",
+        "wind_speed_unit": "mph",
+        "timezone": "auto",
+        "forecast_days": 2,
     }
+    return safe_get(OPEN_METEO_BASE, params=params)
 
-if not per_model:
-    st.error("Could not fetch forecast data right now.")
-    st.stop()
+def today_peak_hour(hourly_times, hourly_temps, today_str):
+    # Find max temp for entries whose date matches today_str (YYYY-MM-DD)
+    best_temp = None
+    best_time = None
+    for t, temp in zip(hourly_times, hourly_temps):
+        # t format: "2026-03-04T14:00"
+        if t.startswith(today_str):
+            if best_temp is None or temp > best_temp:
+                best_temp = temp
+                best_time = t
+    return best_time, best_temp
 
-# Choose available dates from the first model we have
-first_model = next(iter(per_model.keys()))
-available_dates = per_model[first_model]["daily_highs"]["date"].tolist()
+st.title("Kalshi Weather Trading Dashboard")
 
-selected_date = st.selectbox("Forecast day (local time)", available_dates)
+city_name = st.selectbox("Select City", list(CITIES.keys()))
+bracket_size = st.selectbox("Kalshi bracket size (°F)", [1, 2, 3, 5], index=1)
 
-# Compute daily-high range across models
-highs = []
-for model_name, data in per_model.items():
-    row = data["daily_highs"].loc[data["daily_highs"]["date"] == selected_date]
-    if not row.empty:
-        highs.append(float(row["high_f"].iloc[0]))
+lat = CITIES[city_name]["lat"]
+lon = CITIES[city_name]["lon"]
 
-if not highs:
-    st.error("No forecast highs available for that day.")
-    st.stop()
+st.caption("Source: Open-Meteo (no key)")
 
-low_est = min(highs)
-high_est = max(highs)
-median_est = sorted(highs)[len(highs)//2]
+with st.spinner(f"Fetching forecast for {city_name}..."):
+    try:
+        payload = get_forecast(lat, lon)
 
-# Peak time: use the first model’s hourly temps for the selected date
-hdf = per_model[first_model]["hourly"]
-day_rows = hdf[hdf["date"] == selected_date].copy()
-peak_time_str = "N/A"
-if not day_rows.empty:
-    peak_idx = day_rows["temp_f"].astype(float).idxmax()
-    peak_time = day_rows.loc[peak_idx, "time"]
-    peak_time_str = peak_time.strftime("%-I:%M %p")
+        # Daily high for "today" is the first element of daily arrays
+        daily = payload.get("daily", {})
+        daily_times = daily.get("time", [])
+        daily_max = daily.get("temperature_2m_max", [])
 
-# "Suggested Kalshi range" — simple band you can use for bracket/strike thinking
-# Round outward to whole degrees.
-suggest_low = int(pd.Series([low_est]).apply(lambda x: int(x // 1)).iloc[0])
-suggest_high = int(pd.Series([high_est]).apply(lambda x: int(x // 1 + (1 if x % 1 else 0))).iloc[0])
+        if not daily_times or not daily_max:
+            st.error("Could not read daily forecast from Open-Meteo.")
+            st.stop()
 
-# --- Display ---
-st.caption(f"Source: Open-Meteo (no key). Models used: {', '.join(per_model.keys())}")
+        today_str = daily_times[0]  # YYYY-MM-DD
+        predicted_high = float(daily_max[0])
 
-st.subheader("Daily High Prediction")
-st.metric("Predicted High (median of models)", f"{median_est:.1f} °F")
-st.write(f"**Model range:** {low_est:.1f}–{high_est:.1f} °F")
-st.write(f"**Estimated peak temperature time:** {peak_time_str} (local time)")
+        # Hourly peak time estimate (today)
+        hourly = payload.get("hourly", {})
+        hourly_times = hourly.get("time", [])
+        hourly_temps = hourly.get("temperature_2m", [])
 
-st.subheader("Suggested Kalshi range band (simple)")
-st.write(
-    f"Use this as a practical band for the day’s high: **{suggest_low}–{suggest_high} °F** "
-    f"(rounded outward from the model range)."
-)
+        peak_time_raw, peak_temp = today_peak_hour(hourly_times, hourly_temps, today_str)
 
-st.caption(
-    "Tip: If Kalshi uses threshold markets (e.g., ‘High ≥ X’), values well below the band’s low usually mean ‘lean YES’; "
-    "values well above the band’s high usually mean ‘lean NO’. If X is inside the band, it’s closer/coin-flip territory."
-)
+        # Format peak time nicely
+        peak_time_display = "—"
+        if peak_time_raw:
+            # "YYYY-MM-DDTHH:MM"
+            dt = datetime.fromisoformat(peak_time_raw)
+            peak_time_display = dt.strftime("%-I:%M %p") if hasattr(dt, "strftime") else str(dt)
 
-# Optional: show the model highs table
-st.subheader("Per-model highs (for transparency)")
-rows = []
-for model_name, data in per_model.items():
-    row = data["daily_highs"].loc[data["daily_highs"]["date"] == selected_date]
-    if not row.empty:
-        rows.append({"model": model_name, "high_f": float(row["high_f"].iloc[0])})
-if rows:
-    st.dataframe(pd.DataFrame(rows).sort_values("high_f"), use_container_width=True)
+        # Suggested Kalshi bracket
+        lo, hi = suggested_bracket(predicted_high, bracket_size)
+
+        st.subheader(city_name)
+
+        col1, col2 = st.columns(2)
+        col1.metric("Predicted Daily High (°F)", f_to_display(predicted_high))
+        col2.metric("Estimated Peak Time", peak_time_display)
+
+        st.markdown("---")
+
+        st.subheader("Suggested Kalshi Range (Daily High)")
+        if bracket_size == 1:
+            st.write(f"**{lo}°F**")
+        else:
+            st.write(f"**{lo}–{hi}°F**")
+
+        # Add a small “buffer” idea without pretending certainty
+        st.caption(
+            "Tip: If the market offers adjacent brackets, consider watching the neighboring range(s) "
+            "because forecasts can drift."
+        )
+
+        # Optional: show “neighbor” brackets for quick decision-making
+        st.markdown("**Nearby ranges to watch:**")
+        if bracket_size == 1:
+            st.write(f"- {lo-1}°F")
+            st.write(f"- {lo}°F (current)")
+            st.write(f"- {lo+1}°F")
+        else:
+            prev_lo, prev_hi = lo - bracket_size, (lo - 1)
+            next_lo, next_hi = hi + 1, hi + bracket_size
+            st.write(f"- {prev_lo}–{prev_hi}")
+            st.write(f"- {lo}–{hi} (current)")
+            st.write(f"- {next_lo}–{next_hi}")
+
+        st.markdown("---")
+        with st.expander("See raw forecast numbers"):
+            st.write(f"Forecast date (today): {today_str}")
+            st.write(f"Daily max (today): {predicted_high}")
+            if peak_temp is not None:
+                st.write(f"Peak hour temp (today): {peak_temp} at {peak_time_raw}")
+
+    except Exception as e:
+        st.error("Could not fetch weather data right now.")
+        st.caption("If this keeps happening: Manage app → Logs to see details.")
+        st.caption(f"Debug info: {type(e).__name__}")
