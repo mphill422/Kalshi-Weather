@@ -29,6 +29,7 @@ def fetch_open_meteo(lat: float, lon: float) -> dict:
         "latitude": lat,
         "longitude": lon,
         "timezone": "auto",
+        "temperature_unit": "fahrenheit",
         "current": "temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m",
         "hourly": "temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m",
         "daily": "temperature_2m_max,temperature_2m_min",
