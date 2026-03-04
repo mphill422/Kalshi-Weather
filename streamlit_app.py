@@ -1,38 +1,4 @@
-import math
-import time
-from datetime import datetime, timedelta, timezone
 
-import pandas as pd
-import requests
-import streamlit as st
-
-# =========================
-# Ultra-stable Kalshi Weather Dashboard
-# - No geocoding (hardcoded lat/lon)
-# - Robust Open-Meteo + optional Open-Meteo GFS
-# - Robust NWS with fallbacks + proper User-Agent
-# - Kalshi bracket alignment helper (even-start vs odd-start)
-# - Probability ladder (normal approx based on model spread)
-# - Peak-time heat spike detector (current vs forecast curve)
-# =========================
-
-st.set_page_config(page_title="Kalshi Weather Trading Dashboard", layout="centered")
-
-# ----------- City list (no geocoding) -----------
-CITIES = {
-    # Core
-    "Austin, TX": (30.2672, -97.7431),
-    "Dallas, TX": (32.7767, -96.7970),
-    "Houston, TX": (29.7604, -95.3698),
-    "Phoenix, AZ": (33.4484, -112.0740),
-    # Added
-    "New York City, NY": (40.7128, -74.0060),
-    "Atlanta, GA": (33.7490, -84.3880),
-    "Miami, FL": (25.7617, -80.1918),
-    "New Orleans, LA": (29.9511, -90.0715),
-    "San Antonio, TX": (29.4241, -98.4936),
-    "Los Angeles, CA": (34.0522, -118.2437),
-}
 
 DEFAULT_CITY = "Austin, TX"
 
