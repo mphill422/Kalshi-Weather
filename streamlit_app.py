@@ -1,4 +1,3 @@
-
 import streamlit as st
 import requests
 
@@ -13,13 +12,18 @@ st.write(f"Fetching weather data for {city}...")
 
 url = f"https://wttr.in/{city}?format=j1"
 
-response = requests.get(url)
-data = response.json()
+try:
+    response = requests.get(url, timeout=10)
+    data = response.json()
 
-temp = data["current_condition"][0]["temp_F"]
-humidity = data["current_condition"][0]["humidity"]
+    temp = data["current_condition"][0]["temp_F"]
+    humidity = data["current_condition"][0]["humidity"]
 
-st.metric("Current Temperature (°F)", temp)
-st.metric("Humidity (%)", humidity)
+    st.metric("Current Temperature (°F)", temp)
+    st.metric("Humidity (%)", humidity)
 
-st.write("Weather data source: wttr.in")
+    st.write("Weather data source: wttr.in")
+
+except Exception as e:
+    st.error("Could not fetch weather data right now.")
+    st.write("This usually happens if the external weather API blocks the request.")
