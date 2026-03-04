@@ -3,27 +3,26 @@ import requests
 
 st.title("Kalshi Weather Trading Dashboard")
 
-city = st.selectbox(
-    "Select City",
-    ["Austin", "Dallas", "Houston", "Phoenix", "Las Vegas"]
-)
+cities = {
+    "Austin": (30.27, -97.74),
+    "Dallas": (32.78, -96.80),
+    "Houston": (29.76, -95.37),
+    "Phoenix": (33.45, -112.07)
+}
 
-st.write(f"Fetching weather data for {city}...")
+city = st.selectbox("Select City", list(cities.keys()))
 
-url = f"https://wttr.in/{city}?format=j1"
+lat, lon = cities[city]
+
+url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m&temperature_unit=fahrenheit"
 
 try:
-    response = requests.get(url, timeout=10)
+    response = requests.get(url)
     data = response.json()
 
-    temp = data["current_condition"][0]["temp_F"]
-    humidity = data["current_condition"][0]["humidity"]
+    temp = data["current"]["temperature_2m"]
 
     st.metric("Current Temperature (°F)", temp)
-    st.metric("Humidity (%)", humidity)
 
-    st.write("Weather data source: wttr.in")
-
-except Exception as e:
-    st.error("Could not fetch weather data right now.")
-    st.write("This usually happens if the external weather API blocks the request.")
+except:
+    st.error("Weather data not available right now")
