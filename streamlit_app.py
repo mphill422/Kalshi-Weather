@@ -11,13 +11,13 @@ import streamlit as st
 # ----------------------------
 st.set_page_config(page_title="Kalshi Weather MVP", layout="wide")
 
-APP_TITLE = "Kalshi Weather MVP – Daily High (Multi-Source)"
+APP_TITLE = "Kalshi Weather MVP – Daily High (Multi-Source) [Upgraded]"
 st.title(APP_TITLE)
 
-USER_AGENT = "kalshi-weather-mvp/1.0 (contact: none)"
+USER_AGENT = "kalshi-weather-mvp/1.1 (contact: none)"
 REQ_TIMEOUT = 12
 
-# Cities you requested + the core ones we’ve used
+# Cities
 CITIES = {
     "Miami": {"lat": 25.7617, "lon": -80.1918, "tz": "America/New_York"},
     "New York City": {"lat": 40.7128, "lon": -74.0060, "tz": "America/New_York"},
@@ -63,8 +63,6 @@ def today_local(tz_name: str) -> date:
 
 def parse_iso_to_local_dt(ts: str, tz_name: str) -> datetime | None:
     try:
-        # Open-Meteo returns ISO without offset when timezone parameter is used.
-        # Example: "2026-03-05T13:00"
         dt = datetime.fromisoformat(ts)
         return dt.replace(tzinfo=ZoneInfo(tz_name))
     except Exception:
@@ -72,39 +70,68 @@ def parse_iso_to_local_dt(ts: str, tz_name: str) -> datetime | None:
 
 
 def round_bracket_label(low: int, size: int) -> str:
-    return f"{low}–{low + size}"
+    # Inclusive bracket label (size=2 -> low–low+1)
+    return f"{low}–{low + size - 1}"
 
 
 def normal_cdf(x: float) -> float:
-    # Standard normal CDF approximation via erf
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
 
 
-def bracket_probability(mean: float, sigma: float, low: float, high: float) -> float:
+def bracket_probability_inclusive(mean: float, sigma: float, low: float, high_inclusive: float) -> float:
+    """
+    P(low <= X <= high_inclusive) for Normal(mean, sigma).
+    For integer brackets, use CDF(high+0.5)-CDF(low-0.5) to match discrete degree rounding.
+    """
     if sigma <= 1e-9:
-        return 1.0 if (low <= mean < high) else 0.0
-    z1 = (low - mean) / sigma
-    z2 = (high - mean) / sigma
+        return 1.0 if (low <= mean <= high_inclusive) else 0.0
+
+    z1 = ((low - 0.5) - mean) / sigma
+    z2 = ((high_inclusive + 0.5) - mean) / sigma
     return max(0.0, min(1.0, normal_cdf(z2) - normal_cdf(z1)))
 
 
-def compute_sigma(source_highs: list[float]) -> float:
+def compute_sigma_from_spread(source_highs: list[float]) -> float:
     """
-    We want something stable, not overconfident:
-    - base sigma ~ 1.6°F
-    - plus 0.55 * (spread across sources)
+    Better behaved sigma:
+      sigma = max(fallback, spread/3) with clamps
     """
+    fallback = 2.2
     if not source_highs:
-        return 2.5
-    spread = max(source_highs) - min(source_highs) if len(source_highs) >= 2 else 0.0
-    return max(1.4, 1.6 + 0.55 * spread)
+        return fallback
+    if len(source_highs) < 2:
+        return fallback
+    spread = max(source_highs) - min(source_highs)
+    sigma = max(fallback, spread / 3.0)
+    return max(1.0, min(6.0, sigma))
+
+
+def daytime_filter(df: pd.DataFrame, start_hour: int, end_hour: int) -> pd.DataFrame:
+    """Keep only rows in local daytime hours."""
+    if df is None or df.empty:
+        return df
+    return df[(df["dt"].dt.hour >= start_hour) & (df["dt"].dt.hour <= end_hour)].copy()
+
+
+def heating_rate_f_per_hr(hourly_df: pd.DataFrame, now_local: datetime, lookback_minutes: int = 90) -> float | None:
+    if hourly_df is None or hourly_df.empty:
+        return None
+    cutoff = now_local - timedelta(minutes=lookback_minutes)
+    df = hourly_df[(hourly_df["dt"] >= cutoff) & (hourly_df["dt"] <= now_local)].copy()
+    if df.shape[0] < 2:
+        return None
+    df = df.sort_values("dt")
+    t0, t1 = df.iloc[0], df.iloc[-1]
+    dt_hours = (t1["dt"] - t0["dt"]).total_seconds() / 3600.0
+    if dt_hours <= 0:
+        return None
+    return float((t1["temp_f"] - t0["temp_f"]) / dt_hours)
 
 
 # ----------------------------
 # Data Sources
 # ----------------------------
 def fetch_open_meteo(lat: float, lon: float, tz: str, model: str | None = None) -> dict:
-    # temperature_unit=fahrenheit makes all temps °F.
     base = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
@@ -115,12 +142,8 @@ def fetch_open_meteo(lat: float, lon: float, tz: str, model: str | None = None) 
         f"&forecast_days=2"
     )
     if model:
-        # Open-Meteo supports a 'models=' parameter for some backends.
-        # If it fails, we catch it gracefully.
         base += f"&models={model}"
-
-    j = http_get_json(base)
-    return j
+    return http_get_json(base)
 
 
 def extract_open_meteo_today(j: dict, tz: str) -> tuple[float | None, pd.DataFrame | None, str | None]:
@@ -135,17 +158,13 @@ def extract_open_meteo_today(j: dict, tz: str) -> tuple[float | None, pd.DataFra
             return None, None, "Open-Meteo missing daily high fields"
 
         t0 = today_local(tz).isoformat()
-
-        # Find today's index
-        idx = 0
-        if t0 in daily_time:
-            idx = daily_time.index(t0)
-
+        idx = daily_time.index(t0) if t0 in daily_time else 0
         daily_high = safe_float(highs[idx])
 
         hourly = j.get("hourly", {})
         ht = hourly.get("time", [])
         temps = hourly.get("temperature_2m", [])
+        df = None
         if ht and temps and len(ht) == len(temps):
             rows = []
             for ts, temp in zip(ht, temps):
@@ -154,10 +173,7 @@ def extract_open_meteo_today(j: dict, tz: str) -> tuple[float | None, pd.DataFra
                     continue
                 rows.append({"dt": dt, "temp_f": safe_float(temp)})
             df = pd.DataFrame(rows).dropna()
-        else:
-            df = None
 
-        # Keep only today's hours
         if df is not None and not df.empty:
             tday = today_local(tz)
             df = df[df["dt"].dt.date == tday].copy()
@@ -171,8 +187,8 @@ def extract_open_meteo_today(j: dict, tz: str) -> tuple[float | None, pd.DataFra
 
 def fetch_nws_hourly_high(lat: float, lon: float, tz: str) -> tuple[float | None, pd.DataFrame | None, str | None]:
     """
-    NWS: points -> forecastHourly (periods)
-    We'll compute today's max temperature from the hourly forecast periods (°F).
+    NWS: points -> forecastHourly (periods).
+    IMPORTANT FIX: compute today's HIGH using *daytime hours only* to avoid weird late selections.
     """
     try:
         points_url = f"https://api.weather.gov/points/{lat},{lon}"
@@ -180,8 +196,7 @@ def fetch_nws_hourly_high(lat: float, lon: float, tz: str) -> tuple[float | None
         if not p or "__error__" in p:
             return None, None, f"NWS points error: {p.get('__error__')}"
 
-        props = p.get("properties", {})
-        hourly_url = props.get("forecastHourly")
+        hourly_url = (p.get("properties", {}) or {}).get("forecastHourly")
         if not hourly_url:
             return None, None, "NWS missing forecastHourly URL"
 
@@ -200,11 +215,9 @@ def fetch_nws_hourly_high(lat: float, lon: float, tz: str) -> tuple[float | None
             unit = per.get("temperatureUnit")
 
             if unit and unit.upper() != "F":
-                # We only handle F reliably; skip otherwise
                 continue
 
             try:
-                # NWS is offset-aware ISO
                 dt = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(ZoneInfo(tz))
             except Exception:
                 continue
@@ -215,12 +228,18 @@ def fetch_nws_hourly_high(lat: float, lon: float, tz: str) -> tuple[float | None
         if df.empty:
             return None, None, "NWS hourly parse produced no rows"
 
-        # Today's max
         tday = today_local(tz)
         df_today = df[df["dt"].dt.date == tday].copy()
         if df_today.empty:
-            return None, None, "NWS hourly has no rows for today (maybe too late/early)"
+            return None, None, "NWS hourly has no rows for today"
 
+        # Daytime-only max (fix)
+        df_day = daytime_filter(df_today, 10, 18)
+        if df_day is not None and not df_day.empty:
+            daily_high = float(df_day["temp_f"].max())
+            return daily_high, df_today, None
+
+        # Fallback: if daytime missing, use full day
         daily_high = float(df_today["temp_f"].max())
         return daily_high, df_today, None
 
@@ -242,7 +261,7 @@ tz = info["tz"]
 
 controls = st.expander("Settings", expanded=True)
 with controls:
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         use_gfs = st.toggle("Include Open-Meteo GFS model (extra check)", value=False)
     with col2:
@@ -251,6 +270,17 @@ with controls:
         bracket_size = st.selectbox("Kalshi bracket size (°F)", [1, 2], index=0)
     with col4:
         grace_minutes = st.slider("Grace minutes after 10:30 local", min_value=0, max_value=120, value=45, step=5)
+    with col5:
+        use_nowcast = st.toggle("Use nowcast (heating-rate adjustment)", value=True)
+
+    # weights (sane defaults)
+    wcol1, wcol2, wcol3 = st.columns(3)
+    with wcol1:
+        w_open = st.slider("Weight Open-Meteo", 0.0, 1.0, 0.55, 0.05)
+    with wcol2:
+        w_nws = st.slider("Weight NWS", 0.0, 1.0, 0.30, 0.05)
+    with wcol3:
+        w_gfs = st.slider("Weight GFS", 0.0, 1.0, 0.15, 0.05)
 
     lock_time_local = time(10, 30)
 
@@ -258,20 +288,16 @@ with controls:
 # Fetch + Compute
 # ----------------------------
 with st.spinner("Fetching forecasts…"):
-    # Open-Meteo default
     om = fetch_open_meteo(info["lat"], info["lon"], tz, model=None)
     om_high, om_hourly, om_err = extract_open_meteo_today(om, tz)
 
-    # Open-Meteo GFS (optional)
     gfs_high = None
     gfs_hourly = None
     gfs_err = None
     if use_gfs:
-        # model name can vary; gfs_seamless is commonly supported by Open-Meteo
         om_gfs = fetch_open_meteo(info["lat"], info["lon"], tz, model="gfs_seamless")
         gfs_high, gfs_hourly, gfs_err = extract_open_meteo_today(om_gfs, tz)
 
-    # NWS (optional)
     nws_high = None
     nws_hourly = None
     nws_err = None
@@ -303,41 +329,122 @@ st.subheader(f"{city} – Today’s High Forecasts (°F)")
 st.table(pd.DataFrame(status_rows, columns=["Source", "Today High", "Status"]))
 
 # ----------------------------
-# Consensus + Suggested bracket
+# Weighted consensus + sigma
 # ----------------------------
-source_highs = [x for x in [om_high, gfs_high, nws_high] if isinstance(x, (int, float)) and x is not None]
-if not source_highs:
+vals = []
+wts = []
+if om_high is not None:
+    vals.append(float(om_high)); wts.append(w_open)
+if gfs_high is not None and use_gfs:
+    vals.append(float(gfs_high)); wts.append(w_gfs)
+if nws_high is not None and use_nws:
+    vals.append(float(nws_high)); wts.append(w_nws)
+
+if not vals:
     st.error("No valid sources returned a high for today. Try again, or toggle off a failing source.")
     st.stop()
 
-consensus = float(sum(source_highs) / len(source_highs))
-sigma = compute_sigma(source_highs)
+wsum = sum(wts) if sum(wts) > 0 else len(wts)
+consensus = float(sum(v * w for v, w in zip(vals, wts)) / wsum)
 
-spread = max(source_highs) - min(source_highs) if len(source_highs) > 1 else 0.0
+source_highs = vals[:]  # for spread/sigma
+spread = (max(source_highs) - min(source_highs)) if len(source_highs) > 1 else 0.0
+sigma = compute_sigma_from_spread(source_highs)
 
 c1, c2, c3 = st.columns(3)
-c1.metric("Consensus high", f"{consensus:.1f}°F")
+c1.metric("Weighted consensus high", f"{consensus:.1f}°F")
 c2.metric("Cross-source spread", f"{spread:.1f}°F")
 c3.metric("Model uncertainty (σ)", f"{sigma:.2f}°F")
 
-# Build candidate brackets around consensus
-# We test +/- 6°F around the rounded consensus to find the max-prob bracket.
-center = int(round(consensus))
+# ----------------------------
+# Hourly curve + peak + nowcast
+# ----------------------------
+now_local = datetime.now(ZoneInfo(tz))
+
+hourly_source_name = None
+hourly_df = None
+if om_hourly is not None and not om_hourly.empty:
+    hourly_df = om_hourly.sort_values("dt")
+    hourly_source_name = "Open-Meteo"
+elif nws_hourly is not None and not nws_hourly.empty:
+    hourly_df = nws_hourly.sort_values("dt")
+    hourly_source_name = "NWS"
+
+peak_time = None
+peak_temp = None
+max_so_far = None
+now_temp = None
+rate = None
+
+if hourly_df is not None and not hourly_df.empty:
+    st.subheader("Hourly temperature curve (today)")
+    st.caption(f"Hourly source used: {hourly_source_name}")
+    st.line_chart(hourly_df.set_index("dt")["temp_f"])
+
+    # Daytime peak (fix): restrict to 10am–6pm local for peak time
+    df_day = daytime_filter(hourly_df, 10, 18)
+    df_peak = df_day if df_day is not None and not df_day.empty else hourly_df
+    idx = df_peak["temp_f"].idxmax()
+    peak_row = df_peak.loc[idx]
+    peak_time = peak_row["dt"]
+    peak_temp = float(peak_row["temp_f"])
+
+    # current-ish temp from nearest hour <= now
+    df_past = hourly_df[hourly_df["dt"] <= now_local]
+    if not df_past.empty:
+        now_temp = float(df_past.sort_values("dt").iloc[-1]["temp_f"])
+        max_so_far = float(df_past["temp_f"].max())
+
+    rate = heating_rate_f_per_hr(hourly_df, now_local, lookback_minutes=90)
+
+    st.write(
+        f"Peak hour (daytime-filtered): **{peak_time.strftime('%I:%M %p')}** at **{peak_temp:.1f}°F**"
+    )
+
+# Apply nowcast shift to consensus mean
+mu = consensus
+nowcast_peak = None
+if use_nowcast and (now_temp is not None) and (rate is not None) and (peak_time is not None):
+    # hours until expected peak, clipped
+    hours_to_peak = (peak_time - now_local).total_seconds() / 3600.0
+    if hours_to_peak > 0:
+        # cap heating rate to avoid crazy spikes
+        rate_capped = max(-2.0, min(6.0, rate))
+        nowcast_peak = now_temp + rate_capped * hours_to_peak
+        if max_so_far is not None:
+            nowcast_peak = max(nowcast_peak, max_so_far)
+
+        # blend (30% nowcast)
+        mu = 0.70 * consensus + 0.30 * nowcast_peak
+
+if nowcast_peak is not None:
+    st.info(f"Nowcast peak estimate: **{nowcast_peak:.1f}°F** → blended mean used: **{mu:.1f}°F**")
+
+# ----------------------------
+# Suggested bracket (FIXED)
+# ----------------------------
+# Build candidate brackets around mu (mean)
+center = int(round(mu))
 candidates = []
 for low in range(center - 6, center + 7):
-    high = low + bracket_size
-    p = bracket_probability(consensus, sigma, low, high)
+    high = low + bracket_size - 1  # inclusive high
+    p = bracket_probability_inclusive(mu, sigma, low, high)
     candidates.append((low, high, p))
 
-best = max(candidates, key=lambda x: x[2])
-best_low, best_high, best_p = best
+best_low, best_high, best_p = max(candidates, key=lambda x: x[2])
 
-st.success(
-    f"Suggested Kalshi bracket: **{round_bracket_label(best_low, bracket_size)}**  "
+# Boundary warning
+boundary_warn = (abs(mu - best_low) < 0.7) or (abs(mu - best_high) < 0.7)
+
+msg = (
+    f"Suggested Kalshi bracket: **{best_low}–{best_high}**  "
     f"(model probability ≈ **{best_p*100:.0f}%**)"
 )
+if boundary_warn:
+    st.warning(msg + "  ⚠ **Near bracket boundary** (high variance) — size down or wait for more data.")
+else:
+    st.success(msg)
 
-# Show top 5 brackets for context (so you can see hedges if needed)
 top5 = sorted(candidates, key=lambda x: x[2], reverse=True)[:5]
 top_df = pd.DataFrame(
     [{"Bracket": f"{lo}–{hi}", "Model Prob %": round(p*100, 1)} for lo, hi, p in top5]
@@ -348,11 +455,10 @@ st.dataframe(top_df, use_container_width=True, hide_index=True)
 # ----------------------------
 # Timing / Decision window
 # ----------------------------
-now_local = datetime.now(ZoneInfo(tz))
+st.subheader("Decision Window")
 lock_dt = datetime.combine(now_local.date(), lock_time_local, tzinfo=ZoneInfo(tz))
 deadline_dt = lock_dt + timedelta(minutes=int(grace_minutes))
 
-st.subheader("Decision Window")
 st.write(
     f"Local time now: **{now_local.strftime('%a %b %d, %I:%M %p')}**  "
     f"| Target lock: **10:30 AM**  "
@@ -364,39 +470,8 @@ if now_local <= deadline_dt:
 else:
     st.warning("You are past the preferred window. You can still bet, but edge typically shrinks as the day progresses.")
 
-# ----------------------------
-# Hourly chart + peak window
-# ----------------------------
-st.subheader("Hourly temperature curve (today)")
-hourly_source_name = None
-hourly_df = None
-
-# Prefer Open-Meteo hourly; fall back to NWS hourly
-if om_hourly is not None and not om_hourly.empty:
-    hourly_df = om_hourly.sort_values("dt")
-    hourly_source_name = "Open-Meteo"
-elif nws_hourly is not None and not nws_hourly.empty:
-    hourly_df = nws_hourly.sort_values("dt")
-    hourly_source_name = "NWS"
-
-if hourly_df is not None and not hourly_df.empty:
-    plot_df = hourly_df.copy()
-    plot_df["time"] = plot_df["dt"].dt.strftime("%I:%M %p")
-    st.caption(f"Hourly source used: {hourly_source_name}")
-    st.line_chart(plot_df.set_index("dt")["temp_f"])
-
-    # Peak window = hottest 90-minute span approximation (max of rolling 2 hours)
-    # If sparse, just show the max hour.
-    peak_row = plot_df.loc[plot_df["temp_f"].idxmax()]
-    peak_time = peak_row["dt"]
-    peak_temp = float(peak_row["temp_f"])
-
-    st.write(f"Peak hour (from {hourly_source_name}): **{peak_time.strftime('%I:%M %p')}** at **{peak_temp:.1f}°F**")
-else:
-    st.caption("Hourly curve unavailable (sources returned daily high but not usable hourly).")
-
 st.divider()
 st.caption(
-    "Note: This tool estimates probability from cross-source agreement. It can’t see Kalshi’s exact station/reporting rules, "
-    "so always sanity-check the bracket options Kalshi offers before placing size."
+    "Upgrades included: fixed bracket math, daytime NWS peak filtering, weighted ensemble, sigma from spread, "
+    "optional nowcast heating-rate adjustment, and boundary risk warnings."
 )
