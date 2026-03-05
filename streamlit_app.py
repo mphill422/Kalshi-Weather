@@ -1,564 +1,625 @@
+import math
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
+import pandas as pd
+import requests
+import streamlit as st
+
+
+# =========================
+# App config
+# =========================
+st.set_page_config(page_title="Kalshi Weather Trading Dashboard", layout="centered")
 
 DEFAULT_CITY = "Austin, TX"
+REQUEST_TIMEOUT = 12
 
-# ----------- HTTP helpers -----------
 SESSION = requests.Session()
+SESSION.headers.update(
+    {
+        # NWS asks for a User-Agent that identifies your application
+        "User-Agent": "KalshiWeatherDashboard/1.0 (contact: streamlit-app)",
+        "Accept": "application/geo+json, application/json",
+    }
+)
 
-def safe_get_json(url: str, params: dict | None = None, headers: dict | None = None, timeout: int = 12):
-    """
-    Ultra-defensive GET JSON. Returns (data, error_str).
-    """
+# =========================
+# City coordinates (NO geocoding needed)
+# =========================
+CITIES: Dict[str, Dict[str, object]] = {
+    # Texas core
+    "Austin, TX": {"lat": 30.2672, "lon": -97.7431, "tz": "America/Chicago"},
+    "Dallas, TX": {"lat": 32.7767, "lon": -96.7970, "tz": "America/Chicago"},
+    "Houston, TX": {"lat": 29.7604, "lon": -95.3698, "tz": "America/Chicago"},
+    "San Antonio, TX": {"lat": 29.4241, "lon": -98.4936, "tz": "America/Chicago"},
+    # Requested additions
+    "New York City, NY": {"lat": 40.7128, "lon": -74.0060, "tz": "America/New_York"},
+    "Atlanta, GA": {"lat": 33.7490, "lon": -84.3880, "tz": "America/New_York"},
+    "Miami, FL": {"lat": 25.7617, "lon": -80.1918, "tz": "America/New_York"},
+    "New Orleans, LA": {"lat": 29.9511, "lon": -90.0715, "tz": "America/Chicago"},
+    "Los Angeles, CA": {"lat": 34.0522, "lon": -118.2437, "tz": "America/Los_Angeles"},
+    # Useful extra
+    "Phoenix, AZ": {"lat": 33.4484, "lon": -112.0740, "tz": "America/Phoenix"},
+}
+
+# =========================
+# Utilities
+# =========================
+def safe_get_json(url: str, params: Optional[dict] = None, timeout: int = REQUEST_TIMEOUT) -> Tuple[Optional[dict], Optional[str]]:
     try:
-        r = SESSION.get(url, params=params, headers=headers, timeout=timeout)
+        r = SESSION.get(url, params=params, timeout=timeout)
         r.raise_for_status()
         return r.json(), None
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
 
-def parse_iso(dt_str: str):
-    # Open-Meteo uses ISO strings. Some include timezone offset.
+
+def now_date_in_tz(tz_name: str) -> pd.Timestamp:
+    # Streamlit cloud supports tz database names
+    return pd.Timestamp.now(tz=tz_name).normalize()
+
+
+def to_local_dt(series, tz_name: str) -> pd.Series:
+    # Accepts strings / timestamps; returns tz-aware local datetimes where possible
+    dt = pd.to_datetime(series, errors="coerce", utc=True)
     try:
-        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        return dt.dt.tz_convert(tz_name)
     except Exception:
-        return None
+        # If conversion fails, return best-effort (maybe already local)
+        return pd.to_datetime(series, errors="coerce")
 
-# ----------- Normal CDF (no scipy) -----------
-def norm_cdf(x: float, mu: float, sigma: float) -> float:
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def fmt_temp(x: Optional[float]) -> str:
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+        return "—"
+    return f"{x:.1f}"
+
+
+def fmt_time(ts: Optional[pd.Timestamp]) -> str:
+    if ts is None or pd.isna(ts):
+        return "—"
+    try:
+        return ts.strftime("%I:%M %p")
+    except Exception:
+        return "—"
+
+
+def erf_cdf(x: float) -> float:
+    # Standard normal CDF via erf
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def normal_prob_between(a: float, b: float, mu: float, sigma: float) -> float:
     if sigma <= 0:
-        return 1.0 if x >= mu else 0.0
-    z = (x - mu) / (sigma * math.sqrt(2))
-    return 0.5 * (1 + math.erf(z))
+        return 0.0
+    za = (a - mu) / sigma
+    zb = (b - mu) / sigma
+    return max(0.0, erf_cdf(zb) - erf_cdf(za))
 
-def prob_between(a: float, b: float, mu: float, sigma: float) -> float:
-    # Inclusive-ish bounds
-    return max(0.0, min(1.0, norm_cdf(b, mu, sigma) - norm_cdf(a, mu, sigma)))
 
-# ----------- Kalshi bracket helpers -----------
-def bracket_even_start(x: float, size: int) -> tuple[int, int]:
-    """
-    Even-start buckets for size=2 means ... 78-79, 80-81, 82-83, 84-85 ...
-    Generally: start = floor(x/size)*size, but force even-start for size=2.
-    """
-    if size <= 0:
-        size = 2
-    start = int(math.floor(x / size) * size)
-    end = start + size - 1
-    return start, end
+# =========================
+# Weather source fetchers
+# =========================
+@dataclass
+class SourceResult:
+    name: str
+    daily_high_f: Optional[float]
+    peak_time_local: Optional[pd.Timestamp]
+    current_temp_f: Optional[float]
+    hourly_df: Optional[pd.DataFrame]
+    err: Optional[str]
 
-def bracket_odd_start(x: float, size: int) -> tuple[int, int]:
-    """
-    Odd-start buckets for size=2 means ... 79-80, 81-82, 83-84, 85-86 ...
-    This is the common Kalshi menu you showed (83-84, 85-86, 87-88).
-    """
-    if size <= 0:
-        size = 2
-    # Shift by 1 then use even-start on shifted coordinate, then shift back
-    start, end = bracket_even_start(x - 1, size)
-    return start + 1, end + 1
 
-def neighbors_for_bucket(lo: int, hi: int, size: int) -> list[tuple[int, int]]:
-    return [(lo - size, hi - size), (lo, hi), (lo + size, hi + size)]
-
-# ----------- Open-Meteo fetch + parse -----------
-def fetch_open_meteo(lat: float, lon: float, use_gfs: bool = False):
-    """
-    Returns dict with:
-      - source_name
-      - tz_name
-      - current_temp
-      - hourly_df: columns [time, temp_f]
-      - daily_high
-      - peak_time (datetime)
-      - errors list
-    """
-    base_url = "https://api.open-meteo.com/v1/forecast"
+def fetch_open_meteo(lat: float, lon: float, tz: str, model: str = "best") -> SourceResult:
+    url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
         "longitude": lon,
-        "timezone": "auto",
+        "timezone": tz,
         "temperature_unit": "fahrenheit",
         "wind_speed_unit": "mph",
-        "hourly": "temperature_2m",
-        "daily": "temperature_2m_max",
+        "hourly": "temperature_2m,relative_humidity_2m,windspeed_10m",
+        "daily": "temperature_2m_max,temperature_2m_min",
         "current_weather": "true",
     }
-    source_name = "Open-Meteo (best)"
-    if use_gfs:
-        params["models"] = "gfs"
-        source_name = "Open-Meteo (GFS)"
+    if model and model != "best":
+        params["models"] = model  # e.g., "gfs"
+    payload, err = safe_get_json(url, params=params)
 
-    payload, err = safe_get_json(base_url, params=params, timeout=14)
-    if err or not isinstance(payload, dict):
-        return None, f"{source_name} failed: {err or 'Bad payload'}"
-
-    tz_name = payload.get("timezone", "auto")
+    if payload is None:
+        return SourceResult(
+            name=f"Open-Meteo ({model})",
+            daily_high_f=None,
+            peak_time_local=None,
+            current_temp_f=None,
+            hourly_df=None,
+            err=err,
+        )
 
     # Hourly
     hourly = payload.get("hourly") or {}
-    times = hourly.get("time") or []
-    temps = hourly.get("temperature_2m") or []
-    if not times or not temps or len(times) != len(temps):
-        return None, f"{source_name} failed: hourly data missing/invalid"
+    ht = hourly.get("time")
+    temps = hourly.get("temperature_2m")
 
-    hourly_df = pd.DataFrame({"time": times, "temp_f": temps})
-    # Parse time with timezone if possible
-    hourly_df["dt"] = hourly_df["time"].apply(parse_iso)
-    hourly_df = hourly_df.dropna(subset=["dt"]).reset_index(drop=True)
-    if hourly_df.empty:
-        return None, f"{source_name} failed: could not parse hourly timestamps"
-
-    # Current weather (optional)
-    current_temp = None
-    cw = payload.get("current_weather") or {}
-    if isinstance(cw, dict):
-        current_temp = cw.get("temperature")
-
-    # Daily high "today" from daily list (first entry)
-    daily = payload.get("daily") or {}
-    daily_max = daily.get("temperature_2m_max") or []
-    daily_time = daily.get("time") or []
+    hourly_df = None
     daily_high = None
-    if daily_max:
-        daily_high = float(daily_max[0])
+    peak_time = None
 
-    # Peak time today from hourly max within today's date
-    # Determine today's date in the returned timezone by using the first hourly dt date
-    first_dt = hourly_df["dt"].iloc[0]
-    today_date = first_dt.date()
-    today_df = hourly_df[hourly_df["dt"].dt.date == today_date]
-    if today_df.empty:
-        today_df = hourly_df.copy()
+    try:
+        if ht is not None and temps is not None and len(ht) == len(temps) and len(ht) > 0:
+            df = pd.DataFrame({"time": ht, "temp_f": temps})
+            df["dt"] = pd.to_datetime(df["time"], errors="coerce")
+            # Open-Meteo returns already in local tz when timezone param set; keep naive ok
+            # But we still filter by local date using tz name:
+            # If df["dt"] is naive, compare to local today naive date.
+            today_local = now_date_in_tz(tz).date()
+            df["date_local"] = pd.to_datetime(df["dt"], errors="coerce").dt.date
+            df = df.dropna(subset=["dt", "temp_f"])
+            df_today = df[df["date_local"] == today_local].copy()
 
-    peak_row = today_df.loc[today_df["temp_f"].astype(float).idxmax()]
-    peak_time = peak_row["dt"]
-    peak_temp = float(peak_row["temp_f"])
+            if len(df_today) > 0:
+                idx = df_today["temp_f"].astype(float).idxmax()
+                daily_high = float(df_today.loc[idx, "temp_f"])
+                peak_time = pd.to_datetime(df_today.loc[idx, "dt"], errors="coerce")
+                hourly_df = df_today[["dt", "temp_f"]].copy()
+    except Exception as e:
+        # fail-soft
+        err = (err or "") + f" | hourly parse failed: {type(e).__name__}: {e}"
 
-    # If daily_high missing, fallback to peak_temp
-    if daily_high is None:
-        daily_high = peak_temp
+    # Daily max (fallback)
+    try:
+        daily = payload.get("daily") or {}
+        dtime = daily.get("time")
+        dmax = daily.get("temperature_2m_max")
+        if (daily_high is None) and dtime is not None and dmax is not None and len(dtime) == len(dmax) and len(dtime) > 0:
+            ddf = pd.DataFrame({"date": dtime, "tmax": dmax})
+            ddf["date"] = pd.to_datetime(ddf["date"], errors="coerce").dt.date
+            today_local = now_date_in_tz(tz).date()
+            row = ddf[ddf["date"] == today_local]
+            if len(row) > 0:
+                daily_high = float(row.iloc[0]["tmax"])
+    except Exception as e:
+        err = (err or "") + f" | daily parse failed: {type(e).__name__}: {e}"
 
-    return {
-        "source": source_name,
-        "tz": tz_name,
-        "current_temp": float(current_temp) if current_temp is not None else None,
-        "hourly_df": today_df[["dt", "temp_f"]].copy(),
-        "daily_high": float(daily_high),
-        "peak_time": peak_time,
-        "peak_temp": float(peak_temp),
-        "raw": payload,
-    }, None
+    # Current weather
+    current_temp = None
+    try:
+        cw = payload.get("current_weather") or {}
+        # Open-Meteo uses "temperature" in selected unit
+        if "temperature" in cw:
+            current_temp = float(cw["temperature"])
+    except Exception:
+        pass
 
-# ----------- NWS fetch + parse (robust) -----------
-def fetch_nws_hourly(lat: float, lon: float):
-    """
-    NWS flow:
-      1) /points/{lat},{lon} -> forecastHourly URL (sometimes missing)
-      2) if missing, try forecastGridData (has time series)
-      3) if missing, try forecast (periods) as last resort
-    Returns dict in same format as Open-Meteo (hourly_df may be approximate if grid/period).
-    """
-    # NWS requires a descriptive User-Agent with contact per their guidance.
-    # Put something stable; you can edit the email if you want.
-    headers = {
-        "User-Agent": "KalshiWeatherDashboard/1.0 (contact: mphill422@users.noreply.github.com)",
-        "Accept": "application/geo+json, application/json;q=0.9, */*;q=0.8",
-    }
+    return SourceResult(
+        name=f"Open-Meteo ({model})",
+        daily_high_f=daily_high,
+        peak_time_local=peak_time,
+        current_temp_f=current_temp,
+        hourly_df=hourly_df,
+        err=err,
+    )
 
+
+def fetch_nws_hourly(lat: float, lon: float, tz: str) -> SourceResult:
+    # Step 1: points endpoint
     points_url = f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}"
-    points, err = safe_get_json(points_url, headers=headers, timeout=14)
-    if err or not isinstance(points, dict):
-        return None, f"NWS failed: points error: {err or 'Bad payload'}"
+    points, err = safe_get_json(points_url)
+
+    if points is None:
+        return SourceResult(
+            name="NWS",
+            daily_high_f=None,
+            peak_time_local=None,
+            current_temp_f=None,
+            hourly_df=None,
+            err=err,
+        )
 
     props = points.get("properties") or {}
-    forecast_hourly_url = props.get("forecastHourly")
-    grid_url = props.get("forecastGridData")
-    forecast_url = props.get("forecast")
+    hourly_url = props.get("forecastHourly")
 
-    # Helper: build hourly df from NWS periods (hourly)
-    def hourly_df_from_periods(periods):
-        rows = []
-        for p in periods:
-            t = p.get("startTime")
-            temp = p.get("temperature")
-            if t is None or temp is None:
-                continue
-            dt = parse_iso(t)
-            if dt is None:
-                continue
-            # NWS temps are in Fahrenheit by default
-            rows.append({"dt": dt, "temp_f": float(temp)})
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return None
-        # Keep today's date based on first row local date
-        today_date = df["dt"].iloc[0].date()
-        df = df[df["dt"].dt.date == today_date].reset_index(drop=True)
-        if df.empty:
-            return None
-        return df
+    if not hourly_url:
+        return SourceResult(
+            name="NWS",
+            daily_high_f=None,
+            peak_time_local=None,
+            current_temp_f=None,
+            hourly_df=None,
+            err="NWS points response missing forecastHourly URL.",
+        )
 
-    # 1) Try forecastHourly
-    if forecast_hourly_url:
-        hourly_payload, herr = safe_get_json(forecast_hourly_url, headers=headers, timeout=14)
-        if not herr and isinstance(hourly_payload, dict):
-            periods = (hourly_payload.get("properties") or {}).get("periods") or []
-            df = hourly_df_from_periods(periods)
-            if df is not None and not df.empty:
-                peak_row = df.loc[df["temp_f"].astype(float).idxmax()]
-                return {
-                    "source": "National Weather Service (NWS)",
-                    "tz": "NWS",
-                    "current_temp": None,  # NWS doesn't provide true "current" here reliably
-                    "hourly_df": df.copy(),
-                    "daily_high": float(peak_row["temp_f"]),
-                    "peak_time": peak_row["dt"],
-                    "peak_temp": float(peak_row["temp_f"]),
-                    "raw": hourly_payload,
-                }, None
+    hourly_payload, err2 = safe_get_json(hourly_url)
+    if hourly_payload is None:
+        return SourceResult(
+            name="NWS",
+            daily_high_f=None,
+            peak_time_local=None,
+            current_temp_f=None,
+            hourly_df=None,
+            err=err2,
+        )
 
-    # 2) Try forecastGridData (contains time series, but not always hourly)
-    # We'll attempt to read temperature.values and map validTime windows to midpoints.
-    if grid_url:
-        grid_payload, gerr = safe_get_json(grid_url, headers=headers, timeout=14)
-        if not gerr and isinstance(grid_payload, dict):
-            gprops = grid_payload.get("properties") or {}
-            temp_obj = gprops.get("temperature") or {}
-            values = temp_obj.get("values") or []
-            rows = []
-            for v in values:
-                vt = v.get("validTime")
-                val = v.get("value")
-                if vt is None or val is None:
-                    continue
-                # validTime like "2026-03-04T15:00:00+00:00/PT1H"
-                try:
-                    start_str = vt.split("/")[0]
-                    dt = parse_iso(start_str)
-                except Exception:
-                    dt = None
-                if dt is None:
-                    continue
-                # Grid is usually Celsius; convert if unit is degC
-                # Try to detect unit
-                unit = temp_obj.get("uom", "")
-                temp_f = None
-                if "degC" in unit:
-                    temp_f = (float(val) * 9 / 5) + 32
-                else:
-                    temp_f = float(val)
-                rows.append({"dt": dt, "temp_f": float(temp_f)})
+    periods = (hourly_payload.get("properties") or {}).get("periods") or []
+    if not periods:
+        return SourceResult(
+            name="NWS",
+            daily_high_f=None,
+            peak_time_local=None,
+            current_temp_f=None,
+            hourly_df=None,
+            err="NWS hourly periods empty.",
+        )
 
-            df = pd.DataFrame(rows)
-            if not df.empty:
-                today_date = df["dt"].iloc[0].date()
-                df = df[df["dt"].dt.date == today_date].reset_index(drop=True)
-                if not df.empty:
-                    peak_row = df.loc[df["temp_f"].astype(float).idxmax()]
-                    return {
-                        "source": "National Weather Service (NWS)",
-                        "tz": "NWS",
-                        "current_temp": None,
-                        "hourly_df": df.copy(),
-                        "daily_high": float(peak_row["temp_f"]),
-                        "peak_time": peak_row["dt"],
-                        "peak_temp": float(peak_row["temp_f"]),
-                        "raw": grid_payload,
-                    }, None
+    # Build df
+    try:
+        df = pd.DataFrame(periods)
+        # temperature is already in °F usually
+        if "startTime" not in df.columns or "temperature" not in df.columns:
+            return SourceResult("NWS", None, None, None, None, "NWS hourly missing startTime/temperature fields.")
 
-    # 3) Last resort: forecast (periods) - not hourly; use period temperatures
-    if forecast_url:
-        f_payload, ferr = safe_get_json(forecast_url, headers=headers, timeout=14)
-        if not ferr and isinstance(f_payload, dict):
-            periods = (f_payload.get("properties") or {}).get("periods") or []
-            # Use any "isDaytime" period for today as a proxy
-            rows = []
-            for p in periods:
-                t = p.get("startTime")
-                temp = p.get("temperature")
-                if t is None or temp is None:
-                    continue
-                dt = parse_iso(t)
-                if dt is None:
-                    continue
-                rows.append({"dt": dt, "temp_f": float(temp)})
-            df = pd.DataFrame(rows)
-            if not df.empty:
-                today_date = df["dt"].iloc[0].date()
-                df = df[df["dt"].dt.date == today_date].reset_index(drop=True)
-                if not df.empty:
-                    peak_row = df.loc[df["temp_f"].astype(float).idxmax()]
-                    return {
-                        "source": "National Weather Service (NWS)",
-                        "tz": "NWS",
-                        "current_temp": None,
-                        "hourly_df": df.copy(),
-                        "daily_high": float(peak_row["temp_f"]),
-                        "peak_time": peak_row["dt"],
-                        "peak_temp": float(peak_row["temp_f"]),
-                        "raw": f_payload,
-                    }, None
+        df["dt"] = to_local_dt(df["startTime"], tz)
+        df["temp_f"] = pd.to_numeric(df["temperature"], errors="coerce")
+        df = df.dropna(subset=["dt", "temp_f"])
 
-    return None, "NWS failed: points response missing usable forecast URLs."
+        today = now_date_in_tz(tz).date()
+        df_today = df[df["dt"].dt.date == today].copy()
 
-# ----------- Compute confidence from spread -----------
-def confidence_label(spread: float) -> str:
-    # Your rule of thumb: spread > 2 = be cautious
-    if spread <= 1.0:
-        return "High"
-    if spread <= 2.0:
-        return "Medium"
-    return "Low"
+        if len(df_today) == 0:
+            # If early morning UTC confusion etc, use next 24h as fallback
+            df_today = df.iloc[:24].copy()
 
-# ----------- Main UI -----------
+        idx = df_today["temp_f"].idxmax()
+        daily_high = float(df_today.loc[idx, "temp_f"])
+        peak_time = pd.to_datetime(df_today.loc[idx, "dt"], errors="coerce")
+
+        # Current temp: first period should be "now-ish"
+        current_temp = float(df.iloc[0]["temp_f"]) if len(df) else None
+
+        hourly_df = df_today[["dt", "temp_f"]].copy()
+        return SourceResult("NWS", daily_high, peak_time, current_temp, hourly_df, None)
+    except Exception as e:
+        return SourceResult("NWS", None, None, None, None, f"NWS parse failed: {type(e).__name__}: {e}")
+
+
+# =========================
+# Kalshi bracket utilities
+# =========================
+def bracket_label(lo: int, hi: int) -> str:
+    return f"{lo}–{hi}"
+
+
+def make_brackets_around(value: float, size: int, odd_start: bool) -> Tuple[int, int]:
+    """
+    Returns the bracket [lo, hi] (inclusive bounds in integers) containing value
+    using 1°,2°,3°,4° etc. For 2°:
+      odd_start=True  -> 83–84, 85–86 ...
+      odd_start=False -> 84–85, 86–87 ...
+    """
+    v = int(math.floor(value))
+    if size <= 1:
+        return v, v
+
+    if size == 2:
+        if odd_start:
+            # starts at odd
+            # find nearest odd <= v
+            base = v if (v % 2 == 1) else v - 1
+        else:
+            # starts at even
+            base = v if (v % 2 == 0) else v - 1
+        return base, base + 1
+
+    # Generic size: align to multiples of size
+    base = (v // size) * size
+    return base, base + (size - 1)
+
+
+def ladder_rows(mu: float, sigma: float, size: int, odd_start: bool, n: int = 7) -> pd.DataFrame:
+    lo, hi = make_brackets_around(mu, size, odd_start)
+    # center bracket index
+    center_lo = lo
+
+    # build n brackets around center
+    half = n // 2
+    rows = []
+    for k in range(-half, half + 1):
+        b_lo = center_lo + k * size
+        b_hi = b_lo + (size - 1)
+        # use continuous bounds with inclusive integer interpretation
+        p = normal_prob_between(b_lo - 0.5, b_hi + 0.5, mu, sigma) * 100.0
+        rows.append({"Bracket": bracket_label(b_lo, b_hi), "Probability %": round(p, 1)})
+    return pd.DataFrame(rows)
+
+
+# =========================
+# Peak spike detector
+# =========================
+def spike_detector(hourly_df: Optional[pd.DataFrame]) -> Tuple[bool, str]:
+    """
+    Simple check: if temps rise quickly within 2 hours before peak, flag.
+    """
+    if hourly_df is None or len(hourly_df) < 6:
+        return False, "Not enough hourly data."
+
+    df = hourly_df.sort_values("dt").copy()
+    df["temp_f"] = pd.to_numeric(df["temp_f"], errors="coerce")
+    df = df.dropna(subset=["dt", "temp_f"])
+    if len(df) < 6:
+        return False, "Not enough hourly data."
+
+    peak_idx = df["temp_f"].idxmax()
+    peak_dt = df.loc[peak_idx, "dt"]
+
+    window = df[(df["dt"] >= peak_dt - pd.Timedelta(hours=2)) & (df["dt"] <= peak_dt)].copy()
+    if len(window) < 3:
+        return False, "No 2-hour window available."
+
+    rise = float(window["temp_f"].iloc[-1] - window["temp_f"].iloc[0])
+    if rise >= 4.0:
+        return True, f"Fast rise of ~{rise:.1f}°F in the 2 hours before peak."
+    return False, f"Normal ramp (~{rise:.1f}°F over 2 hours)."
+
+
+# =========================
+# UI
+# =========================
 st.title("Kalshi Weather Trading Dashboard")
 
-city = st.selectbox("Select City", list(CITIES.keys()), index=list(CITIES.keys()).index(DEFAULT_CITY))
-lat, lon = CITIES[city]
+city = st.selectbox("Select City", list(CITIES.keys()), index=list(CITIES.keys()).index(DEFAULT_CITY) if DEFAULT_CITY in CITIES else 0)
 
-bracket_size = st.selectbox("Kalshi bracket size (°F)", [1, 2, 3, 4, 5], index=1)
+bracket_size = st.selectbox("Kalshi bracket size (°F)", [1, 2, 3, 4], index=1)
 
-grace_minutes = st.slider("Grace Minutes Around Peak", min_value=0, max_value=90, value=30, step=1)
+grace_minutes = st.slider("Grace Minutes Around Peak", 0, 90, 30)
 
 use_gfs = st.toggle("Also try Open-Meteo GFS model (optional)", value=False)
-st.caption(
-    "If this ever fails, the dashboard ignores it automatically. "
-    "(This prevents the old “GFS error” from breaking cities.)"
-)
+st.caption("If this ever fails, the dashboard ignores it automatically. (This prevents GFS errors from breaking cities.)")
 
-kalshi_alignment = st.radio(
-    "Kalshi bracket alignment (menu style)",
-    ["Auto (show both)", "Even-start (…82–83, 84–85…)", "Odd-start (…83–84, 85–86…)"],
-    index=0,
-)
-st.caption(
-    "Kalshi sometimes lists 2° ranges in an **odd-start** menu (83–84, 85–86…) like your screenshot. "
-    "If your app range doesn’t match Kalshi’s list, switch alignment."
-)
+lat = float(CITIES[city]["lat"])
+lon = float(CITIES[city]["lon"])
+tz = str(CITIES[city]["tz"])
+today_local = now_date_in_tz(tz).date()
 
-# ----------- Fetch sources -----------
-errors = []
+# Fetch sources
+sources: List[SourceResult] = []
+errs: List[str] = []
 
-om_best, e1 = fetch_open_meteo(lat, lon, use_gfs=False)
-if e1:
-    errors.append(e1)
+om_best = fetch_open_meteo(lat, lon, tz, model="best")
+sources.append(om_best)
+if om_best.err:
+    errs.append(f"Open-Meteo (best) failed: {om_best.err}")
+
+nws = fetch_nws_hourly(lat, lon, tz)
+sources.append(nws)
+if nws.err:
+    errs.append(f"NWS failed: {nws.err}")
 
 om_gfs = None
 if use_gfs:
-    om_gfs, e2 = fetch_open_meteo(lat, lon, use_gfs=True)
-    if e2:
-        errors.append(e2)
+    om_gfs = fetch_open_meteo(lat, lon, tz, model="gfs")
+    sources.append(om_gfs)
+    if om_gfs.err:
+        errs.append(f"Open-Meteo (GFS) failed: {om_gfs.err}")
 
-nws, e3 = fetch_nws_hourly(lat, lon)
-if e3:
-    errors.append(e3)
+# Determine "best model used" for prediction:
+# Preference: Open-Meteo(best) daily high if present, otherwise NWS, otherwise GFS, otherwise None.
+best_source = None
+for preferred in ["Open-Meteo (best)", "NWS", "Open-Meteo (gfs)"]:
+    for s in sources:
+        if s.name.lower().startswith(preferred.lower().split("(")[0].lower()) and s.daily_high_f is not None:
+            # more exact match:
+            if preferred == "Open-Meteo (best)" and s.name == "Open-Meteo (best)":
+                best_source = s
+                break
+            if preferred == "NWS" and s.name == "NWS":
+                best_source = s
+                break
+            if preferred == "Open-Meteo (gfs)" and s.name == "Open-Meteo (gfs)":
+                best_source = s
+                break
+    if best_source is not None:
+        break
 
-available = [x for x in [om_best, nws, om_gfs] if x is not None]
+if best_source is None:
+    # fallback to any source with a daily high
+    for s in sources:
+        if s.daily_high_f is not None:
+            best_source = s
+            break
 
-if not available:
-    st.error("No sources available right now for this city. Try again in a minute.")
-    with st.expander("See errors"):
-        for e in errors:
-            st.write("• " + e)
-    st.stop()
+# Compute agreement / spread
+highs = [s.daily_high_f for s in sources if s.daily_high_f is not None]
+spread = (max(highs) - min(highs)) if len(highs) >= 2 else None
 
-sources_line = " + ".join([a["source"] for a in available])
-st.caption(f"Sources: {sources_line}")
+if spread is None:
+    confidence = "Unknown"
+else:
+    # simple bucket
+    if spread <= 1.0:
+        confidence = f"High (spread {spread:.1f}°)"
+    elif spread <= 2.0:
+        confidence = f"Medium (spread {spread:.1f}°)"
+    else:
+        confidence = f"Low (spread {spread:.1f}°)"
 
-if errors:
+# Summary header
+st.caption(
+    "Sources: "
+    + " + ".join(
+        [
+            "Open-Meteo",
+            "National Weather Service (NWS)",
+            "Open-Meteo GFS" if use_gfs else "",
+        ]
+    ).replace(" + ", " + ").strip(" +")
+)
+
+if len(errs) > 0:
     st.warning("Some sources failed. The dashboard will use whatever data is available.")
     with st.expander("See errors"):
-        for e in errors:
+        for e in errs:
             st.write("• " + e)
 
-# ----------- Choose "best" model for primary display -----------
-# Prefer Open-Meteo (best), else NWS, else GFS.
-best = om_best or nws or om_gfs
-
-# ----------- Compute peak window -----------
-peak_dt = best["peak_time"]
-window_start = peak_dt - timedelta(minutes=grace_minutes)
-window_end = peak_dt + timedelta(minutes=grace_minutes)
-
-# ----------- Show headline -----------
+# Display city section
 st.header(city)
 
-pred_high = float(best["daily_high"])
+pred_high = best_source.daily_high_f if best_source else None
 st.subheader("Predicted Daily High (°F)")
-st.markdown(f"<div style='font-size:64px; font-weight:700; line-height:1;'>{pred_high:.1f}</div>", unsafe_allow_html=True)
+st.markdown(f"## {fmt_temp(pred_high)}")
 
-# Agreement + spread
-highs = [float(a["daily_high"]) for a in available]
-spread = max(highs) - min(highs) if len(highs) >= 2 else 0.0
-conf = confidence_label(spread)
 st.subheader("Confidence")
-st.markdown(f"<div style='font-size:56px; font-weight:700; line-height:1;'>{conf} (spread {spread:.1f}°)</div>", unsafe_allow_html=True)
+st.markdown(f"## {confidence}")
 
-# Peak time
+# Peak time & window
+peak_dt = best_source.peak_time_local if best_source else None
 st.subheader("Estimated Peak Time")
-try:
-    peak_str = peak_dt.strftime("%I:%M %p")
-except Exception:
-    peak_str = str(peak_dt)
+st.markdown(f"## {fmt_time(peak_dt)}")
 
-st.markdown(f"<div style='font-size:56px; font-weight:700; line-height:1;'>{peak_str}</div>", unsafe_allow_html=True)
-st.write(f"Peak window: {window_start.strftime('%I:%M %p')} – {window_end.strftime('%I:%M %p')}")
+# Peak window based on grace minutes
+if peak_dt is not None and not pd.isna(peak_dt):
+    start = peak_dt - pd.Timedelta(minutes=int(grace_minutes))
+    end = peak_dt + pd.Timedelta(minutes=int(grace_minutes))
+    st.write(f"**Peak window:** {fmt_time(start)} – {fmt_time(end)}")
 
-# ----------- Current conditions (from Open-Meteo best if present) -----------
-if om_best and om_best.get("current_temp") is not None:
-    st.subheader("Current Conditions (Open-Meteo)")
-    st.metric("Current Temp (°F)", f"{om_best['current_temp']:.1f}")
+# Suggested Kalshi range (show BOTH alignments, default to odd-start for 2°)
+if pred_high is not None:
+    if bracket_size == 2:
+        # Primary (odd-start) matches 83–84,85–86...
+        lo1, hi1 = make_brackets_around(pred_high, 2, odd_start=True)
+        lo2, hi2 = make_brackets_around(pred_high, 2, odd_start=False)
 
-# ----------- Peak-time heat spike detector -----------
-st.subheader("Peak-time Heat Spike Detector")
-detector_msg = "No spike detected."
-detector_level = "info"
+        st.subheader("Suggested Kalshi Range (Daily High)")
+        st.markdown(f"## {lo1}–{hi1}°F")
+        st.caption("Bracket interpretation: 2° odd-start (e.g., 83–84, 85–86) — matches most Kalshi cards.")
 
-try:
-    if om_best and not om_best["hourly_df"].empty and om_best.get("current_temp") is not None:
-        # Find nearest hourly forecast to 'now' using Open-Meteo current_weather time if available
-        cw_time = (om_best.get("raw") or {}).get("current_weather", {}).get("time")
-        now_dt = parse_iso(cw_time) if cw_time else datetime.now(timezone.utc)
-        dfh = om_best["hourly_df"].copy()
-        dfh["diff"] = (dfh["dt"] - now_dt).abs()
-        nearest = dfh.loc[dfh["diff"].idxmin()]
-        forecast_now = float(nearest["temp_f"])
-        current_now = float(om_best["current_temp"])
-        delta = current_now - forecast_now
-
-        # “Running hot” threshold
-        if delta >= 2.0:
-            detector_msg = f"⚠️ Running HOT: current is {delta:.1f}°F above forecast curve right now."
-            detector_level = "warning"
-        elif delta <= -2.0:
-            detector_msg = f"⬇️ Running COOL: current is {abs(delta):.1f}°F below forecast curve right now."
-            detector_level = "info"
-        else:
-            detector_msg = f"Normal: current is {delta:.1f}°F vs forecast curve."
-            detector_level = "success"
-
-        st.caption(f"Forecast-at-now uses nearest hourly point: {forecast_now:.1f}°F.")
+        st.write("Also check this alternate 2° alignment (Kalshi sometimes uses this):")
+        st.write(f"• **{lo2}–{hi2}°F** — 2° even-start (e.g., 84–85, 86–87)")
     else:
-        st.caption("Needs Open-Meteo current temp + hourly forecast to run the spike detector.")
-except Exception as _:
-    st.caption("Spike detector skipped due to an internal parsing issue (does not affect the rest of the dashboard).")
+        lo, hi = make_brackets_around(pred_high, bracket_size, odd_start=False)
+        st.subheader("Suggested Kalshi Range (Daily High)")
+        st.markdown(f"## {lo}–{hi}°F")
 
-if detector_level == "warning":
-    st.warning(detector_msg)
-elif detector_level == "success":
-    st.success(detector_msg)
-else:
-    st.info(detector_msg)
-
-# ----------- Kalshi suggested range -----------
-st.header("Suggested Kalshi Range (Daily High)")
-
-# Determine suggestions for both alignments
-lo_even, hi_even = bracket_even_start(pred_high, bracket_size)
-lo_odd, hi_odd = bracket_odd_start(pred_high, bracket_size)
-
-def fmt_range(lo, hi): return f"{lo}–{hi}°F"
-
-# Pick display based on radio
-if kalshi_alignment.startswith("Even-start"):
-    main_lo, main_hi = lo_even, hi_even
-    alt_lo, alt_hi = lo_odd, hi_odd
-    main_label = "Even-start"
-    alt_label = "Odd-start"
-elif kalshi_alignment.startswith("Odd-start"):
-    main_lo, main_hi = lo_odd, hi_odd
-    alt_lo, alt_hi = lo_even, hi_even
-    main_label = "Odd-start"
-    alt_label = "Even-start"
-else:
-    # Auto: show both and let user decide from Kalshi menu
-    main_lo, main_hi = lo_odd, hi_odd  # default to odd-start because that's what your screenshot showed
-    alt_lo, alt_hi = lo_even, hi_even
-    main_label = "Odd-start (common Kalshi menu)"
-    alt_label = "Even-start"
-
-st.markdown(f"<div style='font-size:52px; font-weight:800; line-height:1;'>{fmt_range(main_lo, main_hi)}</div>", unsafe_allow_html=True)
-st.caption(f"Bracket interpretation: {bracket_size}° {main_label}")
-
-# Always show alternate alignment so you can match the Kalshi screen quickly
-st.write(f"Also check alternate alignment ({alt_label}): **{fmt_range(alt_lo, alt_hi)}**")
-
-st.write("Nearby ranges to watch:")
-near = neighbors_for_bucket(main_lo, main_hi, bracket_size)
-for (lo, hi) in near:
-    if lo == main_lo and hi == main_hi:
-        st.write(f"• **{lo}–{hi} (current)**")
+# Nearby ranges to watch
+if pred_high is not None:
+    st.write("**Nearby ranges to watch:**")
+    if bracket_size == 2:
+        lo, hi = make_brackets_around(pred_high, 2, odd_start=True)
+        for k in [-1, 0, 1]:
+            b_lo = lo + k * 2
+            b_hi = b_lo + 1
+            if k == 0:
+                st.write(f"• {b_lo}–{b_hi} (current)")
+            else:
+                st.write(f"• {b_lo}–{b_hi}")
     else:
-        st.write(f"• {lo}–{hi}")
+        lo, hi = make_brackets_around(pred_high, bracket_size, odd_start=False)
+        for k in [-1, 0, 1]:
+            b_lo = lo + k * bracket_size
+            b_hi = b_lo + (bracket_size - 1)
+            if k == 0:
+                st.write(f"• {b_lo}–{b_hi} (current)")
+            else:
+                st.write(f"• {b_lo}–{b_hi}")
 
-# ----------- Raw forecast numbers expander -----------
+# Raw numbers expander
 with st.expander("See raw forecast numbers"):
-    st.write(f"Forecast date (today): {datetime.now().date()}")
-    st.write(f"Best model used: {best['source']}")
-    for a in available:
-        try:
-            st.write(f"{a['source']}: {float(a['daily_high']):.1f}°F | peak {a['peak_time'].strftime('%I:%M %p')}")
-        except Exception:
-            st.write(f"{a['source']}: {float(a['daily_high']):.1f}°F")
+    st.write(f"Forecast date (today): **{today_local}**")
+    st.write(f"Best model used: **{best_source.name if best_source else '—'}**")
+    for s in sources:
+        st.write(f"- **{s.name}**: high={fmt_temp(s.daily_high_f)}°F, peak={fmt_time(s.peak_time_local)}, current={fmt_temp(s.current_temp_f)}°F")
 
-# ----------- Model agreement table -----------
-st.header("Model Agreement (Source Highs)")
+# Current conditions (Open-Meteo best if available)
+st.subheader("Current Conditions (Open-Meteo)")
+st.write(f"Temp (°F): **{fmt_temp(om_best.current_temp_f)}**")
+
+# Model agreement table
+st.subheader("Model Agreement (Source Highs)")
 rows = []
-for a in available:
-    try:
-        rows.append({
-            "Source": a["source"],
-            "Daily High (°F)": round(float(a["daily_high"]), 1),
-            "Peak Time": a["peak_time"].strftime("%I:%M %p") if isinstance(a["peak_time"], datetime) else str(a["peak_time"]),
-        })
-    except Exception:
-        rows.append({"Source": a["source"], "Daily High (°F)": a.get("daily_high"), "Peak Time": str(a.get("peak_time"))})
-st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-# ----------- Probability ladder -----------
-st.header("Kalshi Probability Ladder")
-
-# Build a normal approx distribution from:
-# mean = pred_high (best)
-# sigma = max(0.8, spread/2) with a small floor
-sigma = max(0.8, spread / 2.0)
-
-# Ladder centered around the suggested main range
-ladder_center = (main_lo + main_hi) / 2.0
-# Show 5 buckets around the suggested one
-ladder = []
-for k in range(-2, 3):
-    lo = main_lo + k * bracket_size
-    hi = main_hi + k * bracket_size
-    p = prob_between(lo - 0.5, hi + 0.5, mu=pred_high, sigma=sigma)  # continuity-ish
-    ladder.append({"Bracket": f"{lo}–{hi}", "Probability %": round(100 * p, 1)})
-
-ladder_df = pd.DataFrame(ladder)
-st.dataframe(ladder_df, use_container_width=True, hide_index=True)
-st.caption(f"Probability model: Normal(mean={pred_high:.1f}, sigma={sigma:.2f}) derived from model spread.")
-
-# ----------- Value bet check -----------
-st.header("Value Bet Check (you enter the Kalshi price)")
-st.caption("Enter the YES price (in cents) for the bracket you’re considering. We compare it to the model probability.")
-
-yes_price_cents = st.number_input("Enter Kalshi YES price (cents)", min_value=1, max_value=99, value=50, step=1)
-model_p_main = float(ladder_df.loc[ladder_df["Bracket"] == f"{main_lo}–{main_hi}", "Probability %"].iloc[0]) / 100.0
-implied_p = yes_price_cents / 100.0
-
-edge = model_p_main - implied_p
-st.write(f"Model probability for **{main_lo}–{main_hi}** ≈ **{model_p_main*100:.1f}%**")
-st.write(f"Market implied probability at **{yes_price_cents}¢** ≈ **{implied_p*100:.1f}%**")
-
-if edge > 0.03:
-    st.success(f"✅ Positive edge: about **+{edge*100:.1f}%** vs market.")
-elif edge > 0:
-    st.info(f"Small edge: about **+{edge*100:.1f}%** vs market (thin).")
+for s in sources:
+    if s.daily_high_f is not None:
+        rows.append(
+            {
+                "Source": s.name,
+                "Daily High (°F)": round(float(s.daily_high_f), 1),
+                "Peak Time": fmt_time(s.peak_time_local),
+            }
+        )
+if rows:
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
 else:
-    st.warning(f"❌ Negative edge: about **{edge*100:.1f}%** vs market.")
+    st.info("No source provided a usable daily high right now.")
 
-# ----------- Practical note on spread threshold -----------
-with st.expander("Quick trading rule-of-thumb (spread)"):
-    st.write(
-        "If **spread > 2°F**, treat it as **low confidence**. "
-        "That usually means forecasts disagree enough that late updates / station effects can swing the bracket."
-    )
+# Probability ladder (uses mu = predicted high, sigma based on spread)
+if pred_high is not None:
+    st.subheader("Kalshi Probability Ladder")
+    mu = float(pred_high)
+    # sigma heuristic: spread/2, with a sensible floor so it’s never “0.0 spread” fake certainty
+    if spread is None:
+        sigma = 1.6
+    else:
+        sigma = max(1.2, float(spread) / 2.0)
+
+    if bracket_size == 2:
+        ladder = ladder_rows(mu, sigma, 2, odd_start=True, n=7)  # match Kalshi odd-start
+    else:
+        ladder = ladder_rows(mu, sigma, bracket_size, odd_start=False, n=7)
+
+    st.dataframe(ladder, use_container_width=True)
+
+# Value bet check (user inputs Kalshi price)
+st.subheader("Value Bet Check (you enter the Kalshi price)")
+st.caption("This is a rough, model-based check. Use it to compare the market price vs your estimated probability.")
+price_cents = st.number_input("Enter Kalshi YES price for the main bracket (cents)", min_value=0, max_value=100, value=50, step=1)
+
+if pred_high is not None:
+    mu = float(pred_high)
+    if spread is None:
+        sigma = 1.6
+    else:
+        sigma = max(1.2, float(spread) / 2.0)
+
+    # choose primary bracket the dashboard suggested
+    if bracket_size == 2:
+        lo, hi = make_brackets_around(mu, 2, odd_start=True)
+    else:
+        lo, hi = make_brackets_around(mu, bracket_size, odd_start=False)
+
+    p = normal_prob_between(lo - 0.5, hi + 0.5, mu, sigma)
+    model_yes = p
+    market_yes = clamp(price_cents / 100.0, 0.0, 1.0)
+
+    # Edge: expected value per $1 (very simplified, ignores fees/spread)
+    # If YES costs market_yes and pays 1 if event occurs.
+    ev = model_yes * 1.0 - market_yes
+
+    st.write(f"Model probability for **{lo}–{hi}°F** ≈ **{model_yes*100:.1f}%** (sigma≈{sigma:.1f}°)")
+    st.write(f"Market implied YES ≈ **{market_yes*100:.1f}%** (from {price_cents}¢)")
+    st.write(f"Simple edge (model − market) ≈ **{ev*100:.1f}%**")
+    if ev > 0.03:
+        st.success("Model shows positive edge (roughly).")
+    elif ev < -0.03:
+        st.error("Model shows negative edge (roughly).")
+    else:
+        st.warning("Edge is small / unclear.")
+
+# Peak-time heat spike detector
+st.subheader("Peak-time heat spike detector")
+best_hourly = None
+if best_source and best_source.hourly_df is not None:
+    best_hourly = best_source.hourly_df
+elif om_best.hourly_df is not None:
+    best_hourly = om_best.hourly_df
+elif nws.hourly_df is not None:
+    best_hourly = nws.hourly_df
+
+flag, msg = spike_detector(best_hourly)
+if flag:
+    st.warning(f"Potential spike risk: {msg}")
+else:
+    st.write(msg)
