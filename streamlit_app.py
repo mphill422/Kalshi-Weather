@@ -1,11 +1,13 @@
 # streamlit_app.py
-# Kalshi Weather Model – Daily High [v8.2]
-# Reliability upgrade:
-# - Open-Meteo retry + fallback
-# - NWS hourly fallback for trend model
-# - Forecast confidence warning when source count < 2
-# - Clear source-status table
-# - Keeps settlement station mapping, momentum, EV, trade filters
+# Kalshi Weather Model – Daily High [v8.3]
+# Focus: fewer forced bets, better bracket selection
+# Adds:
+# - Noon lag filter (actual vs expected)
+# - Forecast revision tracker (paste recent forecast updates)
+# - Revision trend score
+# - Hotter/colder day warning
+# - Stronger no-bet gating when live temp lags
+# - Keeps settlement-station mapping, momentum, EV, and ladder alignment
 
 import math
 import re
@@ -17,11 +19,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Kalshi Weather Model – Daily High (v8.2)", layout="centered")
-st.title("Kalshi Weather Model – Daily High (v8.2)")
-st.caption("Reliability upgrade: Open-Meteo retry/fallback, NWS trend fallback, confidence warnings, and Kalshi-aligned settlement stations.")
+st.set_page_config(page_title="Kalshi Weather Model – Daily High (v8.3)", layout="centered")
+st.title("Kalshi Weather Model – Daily High (v8.3)")
+st.caption("Built to reduce bad bets: adds noon lag checks, revision trend, stronger trade filter, and Kalshi settlement station alignment.")
 
-UA = {"User-Agent": "kalshi-weather-model/8.2"}
+UA = {"User-Agent": "kalshi-weather-model/8.3"}
 
 CITIES: Dict[str, Dict[str, str | float]] = {
     "Miami": {"lat": 25.7933, "lon": -80.2906, "station": "KMIA", "label": "Miami Intl Airport", "tz": "America/New_York"},
@@ -114,6 +116,26 @@ def parse_market_lines(text: str):
         if label and price_cents is not None:
             out[label] = clamp(price_cents, 0.0, 100.0)
     return out
+
+
+def parse_revision_lines(text: str):
+    rows = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = re.search(r'(\d{1,2}):(\d{2})\s*,?\s*(-?\d+(?:\.\d+)?)', line)
+        if m:
+            hh = int(m.group(1))
+            mm = int(m.group(2))
+            val = float(m.group(3))
+            rows.append({"hh": hh, "mm": mm, "forecast_f": val, "raw": line})
+            continue
+        m2 = re.search(r'(-?\d+(?:\.\d+)?)', line)
+        if m2:
+            val = float(m2.group(1))
+            rows.append({"hh": None, "mm": None, "forecast_f": val, "raw": line})
+    return rows
 
 
 def _parse_open_meteo_payload(js: dict, tz: str):
@@ -278,12 +300,20 @@ with st.expander("Settings", expanded=True):
     show_hourly_chart = st.toggle("Show hourly chart", value=True)
     grace_minutes = st.slider("Grace minutes after 10:30 local", 0, 180, 80, 5)
     ladder_mode = st.selectbox("Kalshi ladder alignment", ["auto", "even", "odd"], index=0)
-    do_not_bet_prob = st.slider("Trade filter: top probability must exceed", 0.40, 0.70, 0.55, 0.01)
+    do_not_bet_prob = st.slider("Trade filter: top probability must exceed", 0.40, 0.70, 0.58, 0.01)
     strong_edge_threshold = st.slider("Strong edge threshold (%)", 1.0, 30.0, 8.0, 0.5)
     small_edge_threshold = st.slider("Small edge threshold (%)", 0.5, 20.0, 3.0, 0.5)
     settlement_bias = st.slider("Settlement station bias correction (°F)", -1.5, 1.5, 0.0, 0.1)
     momentum_weight = st.slider("Peak heating momentum weight", 0.0, 1.0, 0.35, 0.05)
+    noon_lag_threshold = st.slider("No-bet lag threshold (°F behind forecast track)", 0.5, 4.0, 1.5, 0.1)
     no_bet_after_hour = st.slider("No new bets after local hour", 10, 15, 11, 1)
+
+with st.expander("Forecast revision tracker (paste recent forecast updates)", expanded=False):
+    revision_text = st.text_area(
+        "Paste lines like 01:40, 75 or 02:41, 74",
+        height=120,
+        placeholder="01:40, 75\n01:52, 72\n02:41, 74\n02:48, 75\n03:31, 72",
+    )
 
 with st.expander("Kalshi Odds / EV (recommended)", expanded=True):
     market_text = st.text_area(
@@ -361,6 +391,30 @@ with c2:
         st.metric(f"Current settlement temp ({station})", "—")
         st.caption(f"Obs error: {settle_obs_err}")
 
+revision_rows = parse_revision_lines(revision_text)
+revision_bias = 0.0
+revision_msg = ""
+if revision_rows:
+    rev_vals = [r["forecast_f"] for r in revision_rows]
+    latest_rev = rev_vals[-1]
+    first_rev = rev_vals[0]
+    net_change = latest_rev - first_rev
+    recent_change = latest_rev - (rev_vals[-2] if len(rev_vals) >= 2 else first_rev)
+    if net_change <= -1.0:
+        revision_bias = -0.6
+        revision_msg = f"Forecast revisions trending cooler ({net_change:+.1f}°F)."
+    elif net_change >= 1.0:
+        revision_bias = +0.6
+        revision_msg = f"Forecast revisions trending hotter ({net_change:+.1f}°F)."
+    elif recent_change <= -1.0:
+        revision_bias = -0.3
+        revision_msg = f"Latest revision turned cooler ({recent_change:+.1f}°F)."
+    elif recent_change >= 1.0:
+        revision_bias = +0.3
+        revision_msg = f"Latest revision turned hotter ({recent_change:+.1f}°F)."
+    else:
+        revision_msg = "Forecast revisions mostly stable."
+
 st.divider()
 st.subheader("Live trend / nowcast")
 
@@ -369,6 +423,7 @@ peak_hour = None
 trend_proj_high = None
 momentum_delta = None
 momentum_label = None
+expected_now = None
 
 if settle_temp_f is not None and chart_df is not None and not chart_df.empty:
     sunrise_for_calc = sunrise_local if sunrise_local is not None else local_now.replace(hour=6, minute=0, second=0, microsecond=0)
@@ -409,6 +464,14 @@ elif chart_df is None:
 else:
     st.info("Trend engine is waiting for enough usable hourly data.")
 
+if revision_msg:
+    if revision_bias < 0:
+        st.warning(f"Revision tracker: {revision_msg}")
+    elif revision_bias > 0:
+        st.info(f"Revision tracker: {revision_msg}")
+    else:
+        st.caption(f"Revision tracker: {revision_msg}")
+
 mu = consensus
 if trend_proj_high is not None:
     mu = 0.70 * consensus + 0.30 * trend_proj_high
@@ -417,6 +480,10 @@ if trend_proj_high is not None:
 if momentum_delta is not None:
     mu = mu + momentum_weight * momentum_delta
     st.caption(f"Momentum-adjusted high = blended high + ({momentum_weight:.2f} × {momentum_delta:+.1f}) = **{mu:.1f}°F**")
+
+if revision_bias != 0:
+    mu = mu + revision_bias
+    st.caption(f"Revision-adjusted high = model high + revision bias ({revision_bias:+.1f}°F) = **{mu:.1f}°F**")
 
 mu += settlement_bias
 if settlement_bias != 0:
@@ -445,6 +512,13 @@ if risk_level == "PASS":
     trade_filter_reasons.append("Forecast stability state is PASS")
 if source_count < 2:
     trade_filter_reasons.append("Only one forecast source available")
+if momentum_delta is not None and momentum_delta <= -noon_lag_threshold and local_now.hour >= 11:
+    trade_filter_reasons.append(f"Live temp is {abs(momentum_delta):.1f}°F behind forecast track")
+if revision_bias < 0 and local_now.hour >= 11:
+    trade_filter_reasons.append("Forecast revisions are trending cooler")
+if settle_temp_f is not None and expected_now is not None and local_now.hour >= 12:
+    if settle_temp_f < expected_now - noon_lag_threshold:
+        trade_filter_reasons.append("Settlement station is lagging too much for an upper-bracket bet")
 
 if trade_filter_reasons:
     st.error("TRADE FILTER: DO NOT BET — " + " | ".join(trade_filter_reasons))
@@ -522,4 +596,4 @@ if show_hourly_chart and chart_df is not None and not chart_df.empty:
         peak_v = float(df_plot["temp_f"].max())
         st.caption(f"Peak hour (forecast): {peak_t.strftime('%I:%M %p')} at {peak_v:.1f}°F")
 
-st.caption("v8.2 adds Open-Meteo retry logic, NWS fallback for the trend engine, and confidence warnings when source coverage is thin.")
+st.caption("v8.3 is designed to reduce losing bets by blocking trades when live temperature lags the forecast track or revisions trend against the top bracket.")
