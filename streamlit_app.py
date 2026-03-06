@@ -1,13 +1,18 @@
 # streamlit_app.py
-# Kalshi Weather Model – Daily High [v8.3]
-# Focus: fewer forced bets, better bracket selection
-# Adds:
-# - Noon lag filter (actual vs expected)
-# - Forecast revision tracker (paste recent forecast updates)
-# - Revision trend score
-# - Hotter/colder day warning
-# - Stronger no-bet gating when live temp lags
-# - Keeps settlement-station mapping, momentum, EV, and ladder alignment
+# Kalshi Weather Model – Daily High [v8.4]
+# Trading-focused upgrade:
+# - exact cutoff time (hour + minute)
+# - trade day quality score: HIGH EDGE / NORMAL / NO TRADE
+# - top-two bracket gap
+# - stronger no-trade gating
+# - revision tracker
+# - noon lag / momentum checks
+# - settlement station alignment
+# - EV / edge table
+#
+# Notes:
+# This tool is built to reduce bad trades and improve decision quality.
+# It cannot guarantee wins.
 
 import math
 import re
@@ -19,11 +24,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Kalshi Weather Model – Daily High (v8.3)", layout="centered")
-st.title("Kalshi Weather Model – Daily High (v8.3)")
-st.caption("Built to reduce bad bets: adds noon lag checks, revision trend, stronger trade filter, and Kalshi settlement station alignment.")
+st.set_page_config(page_title="Model – Daily High (v8.4)", layout="centered")
+st.title("Model – Daily High (v8.4)")
+st.caption("Trading-focused version: exact cutoff, trade day quality score, top-two gap, stronger no-trade logic, and settlement-station alignment.")
 
-UA = {"User-Agent": "kalshi-weather-model/8.3"}
+UA = {"User-Agent": "kalshi-weather-model/8.4"}
 
 CITIES: Dict[str, Dict[str, str | float]] = {
     "Miami": {"lat": 25.7933, "lon": -80.2906, "station": "KMIA", "label": "Miami Intl Airport", "tz": "America/New_York"},
@@ -126,15 +131,11 @@ def parse_revision_lines(text: str):
             continue
         m = re.search(r'(\d{1,2}):(\d{2})\s*,?\s*(-?\d+(?:\.\d+)?)', line)
         if m:
-            hh = int(m.group(1))
-            mm = int(m.group(2))
-            val = float(m.group(3))
-            rows.append({"hh": hh, "mm": mm, "forecast_f": val, "raw": line})
+            rows.append({"hh": int(m.group(1)), "mm": int(m.group(2)), "forecast_f": float(m.group(3)), "raw": line})
             continue
         m2 = re.search(r'(-?\d+(?:\.\d+)?)', line)
         if m2:
-            val = float(m2.group(1))
-            rows.append({"hh": None, "mm": None, "forecast_f": val, "raw": line})
+            rows.append({"hh": None, "mm": None, "forecast_f": float(m2.group(1)), "raw": line})
     return rows
 
 
@@ -284,6 +285,53 @@ def classify_stability(spread: float, sigma: float, top_prob: float):
     return "LOW RISK", "🟢", "Forecast stability is good."
 
 
+def score_trade_day(source_count: int, spread: float, sigma: float, top_prob: float, top_gap: float, momentum_delta: Optional[float], revision_bias: float):
+    score = 0.0
+    if source_count >= 3:
+        score += 2
+    elif source_count == 2:
+        score += 1
+
+    if spread <= 1.5:
+        score += 2
+    elif spread <= 2.2:
+        score += 1
+
+    if sigma <= 1.7:
+        score += 2
+    elif sigma <= 2.3:
+        score += 1
+
+    if top_prob >= 0.62:
+        score += 3
+    elif top_prob >= 0.55:
+        score += 2
+    elif top_prob >= 0.50:
+        score += 1
+
+    if top_gap >= 0.12:
+        score += 2
+    elif top_gap >= 0.07:
+        score += 1
+
+    if momentum_delta is not None:
+        if abs(momentum_delta) <= 1.0:
+            score += 1
+        elif momentum_delta >= 1.0:
+            score += 1
+
+    if revision_bias == 0:
+        score += 1
+    elif revision_bias > 0:
+        score += 0.5
+
+    if score >= 9:
+        return "HIGH EDGE DAY", "🟢", f"Trade score {score:.1f}/13"
+    if score >= 6:
+        return "NORMAL DAY", "🟡", f"Trade score {score:.1f}/13"
+    return "NO TRADE DAY", "🔴", f"Trade score {score:.1f}/13"
+
+
 city = st.selectbox("City", list(CITIES.keys()), index=list(CITIES.keys()).index(DEFAULT_CITY))
 cfg = CITIES[city]
 lat = float(cfg["lat"])
@@ -298,7 +346,7 @@ with st.expander("Settings", expanded=True):
     include_noaa = st.toggle("Include Open-Meteo NOAA GFS/HRRR", value=True)
     include_nws = st.toggle("Include NWS (api.weather.gov)", value=True)
     show_hourly_chart = st.toggle("Show hourly chart", value=True)
-    grace_minutes = st.slider("Grace minutes after 10:30 local", 0, 180, 80, 5)
+    grace_minutes = st.slider("Grace minutes after 10:30 local", 0, 180, 45, 5)
     ladder_mode = st.selectbox("Kalshi ladder alignment", ["auto", "even", "odd"], index=0)
     do_not_bet_prob = st.slider("Trade filter: top probability must exceed", 0.40, 0.70, 0.58, 0.01)
     strong_edge_threshold = st.slider("Strong edge threshold (%)", 1.0, 30.0, 8.0, 0.5)
@@ -306,7 +354,8 @@ with st.expander("Settings", expanded=True):
     settlement_bias = st.slider("Settlement station bias correction (°F)", -1.5, 1.5, 0.0, 0.1)
     momentum_weight = st.slider("Peak heating momentum weight", 0.0, 1.0, 0.35, 0.05)
     noon_lag_threshold = st.slider("No-bet lag threshold (°F behind forecast track)", 0.5, 4.0, 1.5, 0.1)
-    no_bet_after_hour = st.slider("No new bets after local hour", 10, 15, 11, 1)
+    no_bet_after_hour = st.slider("No new bets after local hour", 9, 15, 10, 1)
+    no_bet_after_minute = st.slider("No new bets after minute", 0, 59, 45, 5)
 
 with st.expander("Forecast revision tracker (paste recent forecast updates)", expanded=False):
     revision_text = st.text_area(
@@ -400,17 +449,18 @@ if revision_rows:
     first_rev = rev_vals[0]
     net_change = latest_rev - first_rev
     recent_change = latest_rev - (rev_vals[-2] if len(rev_vals) >= 2 else first_rev)
+
     if net_change <= -1.0:
-        revision_bias = -0.6
+        revision_bias = -0.7
         revision_msg = f"Forecast revisions trending cooler ({net_change:+.1f}°F)."
     elif net_change >= 1.0:
-        revision_bias = +0.6
+        revision_bias = +0.7
         revision_msg = f"Forecast revisions trending hotter ({net_change:+.1f}°F)."
     elif recent_change <= -1.0:
-        revision_bias = -0.3
+        revision_bias = -0.4
         revision_msg = f"Latest revision turned cooler ({recent_change:+.1f}°F)."
     elif recent_change >= 1.0:
-        revision_bias = +0.3
+        revision_bias = +0.4
         revision_msg = f"Latest revision turned hotter ({recent_change:+.1f}°F)."
     else:
         revision_msg = "Forecast revisions mostly stable."
@@ -492,10 +542,22 @@ if settlement_bias != 0:
 st.divider()
 st.subheader("Suggested Kalshi Bracket")
 ladder, chosen_mode = build_ladder(mu, sigma, ladder_mode)
-top = max(ladder, key=lambda x: x["WinProb"])
+ordered = sorted(ladder, key=lambda x: x["WinProb"], reverse=True)
+top = ordered[0]
+second = ordered[1]
+top_gap = top["WinProb"] - second["WinProb"]
+
 risk_level, risk_icon, risk_msg = classify_stability(spread, sigma, top["WinProb"])
+day_quality, day_icon, day_msg = score_trade_day(source_count, spread, sigma, top["WinProb"], top_gap, momentum_delta, revision_bias)
 
 st.caption(f"Ladder alignment used: **{chosen_mode}**")
+if day_quality == "HIGH EDGE DAY":
+    st.success(f"{day_icon} TRADE DAY QUALITY: {day_quality} — {day_msg}")
+elif day_quality == "NORMAL DAY":
+    st.warning(f"{day_icon} TRADE DAY QUALITY: {day_quality} — {day_msg}")
+else:
+    st.error(f"{day_icon} TRADE DAY QUALITY: {day_quality} — {day_msg}")
+
 if risk_level == "LOW RISK":
     st.success(f"{risk_icon} FORECAST STABILITY: {risk_level} — {risk_msg}")
 elif risk_level == "HIGH RISK":
@@ -503,15 +565,23 @@ elif risk_level == "HIGH RISK":
 else:
     st.error(f"{risk_icon} FORECAST STABILITY: {risk_level} — {risk_msg}")
 
+st.metric("Top-two bracket gap", f"{top_gap*100:.1f}%")
+
+current_cutoff = local_now.replace(hour=no_bet_after_hour, minute=no_bet_after_minute, second=0, microsecond=0)
+
 trade_filter_reasons = []
 if top["WinProb"] < do_not_bet_prob:
     trade_filter_reasons.append(f"Top bracket only {top['WinProb']*100:.1f}% (< {do_not_bet_prob*100:.0f}%)")
-if local_now.hour >= no_bet_after_hour and local_now.minute > 15:
-    trade_filter_reasons.append(f"Past cutoff ({no_bet_after_hour}:15 local)")
+if local_now > current_cutoff:
+    trade_filter_reasons.append(f"Past cutoff ({current_cutoff.strftime('%I:%M %p')} local)")
 if risk_level == "PASS":
     trade_filter_reasons.append("Forecast stability state is PASS")
 if source_count < 2:
     trade_filter_reasons.append("Only one forecast source available")
+if day_quality == "NO TRADE DAY":
+    trade_filter_reasons.append("Trade day quality is NO TRADE")
+if top_gap < 0.07:
+    trade_filter_reasons.append(f"Top-two gap too small ({top_gap*100:.1f}%)")
 if momentum_delta is not None and momentum_delta <= -noon_lag_threshold and local_now.hour >= 11:
     trade_filter_reasons.append(f"Live temp is {abs(momentum_delta):.1f}°F behind forecast track")
 if revision_bias < 0 and local_now.hour >= 11:
@@ -519,6 +589,8 @@ if revision_bias < 0 and local_now.hour >= 11:
 if settle_temp_f is not None and expected_now is not None and local_now.hour >= 12:
     if settle_temp_f < expected_now - noon_lag_threshold:
         trade_filter_reasons.append("Settlement station is lagging too much for an upper-bracket bet")
+if revision_bias < 0 and momentum_delta is not None and momentum_delta < 0:
+    trade_filter_reasons.append("Momentum + revisions both lean lower")
 
 if trade_filter_reasons:
     st.error("TRADE FILTER: DO NOT BET — " + " | ".join(trade_filter_reasons))
@@ -531,7 +603,7 @@ market_prices = parse_market_lines(market_text) if market_text.strip() else {}
 rows = []
 best_bet = None
 
-for x in sorted(ladder, key=lambda r: r["WinProb"], reverse=True):
+for x in ordered:
     row = {
         "Bracket": x["Bracket"],
         "Win %": f"{x['WinProb']*100:.1f}%",
@@ -578,7 +650,9 @@ st.subheader("Decision Window")
 target = local_now.replace(hour=10, minute=30, second=0, microsecond=0)
 grace_end = target + timedelta(minutes=grace_minutes)
 st.caption(
-    f"Local time now: **{local_now.strftime('%a %b %d, %I:%M %p')}** | Target check: **10:30 AM** | Grace: **{grace_minutes} min**"
+    f"Local time now: **{local_now.strftime('%a %b %d, %I:%M %p')}** | "
+    f"Target check: **10:30 AM** | Grace: **{grace_minutes} min** | "
+    f"Hard cutoff: **{current_cutoff.strftime('%I:%M %p')}**"
 )
 if local_now < target:
     st.warning("Early. Target check is 10:30 AM local.")
@@ -596,4 +670,4 @@ if show_hourly_chart and chart_df is not None and not chart_df.empty:
         peak_v = float(df_plot["temp_f"].max())
         st.caption(f"Peak hour (forecast): {peak_t.strftime('%I:%M %p')} at {peak_v:.1f}°F")
 
-st.caption("v8.3 is designed to reduce losing bets by blocking trades when live temperature lags the forecast track or revisions trend against the top bracket.")
+st.caption("v8.4 is the stronger trade version: exact cutoff, trade day quality score, top-two gap, and tighter no-trade logic.")
