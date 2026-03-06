@@ -1,14 +1,15 @@
 # streamlit_app.py
-# Kalshi Weather Model – Daily High [v7.8.1]
-# Clean full-file update
-# Main UI fix:
-# - Replaces confusing "LOW RISK" + "DO NOT BET" combination
-# - Now separates:
-#     1) Forecast Stability
-#     2) Trade Filter
-# So you can see:
-#   FORECAST STABILITY: LOW / HIGH / PASS
-#   TRADE FILTER: BET ALLOWED / DO NOT BET
+# Kalshi Weather Model – Daily High [v8.0]
+# Upgrades:
+# - Correct Kalshi settlement station map
+# - Settlement station validation shown in UI
+# - Live obs from settlement station
+# - Weather sources + nowcast + settlement bias
+# - Kalshi ladder alignment
+# - Edge detection / EV
+# - Forecast stability and trade filter separated
+# - Decision window / market correction warning
+# - Peak-temperature tracking
 
 import math
 import re
@@ -20,27 +21,24 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Kalshi Weather Model – Daily High (v7.8.1)", layout="centered")
-st.title("Kalshi Weather Model – Daily High (v7.8.1)")
-st.caption(
-    "Full dashboard with weather sources, live airport temp, nowcast, ladder alignment, EV / edge gate, "
-    "Do-Not-Bet filter, timing protection, and clearer signal wording."
-)
+st.set_page_config(page_title="Kalshi Weather Model – Daily High (v8.0)", layout="centered")
+st.title("Kalshi Weather Model – Daily High (v8.0)")
+st.caption("Kalshi-aligned settlement stations, live settlement obs, nowcast, ladder probabilities, EV and trade filters.")
 
-UA = {"User-Agent": "kalshi-weather-model/7.8.1"}
+UA = {"User-Agent": "kalshi-weather-model/8.0"}
 
 CITIES: Dict[str, Dict[str, str | float]] = {
-    "Miami": {"lat": 25.7933, "lon": -80.2906, "station": "KMIA", "tz": "America/New_York"},
-    "New York": {"lat": 40.6413, "lon": -73.7781, "station": "KJFK", "tz": "America/New_York"},
-    "Atlanta": {"lat": 33.6407, "lon": -84.4277, "station": "KATL", "tz": "America/New_York"},
-    "New Orleans": {"lat": 29.9934, "lon": -90.2580, "station": "KMSY", "tz": "America/Chicago"},
-    "Houston": {"lat": 29.9902, "lon": -95.3368, "station": "KIAH", "tz": "America/Chicago"},
-    "Austin": {"lat": 30.1975, "lon": -97.6664, "station": "KAUS", "tz": "America/Chicago"},
-    "Dallas": {"lat": 32.8998, "lon": -97.0403, "station": "KDFW", "tz": "America/Chicago"},
-    "San Antonio": {"lat": 29.5337, "lon": -98.4698, "station": "KSAT", "tz": "America/Chicago"},
-    "Phoenix": {"lat": 33.4342, "lon": -112.0116, "station": "KPHX", "tz": "America/Phoenix"},
-    "Las Vegas": {"lat": 36.0801, "lon": -115.1522, "station": "KLAS", "tz": "America/Los_Angeles"},
-    "Los Angeles": {"lat": 33.9416, "lon": -118.4085, "station": "KLAX", "tz": "America/Los_Angeles"},
+    "Miami": {"lat": 25.7933, "lon": -80.2906, "station": "KMIA", "label": "Miami Intl Airport", "tz": "America/New_York"},
+    "New York": {"lat": 40.7812, "lon": -73.9665, "station": "KNYC", "label": "Central Park", "tz": "America/New_York"},
+    "Atlanta": {"lat": 33.6407, "lon": -84.4277, "station": "KATL", "label": "Hartsfield-Jackson Atlanta Intl", "tz": "America/New_York"},
+    "New Orleans": {"lat": 29.9934, "lon": -90.2580, "station": "KMSY", "label": "Louis Armstrong New Orleans Intl", "tz": "America/Chicago"},
+    "Houston": {"lat": 29.6454, "lon": -95.2789, "station": "KHOU", "label": "Houston Hobby Airport", "tz": "America/Chicago"},
+    "Austin": {"lat": 30.1975, "lon": -97.6664, "station": "KAUS", "label": "Austin Bergstrom Intl", "tz": "America/Chicago"},
+    "Dallas": {"lat": 32.8998, "lon": -97.0403, "station": "KDFW", "label": "Dallas/Fort Worth Intl", "tz": "America/Chicago"},
+    "San Antonio": {"lat": 29.5337, "lon": -98.4698, "station": "KSAT", "label": "San Antonio Intl", "tz": "America/Chicago"},
+    "Phoenix": {"lat": 33.4342, "lon": -112.0116, "station": "KPHX", "label": "Phoenix Sky Harbor Intl", "tz": "America/Phoenix"},
+    "Las Vegas": {"lat": 36.0801, "lon": -115.1522, "station": "KLAS", "label": "Harry Reid Intl", "tz": "America/Los_Angeles"},
+    "Los Angeles": {"lat": 33.9416, "lon": -118.4085, "station": "KLAX", "label": "Los Angeles Intl Airport", "tz": "America/Los_Angeles"},
 }
 DEFAULT_CITY = "Miami"
 
@@ -51,16 +49,6 @@ def safe_get_json(url: str, params: Optional[dict] = None, timeout: int = 12):
         if r.status_code != 200:
             return None
         return r.json()
-    except Exception:
-        return None
-
-
-def safe_get_text(url: str, params: Optional[dict] = None, timeout: int = 12):
-    try:
-        r = requests.get(url, params=params, headers=UA, timeout=timeout)
-        if r.status_code != 200:
-            return None
-        return r.text
     except Exception:
         return None
 
@@ -108,6 +96,28 @@ def fair_cents_from_prob(p: float) -> float:
 def expected_value_per_1_dollar(p: float, yes_price_cents: float) -> float:
     price = yes_price_cents / 100.0
     return p * (1.0 - price) - (1.0 - p) * price
+
+
+def parse_market_lines(text: str):
+    out = {}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        odds_match = re.search(r"([+-]\d{2,5})", line)
+        cents_match = re.search(r"(\d{1,3})\s*(?:c|¢)\b", line, flags=re.IGNORECASE)
+        label = line
+        price_cents = None
+        if odds_match:
+            price_cents = yes_price_from_american_odds(float(odds_match.group(1)))
+            label = line[:odds_match.start()].strip()
+        elif cents_match:
+            price_cents = float(cents_match.group(1))
+            label = line[:cents_match.start()].strip()
+        label = label.replace("º", "°").strip()
+        if label and price_cents is not None:
+            out[label] = clamp(price_cents, 0.0, 100.0)
+    return out
 
 
 def _parse_open_meteo_payload(js: dict, tz: str):
@@ -186,7 +196,6 @@ def fetch_nws_hourly(lat: float, lon: float):
     fh = safe_get_json(url)
     if not fh:
         return None, None, "forecastHourly failed"
-
     periods = fh.get("properties", {}).get("periods", [])
     rows = []
     for p in periods:
@@ -194,10 +203,8 @@ def fetch_nws_hourly(lat: float, lon: float):
         temp = p.get("temperature")
         if t is not None and temp is not None:
             rows.append({"time": t, "temp_f": float(temp)})
-
     if not rows:
         return None, None, "parse failed"
-
     df = pd.DataFrame(rows).sort_values("time")
     df["time"] = pd.to_datetime(df["time"], utc=True)
     d0 = df["time"].iloc[0].date()
@@ -230,9 +237,9 @@ def nearest_odd(x: float) -> int:
     return n
 
 
-def build_ladder(consensus: float, sigma: float, mode: str):
-    even_start = nearest_even(consensus) - 4
-    odd_start = nearest_odd(consensus) - 4
+def build_ladder(mu: float, sigma: float, mode: str):
+    even_start = nearest_even(mu) - 4
+    odd_start = nearest_odd(mu) - 4
 
     def one(start_low: int):
         bins = [
@@ -246,72 +253,28 @@ def build_ladder(consensus: float, sigma: float, mode: str):
         rows = []
         for lo, hi, label in bins:
             if lo is None:
-                p = norm_cdf((hi - consensus) / sigma)
+                p = norm_cdf((hi - mu) / sigma)
             elif hi is None:
-                p = 1.0 - norm_cdf((lo - consensus) / sigma)
+                p = 1.0 - norm_cdf((lo - mu) / sigma)
             else:
-                p = prob_between(consensus, sigma, lo, hi + 1e-9)
+                p = prob_between(mu, sigma, lo, hi + 1e-9)
             rows.append({"Bracket": label, "WinProb": p})
-        total = sum(x["WinProb"] for x in rows)
-        for x in rows:
-            x["WinProb"] = x["WinProb"] / total if total > 0 else 0.0
+        total = sum(r["WinProb"] for r in rows)
+        for r in rows:
+            r["WinProb"] = r["WinProb"] / total if total > 0 else 0.0
         return rows
 
     ladders = {"even": one(even_start), "odd": one(odd_start)}
-    chosen = mode if mode in ("even", "odd") else max(
-        ladders.keys(), key=lambda k: max(x["WinProb"] for x in ladders[k])
-    )
+    chosen = mode if mode in ("even", "odd") else max(ladders.keys(), key=lambda k: max(x["WinProb"] for x in ladders[k]))
     return ladders[chosen], chosen
 
 
-def classify_risk(spread: float, sigma: float, top_prob: float):
+def classify_stability(spread: float, sigma: float, top_prob: float):
     if spread >= 4.0 or sigma >= 3.5 or top_prob < 0.20:
-        return "PASS", "🔴", "Forecast stability is poor: uncertainty is too high."
+        return "PASS", "🔴", "Forecast stability is poor."
     if spread >= 2.5 or sigma >= 3.0 or top_prob < 0.25:
-        return "HIGH RISK", "🟡", "Forecast stability is moderate: only playable with strong market edge."
-    return "LOW RISK", "🟢", "Forecast stability is good: models are relatively aligned."
-
-
-def parse_market_lines(text: str):
-    out = {}
-    for raw in (text or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-
-        odds_match = re.search(r"([+-]\d{2,5})", line)
-        cents_match = re.search(r"(\d{1,3})\s*(?:c|¢)\b", line, flags=re.IGNORECASE)
-
-        label = line
-        price_cents = None
-        if odds_match:
-            price_cents = yes_price_from_american_odds(float(odds_match.group(1)))
-            label = line[:odds_match.start()].strip()
-        elif cents_match:
-            price_cents = float(cents_match.group(1))
-            label = line[:cents_match.start()].strip()
-
-        label = label.replace("º", "°").strip()
-        if label and price_cents is not None:
-            out[label] = clamp(price_cents, 0.0, 100.0)
-    return out
-
-
-def best_effort_import_from_url(url: str):
-    if not url.strip():
-        return ""
-    html = safe_get_text(url.strip(), timeout=10)
-    if not html:
-        return ""
-    labels = re.findall(r'(\d{1,3}°\s*(?:to)\s*\d{1,3}°|\d{1,3}°\s*or\s*(?:below|above))', html, flags=re.IGNORECASE)
-    odds = re.findall(r'([+-]\d{2,5})', html)
-    labels = [re.sub(r"\s+", " ", x).replace("º", "°").strip() for x in labels]
-    if not labels or not odds:
-        return ""
-    lines = []
-    for i in range(min(len(labels), len(odds))):
-        lines.append(f"{labels[i]} {odds[i]}")
-    return "\n".join(lines)
+        return "HIGH RISK", "🟡", "Forecast stability is moderate."
+    return "LOW RISK", "🟢", "Forecast stability is good."
 
 
 city = st.selectbox("City", list(CITIES.keys()), index=list(CITIES.keys()).index(DEFAULT_CITY))
@@ -319,6 +282,7 @@ cfg = CITIES[city]
 lat = float(cfg["lat"])
 lon = float(cfg["lon"])
 station = str(cfg["station"])
+station_label = str(cfg["label"])
 tz = str(cfg["tz"])
 tzinfo = ZoneInfo(tz)
 local_now = datetime.now(tzinfo)
@@ -332,21 +296,17 @@ with st.expander("Settings", expanded=True):
     do_not_bet_prob = st.slider("Trade filter: top probability must exceed", 0.40, 0.70, 0.55, 0.01)
     strong_edge_threshold = st.slider("Strong edge threshold (%)", 1.0, 30.0, 8.0, 0.5)
     small_edge_threshold = st.slider("Small edge threshold (%)", 0.5, 20.0, 3.0, 0.5)
-    airport_bias = st.slider("Airport bias correction (°F)", -1.5, 1.5, 0.8, 0.1)
+    settlement_bias = st.slider("Settlement station bias correction (°F)", -1.5, 1.5, 0.0, 0.1)
     no_bet_after_hour = st.slider("No new bets after local hour", 10, 15, 11, 1)
 
 with st.expander("Kalshi Odds / EV (recommended)", expanded=True):
-    import_mode = st.selectbox("Odds input method", ["None", "Paste lines", "Best-effort URL import"], index=1)
-    market_url = ""
-    market_text = ""
-    if import_mode == "Paste lines":
-        market_text = st.text_area(
-            "Paste Kalshi lines with YES odds or cents",
-            height=140,
-            placeholder="82° to 83° +566\n84° to 85° -489\n86° or above +1011\n77° or below 1c",
-        )
-    elif import_mode == "Best-effort URL import":
-        market_url = st.text_input("Kalshi market URL", value="", placeholder="Paste Kalshi market URL")
+    market_text = st.text_area(
+        "Paste Kalshi lines with YES odds or cents",
+        height=140,
+        placeholder="82° to 83° +566\n84° to 85° -489\n86° or above +1011\n77° or below 1c",
+    )
+
+st.info(f"Settlement station for **{city}**: **{station}** — {station_label}")
 
 sources = []
 chart_df = None
@@ -369,7 +329,7 @@ if include_nws:
     _, nws_high, nws_err = fetch_nws_hourly(lat, lon)
     sources.append(("NWS (forecastHourly)", nws_high, nws_err))
 
-obs_temp_f, obs_time, obs_err = fetch_station_obs(station)
+settle_temp_f, settle_obs_time, settle_obs_err = fetch_station_obs(station)
 
 vals = [x[1] for x in sources if x[1] is not None]
 if not vals:
@@ -394,12 +354,12 @@ with c1:
     st.metric("Cross-source spread", f"{spread:.1f}°F")
 with c2:
     st.metric("Model uncertainty (σ)", f"{sigma:.2f}°F")
-    if obs_temp_f is not None and obs_time is not None:
-        st.metric(f"Current airport temp ({station})", f"{obs_temp_f:.1f}°F")
-        st.caption(f"Obs time: {obs_time.astimezone(tzinfo).strftime('%a %b %d, %I:%M %p')} local")
+    if settle_temp_f is not None and settle_obs_time is not None:
+        st.metric(f"Current settlement temp ({station})", f"{settle_temp_f:.1f}°F")
+        st.caption(f"Obs time: {settle_obs_time.astimezone(tzinfo).strftime('%a %b %d, %I:%M %p')} local")
     else:
-        st.metric(f"Current airport temp ({station})", "—")
-        st.caption(f"Obs error: {obs_err}")
+        st.metric(f"Current settlement temp ({station})", "—")
+        st.caption(f"Obs error: {settle_obs_err}")
 
 st.divider()
 st.subheader("Live trend / nowcast")
@@ -407,69 +367,45 @@ st.subheader("Live trend / nowcast")
 heating_rate = None
 peak_hour = None
 trend_proj_high = None
-acceleration_note = None
 
-if obs_temp_f is not None and chart_df is not None and not chart_df.empty:
+if settle_temp_f is not None and chart_df is not None and not chart_df.empty:
     sunrise_for_calc = sunrise_local if sunrise_local is not None else local_now.replace(hour=6, minute=0, second=0, microsecond=0)
     idx = (chart_df["time"] - sunrise_for_calc).abs().idxmin()
     sunrise_temp = float(chart_df.loc[idx, "temp_f"])
     hrs = max(0.25, (local_now - sunrise_for_calc).total_seconds() / 3600.0)
-
     if local_now > sunrise_for_calc:
-        heating_rate = (obs_temp_f - sunrise_temp) / hrs
+        heating_rate = (settle_temp_f - sunrise_temp) / hrs
 
     day_df = chart_df[chart_df["time"].dt.date == local_now.date()].copy()
     day_df = day_df[(day_df["time"].dt.hour >= 8) & (day_df["time"].dt.hour <= 20)]
     if not day_df.empty:
         peak_row = day_df.loc[day_df["temp_f"].idxmax()]
         peak_hour = peak_row["time"]
-
-        hist_df = chart_df[chart_df["time"] <= local_now].tail(4).copy()
-        if len(hist_df) >= 3:
-            hist_df = hist_df.sort_values("time")
-            slopes = []
-            for i in range(1, len(hist_df)):
-                dt_hr = (hist_df["time"].iloc[i] - hist_df["time"].iloc[i - 1]).total_seconds() / 3600.0
-                if dt_hr > 0:
-                    slopes.append((hist_df["temp_f"].iloc[i] - hist_df["temp_f"].iloc[i - 1]) / dt_hr)
-            if len(slopes) >= 2:
-                accel = slopes[-1] - slopes[-2]
-                if accel > 0.4:
-                    acceleration_note = f"Heating acceleration positive ({accel:+.2f} °F/hr). Upside risk slightly higher."
-                elif accel < -0.4:
-                    acceleration_note = f"Heating acceleration negative ({accel:+.2f} °F/hr). Downside risk slightly higher."
-                else:
-                    acceleration_note = f"Heating acceleration stable ({accel:+.2f} °F/hr)."
-
         if heating_rate is not None:
             hours_to_peak = max(0.0, (peak_hour - local_now).total_seconds() / 3600.0)
-            trend_proj_high = obs_temp_f + hours_to_peak * heating_rate
+            trend_proj_high = settle_temp_f + hours_to_peak * heating_rate
 
 a, b, c = st.columns(3)
 a.metric("Heating rate since sunrise", "—" if heating_rate is None else f"{heating_rate:+.2f} °F/hr")
 b.metric("Forecast peak hour", "—" if peak_hour is None else peak_hour.strftime("%I:%M %p"))
 c.metric("Projected high (trend-based)", "—" if trend_proj_high is None else f"{trend_proj_high:.1f}°F")
 
-if acceleration_note:
-    st.info(acceleration_note)
-
-blended_high = consensus
+mu = consensus
 if trend_proj_high is not None:
-    blended_high = 0.70 * consensus + 0.30 * trend_proj_high
-    st.caption(f"Blended model high = 70% forecast consensus + 30% live trend = **{blended_high:.1f}°F**")
+    mu = 0.70 * consensus + 0.30 * trend_proj_high
+    st.caption(f"Blended model high = 70% forecast consensus + 30% live trend = **{mu:.1f}°F**")
 
-biased_high = blended_high + airport_bias
-st.caption(f"Airport-biased high = blended high + bias ({airport_bias:+.1f}°F) = **{biased_high:.1f}°F**")
+mu += settlement_bias
+if settlement_bias != 0:
+    st.caption(f"Settlement-adjusted high = blended high + bias ({settlement_bias:+.1f}°F) = **{mu:.1f}°F**")
 
 st.divider()
 st.subheader("Suggested Kalshi Bracket")
-
-ladder, chosen_mode = build_ladder(biased_high, sigma, ladder_mode)
+ladder, chosen_mode = build_ladder(mu, sigma, ladder_mode)
 top = max(ladder, key=lambda x: x["WinProb"])
-risk_level, risk_icon, risk_msg = classify_risk(spread, sigma, top["WinProb"])
+risk_level, risk_icon, risk_msg = classify_stability(spread, sigma, top["WinProb"])
 
 st.caption(f"Ladder alignment used: **{chosen_mode}**")
-
 if risk_level == "LOW RISK":
     st.success(f"{risk_icon} FORECAST STABILITY: {risk_level} — {risk_msg}")
 elif risk_level == "HIGH RISK":
@@ -477,32 +413,22 @@ elif risk_level == "HIGH RISK":
 else:
     st.error(f"{risk_icon} FORECAST STABILITY: {risk_level} — {risk_msg}")
 
-do_not_bet_reasons = []
+trade_filter_reasons = []
 if top["WinProb"] < do_not_bet_prob:
-    do_not_bet_reasons.append(f"Top bracket only {top['WinProb']*100:.1f}% (< {do_not_bet_prob*100:.0f}%)")
+    trade_filter_reasons.append(f"Top bracket only {top['WinProb']*100:.1f}% (< {do_not_bet_prob*100:.0f}%)")
 if local_now.hour >= no_bet_after_hour and local_now.minute > 15:
-    do_not_bet_reasons.append(f"Past your no-new-bets cutoff ({no_bet_after_hour}:15 local)")
+    trade_filter_reasons.append(f"Past cutoff ({no_bet_after_hour}:15 local)")
 if risk_level == "PASS":
-    do_not_bet_reasons.append("Forecast stability state is PASS")
+    trade_filter_reasons.append("Forecast stability state is PASS")
 
-if do_not_bet_reasons:
-    st.error("TRADE FILTER: DO NOT BET — " + " | ".join(do_not_bet_reasons))
+if trade_filter_reasons:
+    st.error("TRADE FILTER: DO NOT BET — " + " | ".join(trade_filter_reasons))
 else:
-    st.success("TRADE FILTER: BET ALLOWED — confidence passed your filter rules.")
+    st.success("TRADE FILTER: BET ALLOWED — confidence passed your rules.")
 
 st.success(f"Suggested bracket: **{top['Bracket']}** (model ≈ **{top['WinProb']*100:.0f}%**)")
 
-market_prices = {}
-if import_mode == "Paste lines" and market_text.strip():
-    market_prices = parse_market_lines(market_text)
-elif import_mode == "Best-effort URL import" and market_url.strip():
-    imported = best_effort_import_from_url(market_url)
-    if imported:
-        st.code(imported)
-        market_prices = parse_market_lines(imported)
-    else:
-        st.warning("URL import failed. Paste lines is more reliable.")
-
+market_prices = parse_market_lines(market_text) if market_text.strip() else {}
 rows = []
 best_bet = None
 
@@ -512,14 +438,12 @@ for x in sorted(ladder, key=lambda r: r["WinProb"], reverse=True):
         "Win %": f"{x['WinProb']*100:.1f}%",
         "Fair YES": f"{fair_cents_from_prob(x['WinProb']):.1f}¢",
     }
-
     if x["Bracket"] in market_prices:
         yes_cents = market_prices[x["Bracket"]]
         market_prob = yes_cents / 100.0
         edge = (x["WinProb"] - market_prob) * 100.0
         ev = expected_value_per_1_dollar(x["WinProb"], yes_cents)
-
-        if do_not_bet_reasons:
+        if trade_filter_reasons:
             signal = "NO BET"
         elif edge >= strong_edge_threshold and ev > 0:
             signal = "BET"
@@ -527,22 +451,13 @@ for x in sorted(ladder, key=lambda r: r["WinProb"], reverse=True):
             signal = "SMALL EDGE"
         else:
             signal = "NO BET"
-
         row["Market YES"] = f"{yes_cents:.1f}¢"
         row["Edge %"] = f"{edge:+.1f}%"
         row["EV / $1"] = f"{ev:+.3f}"
         row["Signal"] = signal
-
         if signal == "BET":
             if best_bet is None or edge > best_bet["edge"]:
-                best_bet = {
-                    "bracket": x["Bracket"],
-                    "edge": edge,
-                    "ev": ev,
-                    "price": yes_cents,
-                    "prob": x["WinProb"] * 100.0,
-                }
-
+                best_bet = {"bracket": x["Bracket"], "edge": edge, "ev": ev, "price": yes_cents, "prob": x["WinProb"]*100.0}
     rows.append(row)
 
 st.subheader("Kalshi Edge Table")
@@ -553,47 +468,18 @@ if market_prices:
     if best_bet is not None:
         st.success(
             f"BET SIGNAL: **{best_bet['bracket']}** | Model **{best_bet['prob']:.1f}%** | "
-            f"Market YES **{best_bet['price']:.1f}¢** | Edge **{best_bet['edge']:+.1f}%** | "
-            f"EV per $1 **{best_bet['ev']:+.3f}**"
+            f"Market YES **{best_bet['price']:.1f}¢** | Edge **{best_bet['edge']:+.1f}%** | EV per $1 **{best_bet['ev']:+.3f}**"
         )
     else:
         st.warning("No live edge gate confirmation. Do not force a bet.")
-
-st.subheader("Market Correction Warning")
-if market_prices:
-    top_market_row = None
-    for r in rows:
-        if r["Bracket"] == top["Bracket"] and "Edge %" in r:
-            top_market_row = r
-            break
-
-    if top_market_row is None:
-        st.info("Paste the current Kalshi price for the model's top bracket to verify live edge.")
-    else:
-        try:
-            edge_val = float(str(top_market_row["Edge %"]).replace("%", ""))
-        except Exception:
-            edge_val = None
-
-        if edge_val is not None:
-            if do_not_bet_reasons:
-                st.error("Even if a market looks cheap, your trade filter says pass.")
-            elif edge_val >= strong_edge_threshold:
-                st.success("Live edge still strong. Market may not have fully corrected.")
-            elif edge_val >= 0:
-                st.warning("Small remaining edge only. Size down or pass.")
-            else:
-                st.error("Market likely corrected already. Do not chase this contract.")
 else:
-    st.info("Add current Kalshi odds to activate live edge / correction checks.")
+    st.info("Paste Kalshi prices to activate live edge / EV / bet signal.")
 
-st.divider()
 st.subheader("Decision Window")
 target = local_now.replace(hour=10, minute=30, second=0, microsecond=0)
 grace_end = target + timedelta(minutes=grace_minutes)
 st.caption(
-    f"Local time now: **{local_now.strftime('%a %b %d, %I:%M %p')}** | "
-    f"Target check: **10:30 AM** | Grace: **{grace_minutes} min**"
+    f"Local time now: **{local_now.strftime('%a %b %d, %I:%M %p')}** | Target check: **10:30 AM** | Grace: **{grace_minutes} min**"
 )
 if local_now < target:
     st.warning("Early. Target check is 10:30 AM local.")
@@ -603,7 +489,6 @@ else:
     st.warning("Past preferred window. Market is often sharper later in the day.")
 
 if show_hourly_chart and chart_df is not None and not chart_df.empty:
-    st.divider()
     st.subheader("Hourly temperature curve (today)")
     df_plot = chart_df[chart_df["time"].dt.date == local_now.date()].copy()
     if not df_plot.empty:
@@ -612,7 +497,4 @@ if show_hourly_chart and chart_df is not None and not chart_df.empty:
         peak_v = float(df_plot["temp_f"].max())
         st.caption(f"Peak hour (forecast): {peak_t.strftime('%I:%M %p')} at {peak_v:.1f}°F")
 
-st.divider()
-st.caption(
-    "v7.8.1 wording update: FORECAST STABILITY and TRADE FILTER are shown separately so the signals are easier to read."
-)
+st.caption("v8.0 adds Kalshi settlement station mapping and uses the settlement station obs in the model.")
