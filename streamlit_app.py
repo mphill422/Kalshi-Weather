@@ -1,11 +1,8 @@
 # streamlit_app.py
-# Kalshi Weather Model – Daily High [v7.3]
-# Updates:
-# - Adds New York + Atlanta back to city list
-# - Makes Open-Meteo/GFS/HRRR fetches more robust
-# - Adds "heating acceleration" upgrade
-# - Adds EV / bet signal
-# - Keeps ladder alignment, LOW/HIGH/PASS, win %, live airport temp, nowcast
+# Kalshi Weather Model – Daily High [v7.5 ladder fix]
+# Fixes the ladder mismatch by anchoring the 6-contract ladder correctly:
+# lower tail + 4 middle 2-degree bins + upper tail
+# Example: 77 or below, 78-79, 80-81, 82-83, 84-85, 86 or above
 
 import math
 import re
@@ -19,12 +16,9 @@ import streamlit as st
 
 st.set_page_config(page_title="Kalshi Weather Model – Daily High", layout="centered")
 st.title("Kalshi Weather Model – Daily High")
-st.caption(
-    "v7.3: robust model fetching, New York + Atlanta restored, heating acceleration upgrade, "
-    "Kalshi odds / EV, ladder alignment, risk warning, live airport temp, and nowcast."
-)
+st.caption("v7.5: fixes Kalshi ladder alignment, restores city list, keeps risk / win % / nowcast / EV.")
 
-UA = {"User-Agent": "kalshi-weather-model/7.3"}
+UA = {"User-Agent": "kalshi-weather-model/7.5"}
 
 CITIES: Dict[str, Dict[str, str | float]] = {
     "Miami": {"lat": 25.7933, "lon": -80.2906, "station": "KMIA", "tz": "America/New_York"},
@@ -83,6 +77,10 @@ def parse_iso(s: str):
         return None
 
 
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
 def american_odds_to_prob(odds: float):
     if odds == 0:
         return None
@@ -95,7 +93,7 @@ def yes_price_from_american_odds(odds: float):
 
 
 def fair_cents_from_prob(p: float) -> float:
-    return max(0.0, min(100.0, p * 100.0))
+    return clamp(p * 100.0, 0.0, 100.0)
 
 
 def expected_value_per_1_dollar(p: float, yes_price_cents: float) -> float:
@@ -103,55 +101,70 @@ def expected_value_per_1_dollar(p: float, yes_price_cents: float) -> float:
     return p * (1.0 - price) - (1.0 - p) * price
 
 
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
+def _parse_open_meteo_payload(js: dict, tz: str):
+    try:
+        times = js["hourly"]["time"]
+        temps = js["hourly"]["temperature_2m"]
+        df = pd.DataFrame({"time": pd.to_datetime(times), "temp_f": temps})
+        df["time"] = df["time"].dt.tz_localize(ZoneInfo(tz), ambiguous="NaT", nonexistent="shift_forward")
+        df = df.dropna(subset=["time"]).reset_index(drop=True)
+        if df.empty:
+            return None, None, None, "no valid hourly rows"
+        today_high = float(js["daily"]["temperature_2m_max"][0])
+        sunrise = pd.to_datetime(js["daily"]["sunrise"][0]).tz_localize(
+            ZoneInfo(tz), ambiguous="NaT", nonexistent="shift_forward"
+        )
+        return df, today_high, sunrise, ""
+    except Exception as e:
+        return None, None, None, str(e)
 
 
-def fetch_open_meteo(lat: float, lon: float, tz: str, model: Optional[str] = None):
+def fetch_open_meteo_best(lat: float, lon: float, tz: str):
     base = "https://api.open-meteo.com/v1/forecast"
-
-    def _attempt(timezone_value: str):
-        params = {
-            "latitude": lat,
-            "longitude": lon,
-            "temperature_unit": "fahrenheit",
-            "timezone": timezone_value,
-            "hourly": "temperature_2m",
-            "daily": "sunrise,sunset,temperature_2m_max",
-            "forecast_days": 2,
-        }
-        if model:
-            params["models"] = model
-        js = safe_get_json(base, params=params)
-        if not js:
-            return None, None, None, "fetch failed"
-
-        try:
-            times = js["hourly"]["time"]
-            temps = js["hourly"]["temperature_2m"]
-            df = pd.DataFrame({"time": pd.to_datetime(times), "temp_f": temps})
-            df["time"] = df["time"].dt.tz_localize(ZoneInfo(tz), ambiguous="NaT", nonexistent="shift_forward")
-            df = df.dropna(subset=["time"]).reset_index(drop=True)
-            if df.empty:
-                return None, None, None, "no valid hourly rows"
-
-            tmax = float(js["daily"]["temperature_2m_max"][0])
-
-            sunrise = pd.to_datetime(js["daily"]["sunrise"][0])
-            sunrise = sunrise.tz_localize(ZoneInfo(tz), ambiguous="NaT", nonexistent="shift_forward")
-            return df, tmax, sunrise, ""
-        except Exception as e:
-            return None, None, None, str(e)
-
-    df, tmax, sunrise, err = _attempt(tz)
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "temperature_unit": "fahrenheit",
+        "timezone": tz,
+        "hourly": "temperature_2m",
+        "daily": "sunrise,sunset,temperature_2m_max",
+        "forecast_days": 2,
+    }
+    js = safe_get_json(base, params=params)
+    if not js:
+        return None, None, None, "fetch failed"
+    df, hi, sunrise, err = _parse_open_meteo_payload(js, tz)
     if df is not None:
-        return df, tmax, sunrise, ""
+        return df, hi, sunrise, ""
+    params["timezone"] = "auto"
+    js2 = safe_get_json(base, params=params)
+    if not js2:
+        return None, None, None, err or "fetch failed"
+    return _parse_open_meteo_payload(js2, tz)
 
-    df2, tmax2, sunrise2, err2 = _attempt("auto")
-    if df2 is not None:
-        return df2, tmax2, sunrise2, f"fallback:auto after {err}"
 
-    return None, None, None, err2 or err or "fetch failed"
+def fetch_open_meteo_noaa(lat: float, lon: float, tz: str):
+    base = "https://api.open-meteo.com/v1/gfs"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "temperature_unit": "fahrenheit",
+        "timezone": tz,
+        "hourly": "temperature_2m",
+        "daily": "sunrise,sunset,temperature_2m_max",
+        "forecast_days": 2,
+    }
+    js = safe_get_json(base, params=params)
+    if not js:
+        return None, None, None, "fetch failed"
+    df, hi, sunrise, err = _parse_open_meteo_payload(js, tz)
+    if df is not None:
+        return df, hi, sunrise, ""
+    params["timezone"] = "auto"
+    js2 = safe_get_json(base, params=params)
+    if not js2:
+        return None, None, None, err or "fetch failed"
+    return _parse_open_meteo_payload(js2, tz)
 
 
 def fetch_nws_hourly(lat: float, lon: float):
@@ -161,7 +174,6 @@ def fetch_nws_hourly(lat: float, lon: float):
     url = pts.get("properties", {}).get("forecastHourly")
     if not url:
         return None, None, "forecastHourly missing"
-
     fh = safe_get_json(url)
     if not fh:
         return None, None, "forecastHourly failed"
@@ -188,19 +200,41 @@ def fetch_station_obs(station: str):
     js = safe_get_json(f"https://api.weather.gov/stations/{station}/observations/latest")
     if not js:
         return None, None, "station failed"
-
     props = js.get("properties", {})
     ts = parse_iso(props.get("timestamp", ""))
     temp_c = props.get("temperature", {}).get("value")
     if ts is None or temp_c is None:
         return None, None, "obs missing"
-
     return c_to_f(float(temp_c)), ts, ""
 
 
+# -------- ladder logic FIXED --------
+def nearest_even(x: float) -> int:
+    return int(2 * round(x / 2.0))
+
+
+def nearest_odd(x: float) -> int:
+    n = int(round(x))
+    if n % 2 == 0:
+        lower = n - 1
+        upper = n + 1
+        return lower if abs(x - lower) <= abs(x - upper) else upper
+    return n
+
+
 def build_ladder(consensus: float, sigma: float, mode: str):
-    even_start = int(2 * round(consensus / 2.0))
-    odd_start = even_start - 1
+    """
+    Correct 6-contract Kalshi ladder:
+      lower tail + 4 middle bins + upper tail
+
+    Even example:
+      77 or below, 78-79, 80-81, 82-83, 84-85, 86 or above
+
+    Odd example:
+      76 or below, 77-78, 79-80, 81-82, 83-84, 85 or above
+    """
+    even_start = nearest_even(consensus) - 4
+    odd_start = nearest_odd(consensus) - 4
 
     def one(start_low: int):
         bins = [
@@ -220,17 +254,13 @@ def build_ladder(consensus: float, sigma: float, mode: str):
             else:
                 p = prob_between(consensus, sigma, lo, hi + 1e-9)
             rows.append({"Bracket": label, "WinProb": p})
-
-        s = sum(x["WinProb"] for x in rows)
+        total = sum(x["WinProb"] for x in rows)
         for x in rows:
-            x["WinProb"] = x["WinProb"] / s if s > 0 else 0.0
+            x["WinProb"] = x["WinProb"] / total if total > 0 else 0.0
         return rows
 
     ladders = {"even": one(even_start), "odd": one(odd_start)}
-    if mode in ("even", "odd"):
-        chosen = mode
-    else:
-        chosen = max(ladders.keys(), key=lambda k: max(x["WinProb"] for x in ladders[k]))
+    chosen = mode if mode in ("even", "odd") else max(ladders.keys(), key=lambda k: max(x["WinProb"] for x in ladders[k]))
     return ladders[chosen], chosen
 
 
@@ -248,7 +278,6 @@ def parse_market_lines(text: str):
         line = raw.strip()
         if not line:
             continue
-
         odds_match = re.search(r"([+-]\d{2,5})", line)
         cents_match = re.search(r"(\d{1,3})\s*(?:c|¢)\b", line, flags=re.IGNORECASE)
 
@@ -275,20 +304,18 @@ def best_effort_import_from_url(url: str):
     html = safe_get_text(url.strip(), timeout=10)
     if not html:
         return ""
-
     labels = re.findall(r'(\d{1,3}°\s*(?:to)\s*\d{1,3}°|\d{1,3}°\s*or\s*(?:below|above))', html, flags=re.IGNORECASE)
     odds = re.findall(r'([+-]\d{2,5})', html)
     labels = [re.sub(r"\s+", " ", x).replace("º", "°").strip() for x in labels]
-
     if not labels or not odds:
         return ""
-
     lines = []
     for i in range(min(len(labels), len(odds))):
         lines.append(f"{labels[i]} {odds[i]}")
     return "\n".join(lines)
 
 
+# ------------------------- UI -------------------------
 city = st.selectbox("City", list(CITIES.keys()), index=list(CITIES.keys()).index(DEFAULT_CITY))
 cfg = CITIES[city]
 lat = float(cfg["lat"])
@@ -299,9 +326,8 @@ tzinfo = ZoneInfo(tz)
 local_now = datetime.now(tzinfo)
 
 with st.expander("Settings", expanded=True):
-    include_gfs = st.toggle("Include Open-Meteo GFS (extra check)", value=True)
+    include_noaa = st.toggle("Include Open-Meteo NOAA GFS/HRRR", value=True)
     include_nws = st.toggle("Include NWS (api.weather.gov)", value=True)
-    include_hrrr = st.toggle("Include HRRR (best-effort)", value=True)
     show_hourly_chart = st.toggle("Show hourly chart", value=True)
     grace_minutes = st.slider("Grace minutes after 10:30 local", 0, 180, 80, 5)
     ladder_mode = st.selectbox("Kalshi ladder alignment", ["auto", "even", "odd"], index=0)
@@ -320,27 +346,27 @@ with st.expander("Kalshi Odds / EV (optional)", expanded=False):
     elif import_mode == "Best-effort URL import":
         market_url = st.text_input("Kalshi market URL", value="", placeholder="Paste Kalshi market URL")
 
+# ------------------------- fetch -------------------------
 sources = []
 chart_df = None
 sunrise_local = None
 
-om_df, om_high, om_sunrise, om_err = fetch_open_meteo(lat, lon, tz)
-sources.append(("Open-Meteo", om_high, om_err))
-if om_high is not None:
-    chart_df = om_df
-    sunrise_local = om_sunrise
+best_df, best_high, best_sunrise, best_err = fetch_open_meteo_best(lat, lon, tz)
+sources.append(("Open-Meteo (best match)", best_high, best_err))
+if best_high is not None:
+    chart_df = best_df
+    sunrise_local = best_sunrise
 
-if include_gfs:
-    _, gfs_high, _, gfs_err = fetch_open_meteo(lat, lon, tz, model="gfs")
-    sources.append(("Open-Meteo (GFS)", gfs_high, gfs_err))
+if include_noaa:
+    noaa_df, noaa_high, noaa_sunrise, noaa_err = fetch_open_meteo_noaa(lat, lon, tz)
+    sources.append(("Open-Meteo NOAA (GFS/HRRR)", noaa_high, noaa_err))
+    if chart_df is None and noaa_high is not None:
+        chart_df = noaa_df
+        sunrise_local = noaa_sunrise
 
 if include_nws:
     _, nws_high, nws_err = fetch_nws_hourly(lat, lon)
     sources.append(("NWS (forecastHourly)", nws_high, nws_err))
-
-if include_hrrr:
-    _, hrrr_high, _, hrrr_err = fetch_open_meteo(lat, lon, tz, model="hrrr")
-    sources.append(("HRRR (best-effort)", hrrr_high, hrrr_err))
 
 obs_temp_f, obs_time, obs_err = fetch_station_obs(station)
 
@@ -374,6 +400,7 @@ with c2:
         st.metric(f"Current airport temp ({station})", "—")
         st.caption(f"Obs error: {obs_err}")
 
+# nowcast
 st.divider()
 st.subheader("Live trend / nowcast")
 
@@ -384,7 +411,6 @@ acceleration_note = None
 
 if obs_temp_f is not None and chart_df is not None and not chart_df.empty:
     sunrise_for_calc = sunrise_local if sunrise_local is not None else local_now.replace(hour=6, minute=0, second=0, microsecond=0)
-
     idx = (chart_df["time"] - sunrise_for_calc).abs().idxmin()
     sunrise_temp = float(chart_df.loc[idx, "temp_f"])
     hrs = max(0.25, (local_now - sunrise_for_calc).total_seconds() / 3600.0)
@@ -403,10 +429,9 @@ if obs_temp_f is not None and chart_df is not None and not chart_df.empty:
             hist_df = hist_df.sort_values("time")
             slopes = []
             for i in range(1, len(hist_df)):
-                dt_hr = (hist_df["time"].iloc[i] - hist_df["time"].iloc[i-1]).total_seconds() / 3600.0
+                dt_hr = (hist_df["time"].iloc[i] - hist_df["time"].iloc[i - 1]).total_seconds() / 3600.0
                 if dt_hr > 0:
-                    slope = (hist_df["temp_f"].iloc[i] - hist_df["temp_f"].iloc[i-1]) / dt_hr
-                    slopes.append(slope)
+                    slopes.append((hist_df["temp_f"].iloc[i] - hist_df["temp_f"].iloc[i - 1]) / dt_hr)
             if len(slopes) >= 2:
                 accel = slopes[-1] - slopes[-2]
                 if accel > 0.4:
@@ -437,6 +462,7 @@ if trend_proj_high is not None:
     blended_high = 0.70 * consensus + 0.30 * trend_proj_high
     st.caption(f"Blended model high = 70% forecast consensus + 30% live trend = **{blended_high:.1f}°F**")
 
+# ladder / risk
 st.divider()
 st.subheader("Suggested Kalshi Bracket")
 ladder, chosen_mode = build_ladder(blended_high, sigma, ladder_mode)
@@ -467,28 +493,23 @@ elif import_mode == "Best-effort URL import" and market_url.strip():
 
 rows = []
 best_bet = None
-
 for x in sorted(ladder, key=lambda r: r["WinProb"], reverse=True):
     row = {
         "Bracket": x["Bracket"],
         "Win %": f"{x['WinProb']*100:.1f}%",
         "Fair YES": f"{fair_cents_from_prob(x['WinProb']):.1f}¢",
     }
-
     if x["Bracket"] in market_prices:
         yes_cents = market_prices[x["Bracket"]]
         market_prob = yes_cents / 100.0
         edge = (x["WinProb"] - market_prob) * 100.0
         ev = expected_value_per_1_dollar(x["WinProb"], yes_cents)
-
         row["Market YES"] = f"{yes_cents:.1f}¢"
         row["Edge %"] = f"{edge:+.1f}%"
         row["EV / $1"] = f"{ev:+.3f}"
-
         if edge >= min_edge_pct and ev > 0:
             if best_bet is None or edge > best_bet["edge"]:
                 best_bet = {"bracket": x["Bracket"], "edge": edge, "ev": ev, "price": yes_cents}
-
     rows.append(row)
 
 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -508,7 +529,6 @@ st.divider()
 st.subheader("Decision Window")
 target = local_now.replace(hour=10, minute=30, second=0, microsecond=0)
 grace_end = target + timedelta(minutes=grace_minutes)
-
 st.caption(
     f"Local time now: **{local_now.strftime('%a %b %d, %I:%M %p')}** | "
     f"Target check: **10:30 AM** | Grace: **{grace_minutes} min**"
@@ -531,7 +551,4 @@ if show_hourly_chart and chart_df is not None and not chart_df.empty:
         st.caption(f"Peak hour (forecast): {peak_t.strftime('%I:%M %p')} at {peak_v:.1f}°F")
 
 st.divider()
-st.caption(
-    "Notes: New York + Atlanta restored. GFS / HRRR may still fail around update windows. "
-    "URL import is best-effort only; paste lines is more reliable."
-)
+st.caption("v7.5 fixes the ladder mismatch. Example even ladder: 77↓, 78-79, 80-81, 82-83, 84-85, 86↑.")
