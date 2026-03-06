@@ -1,5 +1,12 @@
 # streamlit_app.py
-# Kalshi Weather Model – Daily High [v7 clean rebuild]
+# Kalshi Weather Model – Daily High [v7.1 clean rebuild]
+# Fixes:
+# - NWS datetime parsing crash fixed
+# - Auto ladder
+# - LOW / HIGH RISK / PASS
+# - Win % per bracket
+# - Live airport temp
+# - Heating rate / projected high
 
 import math
 from datetime import datetime, timedelta
@@ -12,9 +19,9 @@ import streamlit as st
 
 st.set_page_config(page_title="Kalshi Weather Model – Daily High", layout="centered")
 st.title("Kalshi Weather Model – Daily High")
-st.caption("Fresh rebuild: corrected ladder logic, LOW / HIGH RISK / PASS restored, win % shown next to each bracket.")
+st.caption("Fresh rebuild v7.1: fixed NWS crash, corrected ladder logic, LOW / HIGH RISK / PASS restored, win % shown next to each bracket.")
 
-UA = {"User-Agent": "kalshi-weather-model/7"}
+UA = {"User-Agent": "kalshi-weather-model/7.1"}
 
 CITIES: Dict[str, Dict[str, str | float]] = {
     "Miami": {"lat": 25.7933, "lon": -80.2906, "station": "KMIA", "tz": "America/New_York"},
@@ -101,6 +108,8 @@ def fetch_nws_hourly(lat: float, lon: float):
     if not rows:
         return None, None, "parse failed"
     df = pd.DataFrame(rows).sort_values("time")
+    # Critical fix: force datetime dtype so .dt accessor always works
+    df["time"] = pd.to_datetime(df["time"], utc=True)
     d0 = df["time"].iloc[0].date()
     today_high = float(df[df["time"].dt.date == d0]["temp_f"].max())
     return df, today_high, ""
@@ -297,4 +306,4 @@ if show_hourly_chart and chart_df is not None and not chart_df.empty:
         st.caption(f"Peak hour (forecast): {peak_t.strftime('%I:%M %p')} at {peak_v:.1f}°F")
 
 st.divider()
-st.caption("Fresh rebuild v7: no pasted-contract workflow, corrected ladder logic, LOW/HIGH/PASS restored.")
+st.caption("Fresh rebuild v7.1: fixed NWS datetime crash, no pasted-contract workflow, corrected ladder logic, LOW/HIGH/PASS restored.")
