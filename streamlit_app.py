@@ -1,18 +1,14 @@
-# streamlit_app.py
-# Kalshi Weather Model – Daily High [v8.4]
-# Trading-focused upgrade:
-# - exact cutoff time (hour + minute)
-# - trade day quality score: HIGH EDGE / NORMAL / NO TRADE
-# - top-two bracket gap
-# - stronger no-trade gating
-# - revision tracker
-# - noon lag / momentum checks
-# - settlement station alignment
-# - EV / edge table
+ # streamlit_app.py
+# Kalshi Weather Model – Daily High [v8.5]
+# Adds a market mispricing detector on top of v8.4:
+# - explicit MODEL vs MARKET gap
+# - MISPRICED / FAIR / OVERPRICED labels
+# - clearer edge buckets
+# - keeps settlement stations, trade day quality, top-two gap,
+#   revision tracker, momentum checks, exact cutoff, EV table
 #
-# Notes:
-# This tool is built to reduce bad trades and improve decision quality.
-# It cannot guarantee wins.
+# Note:
+# This improves trade selection clarity. It does not guarantee wins.
 
 import math
 import re
@@ -24,11 +20,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Model – Daily High (v8.4)", layout="centered")
-st.title("Model – Daily High (v8.4)")
-st.caption("Trading-focused version: exact cutoff, trade day quality score, top-two gap, stronger no-trade logic, and settlement-station alignment.")
+st.set_page_config(page_title="Model – Daily High (v8.5)", layout="centered")
+st.title("Model – Daily High (v8.5)")
+st.caption("Adds market mispricing detection so you can see when Kalshi is clearly off, fair, or overpriced.")
 
-UA = {"User-Agent": "kalshi-weather-model/8.4"}
+UA = {"User-Agent": "kalshi-weather-model/8.5"}
 
 CITIES: Dict[str, Dict[str, str | float]] = {
     "Miami": {"lat": 25.7933, "lon": -80.2906, "station": "KMIA", "label": "Miami Intl Airport", "tz": "America/New_York"},
@@ -291,35 +287,29 @@ def score_trade_day(source_count: int, spread: float, sigma: float, top_prob: fl
         score += 2
     elif source_count == 2:
         score += 1
-
     if spread <= 1.5:
         score += 2
     elif spread <= 2.2:
         score += 1
-
     if sigma <= 1.7:
         score += 2
     elif sigma <= 2.3:
         score += 1
-
     if top_prob >= 0.62:
         score += 3
     elif top_prob >= 0.55:
         score += 2
     elif top_prob >= 0.50:
         score += 1
-
     if top_gap >= 0.12:
         score += 2
     elif top_gap >= 0.07:
         score += 1
-
     if momentum_delta is not None:
         if abs(momentum_delta) <= 1.0:
             score += 1
         elif momentum_delta >= 1.0:
             score += 1
-
     if revision_bias == 0:
         score += 1
     elif revision_bias > 0:
@@ -330,6 +320,18 @@ def score_trade_day(source_count: int, spread: float, sigma: float, top_prob: fl
     if score >= 6:
         return "NORMAL DAY", "🟡", f"Trade score {score:.1f}/13"
     return "NO TRADE DAY", "🔴", f"Trade score {score:.1f}/13"
+
+
+def classify_mispricing(edge_pct: float, ev: float):
+    if edge_pct >= 12 and ev > 0:
+        return "🔥 MISPRICED", "Large model edge"
+    if edge_pct >= 6 and ev > 0:
+        return "✅ UNDERPRICED", "Positive edge"
+    if abs(edge_pct) <= 3:
+        return "⚖️ FAIR", "Near model fair value"
+    if edge_pct < -3:
+        return "❌ OVERPRICED", "Market too expensive"
+    return "—", ""
 
 
 city = st.selectbox("City", list(CITIES.keys()), index=list(CITIES.keys()).index(DEFAULT_CITY))
@@ -449,7 +451,6 @@ if revision_rows:
     first_rev = rev_vals[0]
     net_change = latest_rev - first_rev
     recent_change = latest_rev - (rev_vals[-2] if len(rev_vals) >= 2 else first_rev)
-
     if net_change <= -1.0:
         revision_bias = -0.7
         revision_msg = f"Forecast revisions trending cooler ({net_change:+.1f}°F)."
@@ -614,6 +615,7 @@ for x in ordered:
         market_prob = yes_cents / 100.0
         edge = (x["WinProb"] - market_prob) * 100.0
         ev = expected_value_per_1_dollar(x["WinProb"], yes_cents)
+        mispricing, note = classify_mispricing(edge, ev)
         if trade_filter_reasons:
             signal = "NO BET"
         elif edge >= strong_edge_threshold and ev > 0:
@@ -623,28 +625,46 @@ for x in ordered:
         else:
             signal = "NO BET"
         row["Market YES"] = f"{yes_cents:.1f}¢"
-        row["Edge %"] = f"{edge:+.1f}%"
+        row["Model vs Mkt"] = f"{edge:+.1f}%"
         row["EV / $1"] = f"{ev:+.3f}"
+        row["Mispricing"] = mispricing
         row["Signal"] = signal
         if signal == "BET":
             if best_bet is None or edge > best_bet["edge"]:
-                best_bet = {"bracket": x["Bracket"], "edge": edge, "ev": ev, "price": yes_cents, "prob": x["WinProb"] * 100.0}
+                best_bet = {
+                    "bracket": x["Bracket"],
+                    "edge": edge,
+                    "ev": ev,
+                    "price": yes_cents,
+                    "prob": x["WinProb"] * 100.0,
+                    "mispricing": mispricing,
+                    "note": note,
+                }
     rows.append(row)
 
 st.subheader("Kalshi Edge Table")
 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 if market_prices:
+    st.subheader("Market Mispricing Detector")
+    flagged = [r for r in rows if r.get("Mispricing") in ("🔥 MISPRICED", "✅ UNDERPRICED")]
+    if flagged:
+        st.success("Market has at least one bracket priced below the model.")
+        st.dataframe(pd.DataFrame(flagged), use_container_width=True, hide_index=True)
+    else:
+        st.info("No strong underpriced bracket detected right now.")
+
     st.subheader("Bet Signal")
     if best_bet is not None:
         st.success(
-            f"BET SIGNAL: **{best_bet['bracket']}** | Model **{best_bet['prob']:.1f}%** | "
-            f"Market YES **{best_bet['price']:.1f}¢** | Edge **{best_bet['edge']:+.1f}%** | EV per $1 **{best_bet['ev']:+.3f}**"
+            f"{best_bet['mispricing']} | **{best_bet['bracket']}** | "
+            f"Model **{best_bet['prob']:.1f}%** | Market YES **{best_bet['price']:.1f}¢** | "
+            f"Gap **{best_bet['edge']:+.1f}%** | EV per $1 **{best_bet['ev']:+.3f}**"
         )
     else:
         st.warning("No live edge gate confirmation. Do not force a bet.")
 else:
-    st.info("Paste Kalshi prices to activate live edge / EV / bet signal.")
+    st.info("Paste Kalshi prices to activate live edge / EV / mispricing detection.")
 
 st.subheader("Decision Window")
 target = local_now.replace(hour=10, minute=30, second=0, microsecond=0)
@@ -670,4 +690,4 @@ if show_hourly_chart and chart_df is not None and not chart_df.empty:
         peak_v = float(df_plot["temp_f"].max())
         st.caption(f"Peak hour (forecast): {peak_t.strftime('%I:%M %p')} at {peak_v:.1f}°F")
 
-st.caption("v8.4 is the stronger trade version: exact cutoff, trade day quality score, top-two gap, and tighter no-trade logic.")
+st.caption("v8.5 adds a clearer market mispricing detector so you can separate genuinely cheap brackets from fair or overpriced ones.")
