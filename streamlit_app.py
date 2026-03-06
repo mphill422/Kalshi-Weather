@@ -1,32 +1,27 @@
 # streamlit_app.py
-# Kalshi Weather Model – Daily High [v8.1]
-# Adds peak heating momentum model:
-# - compares live settlement-station temperature to forecast track
-# - estimates if day is running hotter/cooler than expected
-# - adjusts blended high using momentum
-# Keeps:
-# - Kalshi settlement station map
-# - live settlement obs
-# - ladder alignment
-# - EV / edge table
-# - forecast stability + trade filter
-# - decision window
+# Kalshi Weather Model – Daily High [v8.2]
+# Reliability upgrade:
+# - Open-Meteo retry + fallback
+# - NWS hourly fallback for trend model
+# - Forecast confidence warning when source count < 2
+# - Clear source-status table
+# - Keeps settlement station mapping, momentum, EV, trade filters
 
 import math
 import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Kalshi Weather Model – Daily High (v8.1)", layout="centered")
-st.title("Kalshi Weather Model – Daily High (v8.1)")
-st.caption("Adds peak heating momentum so the model can tell when the day is running hotter or cooler than forecast.")
+st.set_page_config(page_title="Kalshi Weather Model – Daily High (v8.2)", layout="centered")
+st.title("Kalshi Weather Model – Daily High (v8.2)")
+st.caption("Reliability upgrade: Open-Meteo retry/fallback, NWS trend fallback, confidence warnings, and Kalshi-aligned settlement stations.")
 
-UA = {"User-Agent": "kalshi-weather-model/8.1"}
+UA = {"User-Agent": "kalshi-weather-model/8.2"}
 
 CITIES: Dict[str, Dict[str, str | float]] = {
     "Miami": {"lat": 25.7933, "lon": -80.2906, "station": "KMIA", "label": "Miami Intl Airport", "tz": "America/New_York"},
@@ -139,55 +134,44 @@ def _parse_open_meteo_payload(js: dict, tz: str):
         return None, None, None, str(e)
 
 
+def fetch_open_meteo_with_retries(base_url: str, lat: float, lon: float, tz: str):
+    attempts = [
+        {"timezone": tz, "forecast_days": 2},
+        {"timezone": "auto", "forecast_days": 2},
+        {"timezone": tz, "forecast_days": 1},
+        {"timezone": "auto", "forecast_days": 1},
+    ]
+    last_err = "fetch failed"
+    for attempt in attempts:
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "temperature_unit": "fahrenheit",
+            "timezone": attempt["timezone"],
+            "hourly": "temperature_2m",
+            "daily": "sunrise,sunset,temperature_2m_max",
+            "forecast_days": attempt["forecast_days"],
+        }
+        js = safe_get_json(base_url, params=params, timeout=14)
+        if not js:
+            last_err = "fetch failed"
+            continue
+        df, hi, sunrise, err = _parse_open_meteo_payload(js, tz)
+        if df is not None and hi is not None:
+            return df, hi, sunrise, ""
+        last_err = err or "parse failed"
+    return None, None, None, last_err
+
+
 def fetch_open_meteo_best(lat: float, lon: float, tz: str):
-    base = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "temperature_unit": "fahrenheit",
-        "timezone": tz,
-        "hourly": "temperature_2m",
-        "daily": "sunrise,sunset,temperature_2m_max",
-        "forecast_days": 2,
-    }
-    js = safe_get_json(base, params=params)
-    if not js:
-        return None, None, None, "fetch failed"
-    df, hi, sunrise, err = _parse_open_meteo_payload(js, tz)
-    if df is not None:
-        return df, hi, sunrise, ""
-    params["timezone"] = "auto"
-    js2 = safe_get_json(base, params=params)
-    if not js2:
-        return None, None, None, err or "fetch failed"
-    return _parse_open_meteo_payload(js2, tz)
+    return fetch_open_meteo_with_retries("https://api.open-meteo.com/v1/forecast", lat, lon, tz)
 
 
 def fetch_open_meteo_noaa(lat: float, lon: float, tz: str):
-    base = "https://api.open-meteo.com/v1/gfs"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "temperature_unit": "fahrenheit",
-        "timezone": tz,
-        "hourly": "temperature_2m",
-        "daily": "sunrise,sunset,temperature_2m_max",
-        "forecast_days": 2,
-    }
-    js = safe_get_json(base, params=params)
-    if not js:
-        return None, None, None, "fetch failed"
-    df, hi, sunrise, err = _parse_open_meteo_payload(js, tz)
-    if df is not None:
-        return df, hi, sunrise, ""
-    params["timezone"] = "auto"
-    js2 = safe_get_json(base, params=params)
-    if not js2:
-        return None, None, None, err or "fetch failed"
-    return _parse_open_meteo_payload(js2, tz)
+    return fetch_open_meteo_with_retries("https://api.open-meteo.com/v1/gfs", lat, lon, tz)
 
 
-def fetch_nws_hourly(lat: float, lon: float):
+def fetch_nws_hourly(lat: float, lon: float) -> Tuple[Optional[pd.DataFrame], Optional[float], str]:
     pts = safe_get_json(f"https://api.weather.gov/points/{lat},{lon}")
     if not pts:
         return None, None, "points failed"
@@ -313,27 +297,34 @@ st.info(f"Settlement station for **{city}**: **{station}** — {station_label}")
 sources = []
 chart_df = None
 sunrise_local = None
+nws_df = None
 
 best_df, best_high, best_sunrise, best_err = fetch_open_meteo_best(lat, lon, tz)
-sources.append(("Open-Meteo (best match)", best_high, best_err))
+sources.append(("Open-Meteo (best match)", best_high, best_err or "OK"))
 if best_high is not None:
     chart_df = best_df
     sunrise_local = best_sunrise
 
 if include_noaa:
     noaa_df, noaa_high, noaa_sunrise, noaa_err = fetch_open_meteo_noaa(lat, lon, tz)
-    sources.append(("Open-Meteo NOAA (GFS/HRRR)", noaa_high, noaa_err))
+    sources.append(("Open-Meteo NOAA (GFS/HRRR)", noaa_high, noaa_err or "OK"))
     if chart_df is None and noaa_high is not None:
         chart_df = noaa_df
         sunrise_local = noaa_sunrise
 
 if include_nws:
-    _, nws_high, nws_err = fetch_nws_hourly(lat, lon)
-    sources.append(("NWS (forecastHourly)", nws_high, nws_err))
+    nws_df, nws_high, nws_err = fetch_nws_hourly(lat, lon)
+    sources.append(("NWS (forecastHourly)", nws_high, nws_err or "OK"))
+
+if chart_df is None and nws_df is not None:
+    chart_df = nws_df.copy()
+    chart_df["time"] = chart_df["time"].dt.tz_convert(tzinfo)
+    sunrise_local = local_now.replace(hour=6, minute=0, second=0, microsecond=0)
 
 settle_temp_f, settle_obs_time, settle_obs_err = fetch_station_obs(station)
 
 vals = [x[1] for x in sources if x[1] is not None]
+source_count = len(vals)
 if not vals:
     st.error("No forecast sources returned successfully.")
     st.stop()
@@ -346,9 +337,16 @@ st.subheader(f"{city} – Today’s High Forecasts (°F)")
 df_sources = pd.DataFrame([{
     "Source": s[0],
     "Today High": ("—" if s[1] is None else f"{s[1]:.1f}°F"),
-    "Note": s[2],
+    "Status": s[2],
 } for s in sources])
 st.dataframe(df_sources, use_container_width=True, hide_index=True)
+
+if source_count < 2:
+    st.warning("Forecast confidence reduced: only one forecast source is currently available.")
+elif source_count == 2:
+    st.info("Forecast confidence moderate: two forecast sources are available.")
+else:
+    st.success("Forecast confidence stronger: three forecast sources are available.")
 
 c1, c2 = st.columns(2)
 with c1:
@@ -406,6 +404,10 @@ c.metric("Projected high (trend-based)", "—" if trend_proj_high is None else f
 
 if momentum_delta is not None:
     st.info(f"Peak heating momentum: **{momentum_delta:+.1f}°F** — {momentum_label}.")
+elif chart_df is None:
+    st.warning("Trend engine unavailable because no hourly curve could be built.")
+else:
+    st.info("Trend engine is waiting for enough usable hourly data.")
 
 mu = consensus
 if trend_proj_high is not None:
@@ -441,6 +443,8 @@ if local_now.hour >= no_bet_after_hour and local_now.minute > 15:
     trade_filter_reasons.append(f"Past cutoff ({no_bet_after_hour}:15 local)")
 if risk_level == "PASS":
     trade_filter_reasons.append("Forecast stability state is PASS")
+if source_count < 2:
+    trade_filter_reasons.append("Only one forecast source available")
 
 if trade_filter_reasons:
     st.error("TRADE FILTER: DO NOT BET — " + " | ".join(trade_filter_reasons))
@@ -478,7 +482,7 @@ for x in sorted(ladder, key=lambda r: r["WinProb"], reverse=True):
         row["Signal"] = signal
         if signal == "BET":
             if best_bet is None or edge > best_bet["edge"]:
-                best_bet = {"bracket": x["Bracket"], "edge": edge, "ev": ev, "price": yes_cents, "prob": x["WinProb"]*100.0}
+                best_bet = {"bracket": x["Bracket"], "edge": edge, "ev": ev, "price": yes_cents, "prob": x["WinProb"] * 100.0}
     rows.append(row)
 
 st.subheader("Kalshi Edge Table")
@@ -518,4 +522,4 @@ if show_hourly_chart and chart_df is not None and not chart_df.empty:
         peak_v = float(df_plot["temp_f"].max())
         st.caption(f"Peak hour (forecast): {peak_t.strftime('%I:%M %p')} at {peak_v:.1f}°F")
 
-st.caption("v8.1 adds peak heating momentum so you can see when the settlement station is running hotter/cooler than forecast.")
+st.caption("v8.2 adds Open-Meteo retry logic, NWS fallback for the trend engine, and confidence warnings when source coverage is thin.")
