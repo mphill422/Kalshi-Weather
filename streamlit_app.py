@@ -1,12 +1,14 @@
 # streamlit_app.py
-# Kalshi Weather Model – Daily High [v7.8]
-# Full model version:
-# - Restores full dashboard
-# - Adds Do-Not-Bet filter
-# - Adds Edge Gate (BET / SMALL EDGE / NO BET)
-# - Adds time cutoff / market correction warning
-# - Adds airport bias correction
-# - Keeps ladder alignment, nowcast, EV, hourly chart, city list
+# Kalshi Weather Model – Daily High [v7.8.1]
+# Clean full-file update
+# Main UI fix:
+# - Replaces confusing "LOW RISK" + "DO NOT BET" combination
+# - Now separates:
+#     1) Forecast Stability
+#     2) Trade Filter
+# So you can see:
+#   FORECAST STABILITY: LOW / HIGH / PASS
+#   TRADE FILTER: BET ALLOWED / DO NOT BET
 
 import math
 import re
@@ -18,14 +20,14 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Kalshi Weather Model – Daily High (v7.8)", layout="centered")
-st.title("Kalshi Weather Model – Daily High (v7.8)")
+st.set_page_config(page_title="Kalshi Weather Model – Daily High (v7.8.1)", layout="centered")
+st.title("Kalshi Weather Model – Daily High (v7.8.1)")
 st.caption(
     "Full dashboard with weather sources, live airport temp, nowcast, ladder alignment, EV / edge gate, "
-    "Do-Not-Bet filter, and timing protection."
+    "Do-Not-Bet filter, timing protection, and clearer signal wording."
 )
 
-UA = {"User-Agent": "kalshi-weather-model/7.8"}
+UA = {"User-Agent": "kalshi-weather-model/7.8.1"}
 
 CITIES: Dict[str, Dict[str, str | float]] = {
     "Miami": {"lat": 25.7933, "lon": -80.2906, "station": "KMIA", "tz": "America/New_York"},
@@ -43,9 +45,6 @@ CITIES: Dict[str, Dict[str, str | float]] = {
 DEFAULT_CITY = "Miami"
 
 
-# -------------------------
-# helpers
-# -------------------------
 def safe_get_json(url: str, params: Optional[dict] = None, timeout: int = 12):
     try:
         r = requests.get(url, params=params, headers=UA, timeout=timeout)
@@ -111,9 +110,6 @@ def expected_value_per_1_dollar(p: float, yes_price_cents: float) -> float:
     return p * (1.0 - price) - (1.0 - p) * price
 
 
-# -------------------------
-# fetchers
-# -------------------------
 def _parse_open_meteo_payload(js: dict, tz: str):
     try:
         times = js["hourly"]["time"]
@@ -157,7 +153,6 @@ def fetch_open_meteo_best(lat: float, lon: float, tz: str):
 
 
 def fetch_open_meteo_noaa(lat: float, lon: float, tz: str):
-    # Open-Meteo NOAA GFS/HRRR endpoint
     base = "https://api.open-meteo.com/v1/gfs"
     params = {
         "latitude": lat,
@@ -222,9 +217,6 @@ def fetch_station_obs(station: str):
     return c_to_f(float(temp_c)), ts, ""
 
 
-# -------------------------
-# ladder
-# -------------------------
 def nearest_even(x: float) -> int:
     return int(2 * round(x / 2.0))
 
@@ -239,8 +231,6 @@ def nearest_odd(x: float) -> int:
 
 
 def build_ladder(consensus: float, sigma: float, mode: str):
-    # Correct 6-contract Kalshi ladder:
-    # lower tail + 4 middle 2-degree bins + upper tail
     even_start = nearest_even(consensus) - 4
     odd_start = nearest_odd(consensus) - 4
 
@@ -276,15 +266,12 @@ def build_ladder(consensus: float, sigma: float, mode: str):
 
 def classify_risk(spread: float, sigma: float, top_prob: float):
     if spread >= 4.0 or sigma >= 3.5 or top_prob < 0.20:
-        return "PASS", "🔴", "Uncertainty is too high (spread/σ) or the top bracket is not strong enough."
+        return "PASS", "🔴", "Forecast stability is poor: uncertainty is too high."
     if spread >= 2.5 or sigma >= 3.0 or top_prob < 0.25:
-        return "HIGH RISK", "🟡", "Playable only with a clear edge vs market odds; otherwise skip."
-    return "LOW RISK", "🟢", "Models are relatively aligned and the top bracket is reasonably strong."
+        return "HIGH RISK", "🟡", "Forecast stability is moderate: only playable with strong market edge."
+    return "LOW RISK", "🟢", "Forecast stability is good: models are relatively aligned."
 
 
-# -------------------------
-# market parsing
-# -------------------------
 def parse_market_lines(text: str):
     out = {}
     for raw in (text or "").splitlines():
@@ -327,9 +314,6 @@ def best_effort_import_from_url(url: str):
     return "\n".join(lines)
 
 
-# -------------------------
-# UI
-# -------------------------
 city = st.selectbox("City", list(CITIES.keys()), index=list(CITIES.keys()).index(DEFAULT_CITY))
 cfg = CITIES[city]
 lat = float(cfg["lat"])
@@ -345,7 +329,7 @@ with st.expander("Settings", expanded=True):
     show_hourly_chart = st.toggle("Show hourly chart", value=True)
     grace_minutes = st.slider("Grace minutes after 10:30 local", 0, 180, 80, 5)
     ladder_mode = st.selectbox("Kalshi ladder alignment", ["auto", "even", "odd"], index=0)
-    do_not_bet_prob = st.slider("Do Not Bet Zone: top probability must exceed", 0.40, 0.70, 0.55, 0.01)
+    do_not_bet_prob = st.slider("Trade filter: top probability must exceed", 0.40, 0.70, 0.55, 0.01)
     strong_edge_threshold = st.slider("Strong edge threshold (%)", 1.0, 30.0, 8.0, 0.5)
     small_edge_threshold = st.slider("Small edge threshold (%)", 0.5, 20.0, 3.0, 0.5)
     airport_bias = st.slider("Airport bias correction (°F)", -1.5, 1.5, 0.8, 0.1)
@@ -364,9 +348,6 @@ with st.expander("Kalshi Odds / EV (recommended)", expanded=True):
     elif import_mode == "Best-effort URL import":
         market_url = st.text_input("Kalshi market URL", value="", placeholder="Paste Kalshi market URL")
 
-# -------------------------
-# fetch sources
-# -------------------------
 sources = []
 chart_df = None
 sunrise_local = None
@@ -420,9 +401,6 @@ with c2:
         st.metric(f"Current airport temp ({station})", "—")
         st.caption(f"Obs error: {obs_err}")
 
-# -------------------------
-# nowcast + blended high
-# -------------------------
 st.divider()
 st.subheader("Live trend / nowcast")
 
@@ -480,13 +458,9 @@ if trend_proj_high is not None:
     blended_high = 0.70 * consensus + 0.30 * trend_proj_high
     st.caption(f"Blended model high = 70% forecast consensus + 30% live trend = **{blended_high:.1f}°F**")
 
-# Airport bias correction
 biased_high = blended_high + airport_bias
 st.caption(f"Airport-biased high = blended high + bias ({airport_bias:+.1f}°F) = **{biased_high:.1f}°F**")
 
-# -------------------------
-# ladder / risk
-# -------------------------
 st.divider()
 st.subheader("Suggested Kalshi Bracket")
 
@@ -495,32 +469,29 @@ top = max(ladder, key=lambda x: x["WinProb"])
 risk_level, risk_icon, risk_msg = classify_risk(spread, sigma, top["WinProb"])
 
 st.caption(f"Ladder alignment used: **{chosen_mode}**")
-if risk_level == "LOW RISK":
-    st.success(f"{risk_icon} {risk_level}: {risk_msg}")
-elif risk_level == "HIGH RISK":
-    st.warning(f"{risk_icon} {risk_level}: {risk_msg}")
-else:
-    st.error(f"{risk_icon} {risk_level}: {risk_msg}")
 
-# Do Not Bet filter
+if risk_level == "LOW RISK":
+    st.success(f"{risk_icon} FORECAST STABILITY: {risk_level} — {risk_msg}")
+elif risk_level == "HIGH RISK":
+    st.warning(f"{risk_icon} FORECAST STABILITY: {risk_level} — {risk_msg}")
+else:
+    st.error(f"{risk_icon} FORECAST STABILITY: {risk_level} — {risk_msg}")
+
 do_not_bet_reasons = []
 if top["WinProb"] < do_not_bet_prob:
     do_not_bet_reasons.append(f"Top bracket only {top['WinProb']*100:.1f}% (< {do_not_bet_prob*100:.0f}%)")
 if local_now.hour >= no_bet_after_hour and local_now.minute > 15:
     do_not_bet_reasons.append(f"Past your no-new-bets cutoff ({no_bet_after_hour}:15 local)")
 if risk_level == "PASS":
-    do_not_bet_reasons.append("Model risk state is PASS")
+    do_not_bet_reasons.append("Forecast stability state is PASS")
 
 if do_not_bet_reasons:
-    st.error("DO NOT BET ZONE: " + " | ".join(do_not_bet_reasons))
+    st.error("TRADE FILTER: DO NOT BET — " + " | ".join(do_not_bet_reasons))
 else:
-    st.success("BETTING WINDOW OPEN: Model confidence passed the Do-Not-Bet filter.")
+    st.success("TRADE FILTER: BET ALLOWED — confidence passed your filter rules.")
 
 st.success(f"Suggested bracket: **{top['Bracket']}** (model ≈ **{top['WinProb']*100:.0f}%**)")
 
-# -------------------------
-# odds / edge gate
-# -------------------------
 market_prices = {}
 if import_mode == "Paste lines" and market_text.strip():
     market_prices = parse_market_lines(market_text)
@@ -588,9 +559,6 @@ if market_prices:
     else:
         st.warning("No live edge gate confirmation. Do not force a bet.")
 
-# -------------------------
-# market correction warning
-# -------------------------
 st.subheader("Market Correction Warning")
 if market_prices:
     top_market_row = None
@@ -609,7 +577,7 @@ if market_prices:
 
         if edge_val is not None:
             if do_not_bet_reasons:
-                st.error("Even if a market looks cheap, your Do-Not-Bet filter says pass.")
+                st.error("Even if a market looks cheap, your trade filter says pass.")
             elif edge_val >= strong_edge_threshold:
                 st.success("Live edge still strong. Market may not have fully corrected.")
             elif edge_val >= 0:
@@ -619,9 +587,6 @@ if market_prices:
 else:
     st.info("Add current Kalshi odds to activate live edge / correction checks.")
 
-# -------------------------
-# decision window
-# -------------------------
 st.divider()
 st.subheader("Decision Window")
 target = local_now.replace(hour=10, minute=30, second=0, microsecond=0)
@@ -637,9 +602,6 @@ elif local_now <= grace_end:
 else:
     st.warning("Past preferred window. Market is often sharper later in the day.")
 
-# -------------------------
-# hourly chart
-# -------------------------
 if show_hourly_chart and chart_df is not None and not chart_df.empty:
     st.divider()
     st.subheader("Hourly temperature curve (today)")
@@ -652,5 +614,5 @@ if show_hourly_chart and chart_df is not None and not chart_df.empty:
 
 st.divider()
 st.caption(
-    "v7.8 = full dashboard + Do-Not-Bet Zone + Edge Gate + airport bias correction + timing protection."
+    "v7.8.1 wording update: FORECAST STABILITY and TRADE FILTER are shown separately so the signals are easier to read."
 )
