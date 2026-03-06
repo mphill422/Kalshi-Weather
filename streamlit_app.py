@@ -1,15 +1,16 @@
 # streamlit_app.py
-# Kalshi Weather Model – Daily High [v8.0]
-# Upgrades:
-# - Correct Kalshi settlement station map
-# - Settlement station validation shown in UI
-# - Live obs from settlement station
-# - Weather sources + nowcast + settlement bias
-# - Kalshi ladder alignment
-# - Edge detection / EV
-# - Forecast stability and trade filter separated
-# - Decision window / market correction warning
-# - Peak-temperature tracking
+# Kalshi Weather Model – Daily High [v8.1]
+# Adds peak heating momentum model:
+# - compares live settlement-station temperature to forecast track
+# - estimates if day is running hotter/cooler than expected
+# - adjusts blended high using momentum
+# Keeps:
+# - Kalshi settlement station map
+# - live settlement obs
+# - ladder alignment
+# - EV / edge table
+# - forecast stability + trade filter
+# - decision window
 
 import math
 import re
@@ -21,11 +22,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Kalshi Weather Model – Daily High (v8.0)", layout="centered")
-st.title("Kalshi Weather Model – Daily High (v8.0)")
-st.caption("Kalshi-aligned settlement stations, live settlement obs, nowcast, ladder probabilities, EV and trade filters.")
+st.set_page_config(page_title="Kalshi Weather Model – Daily High (v8.1)", layout="centered")
+st.title("Kalshi Weather Model – Daily High (v8.1)")
+st.caption("Adds peak heating momentum so the model can tell when the day is running hotter or cooler than forecast.")
 
-UA = {"User-Agent": "kalshi-weather-model/8.0"}
+UA = {"User-Agent": "kalshi-weather-model/8.1"}
 
 CITIES: Dict[str, Dict[str, str | float]] = {
     "Miami": {"lat": 25.7933, "lon": -80.2906, "station": "KMIA", "label": "Miami Intl Airport", "tz": "America/New_York"},
@@ -297,6 +298,7 @@ with st.expander("Settings", expanded=True):
     strong_edge_threshold = st.slider("Strong edge threshold (%)", 1.0, 30.0, 8.0, 0.5)
     small_edge_threshold = st.slider("Small edge threshold (%)", 0.5, 20.0, 3.0, 0.5)
     settlement_bias = st.slider("Settlement station bias correction (°F)", -1.5, 1.5, 0.0, 0.1)
+    momentum_weight = st.slider("Peak heating momentum weight", 0.0, 1.0, 0.35, 0.05)
     no_bet_after_hour = st.slider("No new bets after local hour", 10, 15, 11, 1)
 
 with st.expander("Kalshi Odds / EV (recommended)", expanded=True):
@@ -367,6 +369,8 @@ st.subheader("Live trend / nowcast")
 heating_rate = None
 peak_hour = None
 trend_proj_high = None
+momentum_delta = None
+momentum_label = None
 
 if settle_temp_f is not None and chart_df is not None and not chart_df.empty:
     sunrise_for_calc = sunrise_local if sunrise_local is not None else local_now.replace(hour=6, minute=0, second=0, microsecond=0)
@@ -377,8 +381,18 @@ if settle_temp_f is not None and chart_df is not None and not chart_df.empty:
         heating_rate = (settle_temp_f - sunrise_temp) / hrs
 
     day_df = chart_df[chart_df["time"].dt.date == local_now.date()].copy()
-    day_df = day_df[(day_df["time"].dt.hour >= 8) & (day_df["time"].dt.hour <= 20)]
+    day_df = day_df[(day_df["time"].dt.hour >= 6) & (day_df["time"].dt.hour <= 20)]
     if not day_df.empty:
+        nearest_idx = (day_df["time"] - local_now).abs().idxmin()
+        expected_now = float(day_df.loc[nearest_idx, "temp_f"])
+        momentum_delta = settle_temp_f - expected_now
+        if momentum_delta >= 1.0:
+            momentum_label = "running hotter than forecast"
+        elif momentum_delta <= -1.0:
+            momentum_label = "running cooler than forecast"
+        else:
+            momentum_label = "tracking close to forecast"
+
         peak_row = day_df.loc[day_df["temp_f"].idxmax()]
         peak_hour = peak_row["time"]
         if heating_rate is not None:
@@ -390,14 +404,21 @@ a.metric("Heating rate since sunrise", "—" if heating_rate is None else f"{hea
 b.metric("Forecast peak hour", "—" if peak_hour is None else peak_hour.strftime("%I:%M %p"))
 c.metric("Projected high (trend-based)", "—" if trend_proj_high is None else f"{trend_proj_high:.1f}°F")
 
+if momentum_delta is not None:
+    st.info(f"Peak heating momentum: **{momentum_delta:+.1f}°F** — {momentum_label}.")
+
 mu = consensus
 if trend_proj_high is not None:
     mu = 0.70 * consensus + 0.30 * trend_proj_high
     st.caption(f"Blended model high = 70% forecast consensus + 30% live trend = **{mu:.1f}°F**")
 
+if momentum_delta is not None:
+    mu = mu + momentum_weight * momentum_delta
+    st.caption(f"Momentum-adjusted high = blended high + ({momentum_weight:.2f} × {momentum_delta:+.1f}) = **{mu:.1f}°F**")
+
 mu += settlement_bias
 if settlement_bias != 0:
-    st.caption(f"Settlement-adjusted high = blended high + bias ({settlement_bias:+.1f}°F) = **{mu:.1f}°F**")
+    st.caption(f"Settlement-adjusted high = model high + bias ({settlement_bias:+.1f}°F) = **{mu:.1f}°F**")
 
 st.divider()
 st.subheader("Suggested Kalshi Bracket")
@@ -497,4 +518,4 @@ if show_hourly_chart and chart_df is not None and not chart_df.empty:
         peak_v = float(df_plot["temp_f"].max())
         st.caption(f"Peak hour (forecast): {peak_t.strftime('%I:%M %p')} at {peak_v:.1f}°F")
 
-st.caption("v8.0 adds Kalshi settlement station mapping and uses the settlement station obs in the model.")
+st.caption("v8.1 adds peak heating momentum so you can see when the settlement station is running hotter/cooler than forecast.")
