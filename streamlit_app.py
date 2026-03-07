@@ -425,14 +425,11 @@ with st.expander("Settings", expanded=True):
     no_bet_after_hour = st.slider("No new bets after local hour", 9, 15, 12, 1)
     no_bet_after_minute = st.slider("No new bets after minute", 0, 59, 35, 5)
 
-    # Locked permanent settings
     strong_edge_threshold = 10.0
     small_edge_threshold = 3.0
     settlement_bias = 0.0
     momentum_weight = 0.35
     noon_lag_threshold = 1.5
-
-    # City-specific probability filters
     do_not_bet_prob = CITY_PROB_FILTERS.get(city, DEFAULT_PROB_FILTER)
 
     st.markdown(
@@ -492,7 +489,7 @@ with st.expander("Kalshi Odds / EV (recommended)", expanded=True):
         st.code(market_text, language="text")
 
 st.info(f"Settlement station for **{city}**: **{station}** — {station_label}")
-st.caption(f"City profile: sigma × **{sigma_shape:.2f}** (auto), default bias **{float(profile['default_bias']):+.1f}°F**, active probability filter **{do_not_bet_prob:.2f}**")
+st.caption("City profile loaded.")
 
 sources = []
 chart_df = None
