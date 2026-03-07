@@ -476,8 +476,7 @@ with st.expander("Kalshi Odds / EV (recommended)", expanded=True):
                 quick_lines.append(f"{bracket.strip()} {price.strip()}")
 
     if quick_mode and quick_lines:
-        market_text = "
-".join(quick_lines)
+TEMP_PLACEHOLDER
         st.code(market_text, language="text")
 
 st.info(f"Settlement station for **{city}**: **{station}** — {station_label}")
