@@ -10,8 +10,8 @@ import streamlit as st
 # -----------------------------
 # App config
 # -----------------------------
-st.set_page_config(page_title="Kalshi Temperature Model v10", layout="wide")
-st.title("Kalshi Temperature Model v10")
+st.set_page_config(page_title="Kalshi Temperature Model v10.1", layout="wide")
+st.title("Kalshi Temperature Model v10.1")
 st.caption(
     "Stable full version: automatic Open-Meteo + NWS pulls, city-specific filters, "
     "Kalshi ladder parsing, bracket probabilities, and BET / PASS output."
@@ -277,9 +277,9 @@ st.markdown(
 - Probability filter: **{profile['prob_filter']:.2f}**
 - Minimum top-two gap: **{MIN_TOP_TWO_GAP*100:.0f}%**
 - Momentum weight: **{MOMENTUM_WEIGHT:.2f}**
-- No-bet lag threshold: **{NO_BET_LAG:.1f}Â°F**
+- No-bet lag threshold: **{NO_BET_LAG:.1f} deg F**
 - City sigma: **{profile['sigma']:.2f}**
-- Settlement station: **{profile['station']} â {profile['station_label']}**
+- Settlement station: **{profile['station']} - {profile['station_label']}**
 """
 )
 
@@ -328,8 +328,8 @@ obs_temp, obs_time, obs_err = fetch_latest_observation(profile["station"])
 
 source_df = pd.DataFrame(source_rows)
 show_df = source_df.copy()
-show_df["Today High"] = show_df["Today High"].apply(lambda x: f"{x:.1f}Â°F" if isinstance(x, (int, float)) else "â")
-st.subheader(f"{city} â Todayâs High Forecasts (Â°F)")
+show_df["Today High"] = show_df["Today High"].apply(lambda x: f"{x:.1f} deg F" if isinstance(x, (int, float)) else "-")
+st.subheader(f"{city} - Today's High Forecasts ( deg F)")
 st.dataframe(show_df, use_container_width=True, hide_index=True)
 
 usable = [r["Today High"] for r in source_rows if isinstance(r["Today High"], (int, float))]
@@ -342,10 +342,10 @@ spread = (max(usable) - min(usable)) if len(usable) >= 2 else 0.0
 sigma = max(0.75, float(profile["sigma"]) + spread / 2.5)
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Consensus high", f"{consensus:.1f}Â°F")
-c2.metric("Cross-source spread", f"{spread:.1f}Â°F")
-c3.metric("Model uncertainty (Ï)", f"{sigma:.2f}Â°F")
-c4.metric(f"Current settlement temp ({profile['station']})", f"{obs_temp:.1f}Â°F" if obs_temp is not None else "â")
+c1.metric("Consensus high", f"{consensus:.1f} deg F")
+c2.metric("Cross-source spread", f"{spread:.1f} deg F")
+c3.metric("Model uncertainty (sigma)", f"{sigma:.2f} deg F")
+c4.metric(f"Current settlement temp ({profile['station']})", f"{obs_temp:.1f} deg F" if obs_temp is not None else "-")
 
 if obs_time:
     st.caption(f"Obs time: {obs_time}")
@@ -377,14 +377,14 @@ if hourly_periods and obs_temp is not None:
 
 st.subheader("Live trend / nowcast")
 cc1, cc2 = st.columns(2)
-cc1.metric("Expected now (from NWS hourly)", f"{expected_now:.1f}Â°F" if expected_now is not None else "â")
-cc2.metric("Live momentum vs forecast", f"{momentum_delta:+.1f}Â°F" if momentum_delta is not None else "â")
+cc1.metric("Expected now (from NWS hourly)", f"{expected_now:.1f} deg F" if expected_now is not None else "-")
+cc2.metric("Live momentum vs forecast", f"{momentum_delta:+.1f} deg F" if momentum_delta is not None else "-")
 
 mu = consensus
 if momentum_delta is not None:
     adjust = MOMENTUM_WEIGHT * momentum_delta
     mu += adjust
-    st.caption(f"Momentum-adjusted consensus = {consensus:.1f}Â°F + {adjust:+.1f} = **{mu:.1f}Â°F**")
+    st.caption(f"Momentum-adjusted consensus = {consensus:.1f} deg F + {adjust:+.1f} = **{mu:.1f} deg F**")
 
 # -----------------------------
 # Ladder and probabilities
@@ -421,14 +421,14 @@ if top_gap < MIN_TOP_TWO_GAP:
 if local_now > cutoff:
     reasons.append(f"Past cutoff ({cutoff.strftime('%I:%M %p')} local)")
 if momentum_delta is not None and momentum_delta <= -NO_BET_LAG and local_now.hour >= 11:
-    reasons.append(f"Live temp is {abs(momentum_delta):.1f}Â°F behind forecast track")
+    reasons.append(f"Live temp is {abs(momentum_delta):.1f} deg F behind forecast track")
 
 if reasons:
-    st.error("TRADE FILTER: DO NOT BET â " + " | ".join(reasons))
+    st.error("TRADE FILTER: DO NOT BET - " + " | ".join(reasons))
 else:
-    st.success("TRADE FILTER: BET ALLOWED â confidence passed your rules.")
+    st.success("TRADE FILTER: BET ALLOWED - confidence passed your rules.")
 
-st.success(f"Suggested bracket: **{top['Bracket']}** (model â {top['WinProb']*100:.0f}%)")
+st.success(f"Suggested bracket: **{top['Bracket']}** (model ~ {top['WinProb']*100:.0f}%)")
 st.metric("Top-two bracket gap", f"{top_gap*100:.1f}%")
 
 # Table
@@ -437,7 +437,7 @@ for r in rows:
     row = {
         "Bracket": r["Bracket"],
         "Win %": f"{r['WinProb']*100:.1f}%",
-        "Fair YES": f"{r['Fair YES']*100:.1f}Â¢",
+        "Fair YES": f"{r['Fair YES']*100:.1f}c",
     }
     if r["Bracket"] in market_prices:
         mprob = price_to_prob(market_prices[r["Bracket"]])
