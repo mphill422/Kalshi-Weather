@@ -1,14 +1,16 @@
- # streamlit_app.py
-# Kalshi Weather Model – Daily High [v8.5]
-# Adds a market mispricing detector on top of v8.4:
-# - explicit MODEL vs MARKET gap
-# - MISPRICED / FAIR / OVERPRICED labels
-# - clearer edge buckets
+# streamlit_app.py
+# Kalshi Weather Model – Daily High [v9.0]
+# Adds city-specific distribution shaping on top of v8.5:
+# - city-specific sigma multiplier
+# - slight city bias defaults
+# - bracket probabilities better matched to each city's typical behavior
 # - keeps settlement stations, trade day quality, top-two gap,
-#   revision tracker, momentum checks, exact cutoff, EV table
+#   revision tracker, momentum checks, exact cutoff, EV table,
+#   and market mispricing detector
 #
 # Note:
-# This improves trade selection clarity. It does not guarantee wins.
+# This version aims to improve bracket probability quality.
+# It does not guarantee wins.
 
 import math
 import re
@@ -20,11 +22,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Model – Daily High (v8.5)", layout="centered")
-st.title("Model – Daily High (v8.5)")
-st.caption("Adds market mispricing detection so you can see when Kalshi is clearly off, fair, or overpriced.")
+st.set_page_config(page_title="Model – Daily High (v9.0)", layout="centered")
+st.title("Model – Daily High (v9.0)")
+st.caption("Adds city-specific distribution shaping so bracket probabilities better reflect how each city usually settles.")
 
-UA = {"User-Agent": "kalshi-weather-model/8.5"}
+UA = {"User-Agent": "kalshi-weather-model/9.0"}
 
 CITIES: Dict[str, Dict[str, str | float]] = {
     "Miami": {"lat": 25.7933, "lon": -80.2906, "station": "KMIA", "label": "Miami Intl Airport", "tz": "America/New_York"},
@@ -40,6 +42,23 @@ CITIES: Dict[str, Dict[str, str | float]] = {
     "Los Angeles": {"lat": 33.9416, "lon": -118.4085, "station": "KLAX", "label": "Los Angeles Intl Airport", "tz": "America/Los_Angeles"},
 }
 DEFAULT_CITY = "Miami"
+
+# City-specific distribution shaping
+# lower sigma_mult = tighter outcome distribution
+# higher sigma_mult = wider outcome distribution
+CITY_PROFILE = {
+    "Phoenix": {"sigma_mult": 0.82, "default_bias": 0.1},
+    "Las Vegas": {"sigma_mult": 0.85, "default_bias": 0.1},
+    "Los Angeles": {"sigma_mult": 0.90, "default_bias": -0.1},
+    "Dallas": {"sigma_mult": 0.96, "default_bias": 0.0},
+    "Atlanta": {"sigma_mult": 0.98, "default_bias": 0.0},
+    "Austin": {"sigma_mult": 1.08, "default_bias": 0.1},
+    "San Antonio": {"sigma_mult": 1.05, "default_bias": 0.1},
+    "New York": {"sigma_mult": 1.00, "default_bias": 0.0},
+    "Miami": {"sigma_mult": 1.15, "default_bias": 0.0},
+    "Houston": {"sigma_mult": 1.18, "default_bias": 0.0},
+    "New Orleans": {"sigma_mult": 1.16, "default_bias": 0.0},
+}
 
 
 def safe_get_json(url: str, params: Optional[dict] = None, timeout: int = 12):
@@ -343,6 +362,7 @@ station_label = str(cfg["label"])
 tz = str(cfg["tz"])
 tzinfo = ZoneInfo(tz)
 local_now = datetime.now(tzinfo)
+profile = CITY_PROFILE.get(city, {"sigma_mult": 1.0, "default_bias": 0.0})
 
 with st.expander("Settings", expanded=True):
     include_noaa = st.toggle("Include Open-Meteo NOAA GFS/HRRR", value=True)
@@ -353,11 +373,12 @@ with st.expander("Settings", expanded=True):
     do_not_bet_prob = st.slider("Trade filter: top probability must exceed", 0.40, 0.70, 0.58, 0.01)
     strong_edge_threshold = st.slider("Strong edge threshold (%)", 1.0, 30.0, 8.0, 0.5)
     small_edge_threshold = st.slider("Small edge threshold (%)", 0.5, 20.0, 3.0, 0.5)
-    settlement_bias = st.slider("Settlement station bias correction (°F)", -1.5, 1.5, 0.0, 0.1)
+    settlement_bias = st.slider("Settlement station bias correction (°F)", -1.5, 1.5, float(profile["default_bias"]), 0.1)
     momentum_weight = st.slider("Peak heating momentum weight", 0.0, 1.0, 0.35, 0.05)
     noon_lag_threshold = st.slider("No-bet lag threshold (°F behind forecast track)", 0.5, 4.0, 1.5, 0.1)
     no_bet_after_hour = st.slider("No new bets after local hour", 9, 15, 10, 1)
     no_bet_after_minute = st.slider("No new bets after minute", 0, 59, 45, 5)
+    sigma_shape = st.slider("City distribution shaping", 0.70, 1.30, float(profile["sigma_mult"]), 0.01)
 
 with st.expander("Forecast revision tracker (paste recent forecast updates)", expanded=False):
     revision_text = st.text_area(
@@ -374,6 +395,7 @@ with st.expander("Kalshi Odds / EV (recommended)", expanded=True):
     )
 
 st.info(f"Settlement station for **{city}**: **{station}** — {station_label}")
+st.caption(f"City profile: sigma × **{sigma_shape:.2f}**, default bias **{float(profile['default_bias']):+.1f}°F**")
 
 sources = []
 chart_df = None
@@ -412,7 +434,8 @@ if not vals:
 
 consensus = float(sum(vals) / len(vals))
 spread = float(max(vals) - min(vals)) if len(vals) > 1 else 0.0
-sigma = float(max(1.1, 0.85 + 0.55 * spread))
+base_sigma = float(max(1.1, 0.85 + 0.55 * spread))
+sigma = clamp(base_sigma * sigma_shape, 0.8, 5.0)
 
 st.subheader(f"{city} – Today’s High Forecasts (°F)")
 df_sources = pd.DataFrame([{
@@ -690,4 +713,4 @@ if show_hourly_chart and chart_df is not None and not chart_df.empty:
         peak_v = float(df_plot["temp_f"].max())
         st.caption(f"Peak hour (forecast): {peak_t.strftime('%I:%M %p')} at {peak_v:.1f}°F")
 
-st.caption("v8.5 adds a clearer market mispricing detector so you can separate genuinely cheap brackets from fair or overpriced ones.")
+st.caption("v9.0 adds city-specific distribution shaping so bracket probabilities are tighter in cities like Phoenix and Vegas, and wider in cities like Miami and Houston.")
