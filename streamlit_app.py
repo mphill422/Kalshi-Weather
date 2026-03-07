@@ -10,8 +10,8 @@ import streamlit as st
 # -----------------------------
 # App config
 # -----------------------------
-st.set_page_config(page_title="Kalshi Temperature Model v10.1", layout="wide")
-st.title("Kalshi Temperature Model v10.1")
+st.set_page_config(page_title="Kalshi Temperature Model v10.2", layout="wide")
+st.title("Kalshi Temperature Model v10.2")
 st.caption(
     "Stable full version: automatic Open-Meteo + NWS pulls, city-specific filters, "
     "Kalshi ladder parsing, bracket probabilities, and BET / PASS output."
@@ -393,8 +393,8 @@ market_prices = parse_market_lines(market_text) if market_text.strip() else {}
 market_labels = list(market_prices.keys())
 
 effective_ladder_mode = ladder_mode
-if ladder_mode == "market_auto" and market_labels:
-    detected = detect_market_ladder(market_labels)
+detected = detect_market_ladder(market_labels) if market_labels else None
+if ladder_mode == "market_auto":
     effective_ladder_mode = detected if detected else "auto"
 
 labels, chosen_mode = default_ladder(mu, "auto" if effective_ladder_mode == "market_auto" else effective_ladder_mode)
@@ -407,7 +407,12 @@ second = rows[1] if len(rows) > 1 else {"WinProb": 0.0}
 top_gap = top["WinProb"] - second["WinProb"]
 
 st.subheader("Suggested Kalshi Bracket")
-st.caption(f"Ladder alignment used: **{chosen_mode}**")
+if market_labels and detected:
+    st.caption(f"Kalshi ladder auto-detected: **{detected}**")
+elif market_labels:
+    st.caption("Kalshi ladder entered manually.")
+else:
+    st.caption(f"Model ladder alignment used: **{chosen_mode}**")
 if market_labels:
     st.caption("Using brackets from pasted / manual Kalshi ladder.")
 
@@ -429,6 +434,8 @@ else:
     st.success("TRADE FILTER: BET ALLOWED - confidence passed your rules.")
 
 st.success(f"Suggested bracket: **{top['Bracket']}** (model ~ {top['WinProb']*100:.0f}%)")
+if market_labels and detected:
+    st.info(f"Auto-detected Kalshi ladder for {city}: **{detected}**. The app is matching your bracket probabilities to the Kalshi ladder automatically.")
 st.metric("Top-two bracket gap", f"{top_gap*100:.1f}%")
 
 # Table
