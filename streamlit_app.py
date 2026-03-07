@@ -1,5 +1,5 @@
 # streamlit_app.py
-# Kalshi Weather Model – Daily High [v9.1]
+# Kalshi Weather Model – Daily High [v9.4]
 # Adds city-specific distribution shaping on top of v8.5:
 # - city-specific sigma multiplier
 # - slight city bias defaults
@@ -22,11 +22,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Model – Daily High (v9.1)", layout="centered")
-st.title("Model – Daily High (v9.1)")
-st.caption("Locks in your permanent core settings and leaves only the day-to-day items adjustable.")
+st.set_page_config(page_title="Model – Daily High (v9.4)", layout="centered")
+st.title("Model – Daily High (v9.4)")
+st.caption("Adds auto city shaping, locked core settings, mobile Kalshi entry, ladder auto-detection, and stronger live momentum detection.")
 
-UA = {"User-Agent": "kalshi-weather-model/9.1"}
+UA = {"User-Agent": "kalshi-weather-model/9.4"}
 
 CITIES: Dict[str, Dict[str, str | float]] = {
     "Miami": {"lat": 25.7933, "lon": -80.2906, "station": "KMIA", "label": "Miami Intl Airport", "tz": "America/New_York"},
@@ -117,6 +117,46 @@ def expected_value_per_1_dollar(p: float, yes_price_cents: float) -> float:
 
 
 def parse_market_lines(text: str):
+
+def detect_market_ladder(market_labels):
+    nums = []
+    for label in market_labels:
+        found = re.findall(r"\d+", label)
+        nums.extend(int(x) for x in found[:2])
+    if not nums:
+        return None
+    odd_hits = 0
+    even_hits = 0
+    for label in market_labels:
+        found = [int(x) for x in re.findall(r"\d+", label)[:1]]
+        if not found:
+            continue
+        if found[0] % 2 == 0:
+            even_hits += 1
+        else:
+            odd_hits += 1
+    return "odd" if odd_hits > even_hits else "even"
+
+
+def remap_label_to_market(target_label, market_labels):
+    if target_label in market_labels:
+        return target_label
+    target_nums = [int(x) for x in re.findall(r"\d+", target_label)]
+    if not target_nums:
+        return target_label
+    # map 82-83 -> 81-82 / 83-84 style closest bracket if needed
+    best = None
+    best_score = None
+    for lab in market_labels:
+        lab_nums = [int(x) for x in re.findall(r"\d+", lab)]
+        if not lab_nums:
+            continue
+        score = abs(sum(lab_nums[:2]) / max(1, len(lab_nums[:2])) - sum(target_nums[:2]) / max(1, len(target_nums[:2])))
+        if best_score is None or score < best_score:
+            best_score = score
+            best = lab
+    return best or target_label
+
     out = {}
     for raw in (text or "").splitlines():
         line = raw.strip()
@@ -365,17 +405,16 @@ local_now = datetime.now(tzinfo)
 profile = CITY_PROFILE.get(city, {"sigma_mult": 1.0, "default_bias": 0.0})
 
 with st.expander("Settings", expanded=True):
-    st.caption("Locked core settings are built in below. Only the day-to-day items stay adjustable.")
+    st.caption("Core settings are locked in. Only the day-to-day items stay adjustable.")
 
     include_noaa = st.toggle("Include Open-Meteo NOAA GFS/HRRR", value=True)
     include_nws = st.toggle("Include NWS (api.weather.gov)", value=True)
     show_hourly_chart = st.toggle("Show hourly chart", value=True)
 
     grace_minutes = st.slider("Grace minutes after 10:30 local", 0, 180, 45, 5)
-    ladder_mode = st.selectbox("Kalshi ladder alignment", ["auto", "even", "odd"], index=0)
+    ladder_mode = st.selectbox("Kalshi ladder alignment", ["auto", "even", "odd", "market_auto"], index=0)
     no_bet_after_hour = st.slider("No new bets after local hour", 9, 15, 12, 1)
     no_bet_after_minute = st.slider("No new bets after minute", 0, 59, 35, 5)
-    sigma_shape = st.slider("City distribution shaping", 0.70, 1.30, float(profile["sigma_mult"]), 0.01)
 
     # Locked permanent settings
     do_not_bet_prob = 0.58
@@ -405,14 +444,47 @@ with st.expander("Forecast revision tracker (paste recent forecast updates)", ex
     )
 
 with st.expander("Kalshi Odds / EV (recommended)", expanded=True):
+    st.caption("Use paste mode or the mobile-friendly quick entry fields.")
     market_text = st.text_area(
         "Paste Kalshi lines with YES odds or cents",
         height=140,
-        placeholder="82° to 83° +566\n84° to 85° -489\n86° or above +1011\n77° or below 1c",
+        placeholder="82° to 83° +566
+84° to 85° -489
+86° or above +1011
+77° or below 1c",
     )
 
+    st.markdown("**Mobile quick entry (use this if paste won't work)**")
+    quick_mode = st.toggle("Use quick manual Kalshi entry", value=False)
+
+    quick_lines = []
+    if quick_mode:
+        for i in range(6):
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                bracket = st.text_input(
+                    f"Bracket {i+1}",
+                    value="",
+                    key=f"quick_bracket_{i}",
+                    placeholder="e.g. 81° to 82° or 80° or below",
+                )
+            with c2:
+                price = st.text_input(
+                    f"YES odds/cents {i+1}",
+                    value="",
+                    key=f"quick_price_{i}",
+                    placeholder="e.g. +334 or 41c",
+                )
+            if bracket.strip() and price.strip():
+                quick_lines.append(f"{bracket.strip()} {price.strip()}")
+
+    if quick_mode and quick_lines:
+        market_text = "
+".join(quick_lines)
+        st.code(market_text, language="text")
+
 st.info(f"Settlement station for **{city}**: **{station}** — {station_label}")
-st.caption(f"City profile: sigma × **{sigma_shape:.2f}**, default bias **{float(profile['default_bias']):+.1f}°F**")
+st.caption(f"City profile: sigma × **{sigma_shape:.2f}** (auto), default bias **{float(profile['default_bias']):+.1f}°F**")
 
 sources = []
 chart_df = None
@@ -550,6 +622,12 @@ c.metric("Projected high (trend-based)", "—" if trend_proj_high is None else f
 
 if momentum_delta is not None:
     st.info(f"Peak heating momentum: **{momentum_delta:+.1f}°F** — {momentum_label}.")
+    if momentum_delta >= 1.5:
+        st.success("Live momentum signal: station is running materially HOTTER than forecast track.")
+    elif momentum_delta <= -1.5:
+        st.error("Live momentum signal: station is running materially COOLER than forecast track.")
+    elif abs(momentum_delta) <= 0.7:
+        st.caption("Live momentum signal: station is tracking close to forecast.")
 elif chart_df is None:
     st.warning("Trend engine unavailable because no hourly curve could be built.")
 else:
@@ -569,8 +647,13 @@ if trend_proj_high is not None:
     st.caption(f"Blended model high = 70% forecast consensus + 30% live trend = **{mu:.1f}°F**")
 
 if momentum_delta is not None:
-    mu = mu + momentum_weight * momentum_delta
-    st.caption(f"Momentum-adjusted high = blended high + ({momentum_weight:.2f} × {momentum_delta:+.1f}) = **{mu:.1f}°F**")
+    momentum_adjust = momentum_weight * momentum_delta
+    if momentum_delta <= -1.5:
+        momentum_adjust += -0.3
+    elif momentum_delta >= 1.5:
+        momentum_adjust += 0.2
+    mu = mu + momentum_adjust
+    st.caption(f"Momentum-adjusted high = blended high + live momentum = **{mu:.1f}°F**")
 
 if revision_bias != 0:
     mu = mu + revision_bias
@@ -582,7 +665,13 @@ if settlement_bias != 0:
 
 st.divider()
 st.subheader("Suggested Kalshi Bracket")
-ladder, chosen_mode = build_ladder(mu, sigma, ladder_mode)
+market_prices = parse_market_lines(market_text) if market_text.strip() else {}
+effective_ladder_mode = ladder_mode
+if ladder_mode == "market_auto" and market_prices:
+    detected = detect_market_ladder(list(market_prices.keys()))
+    if detected in ("even", "odd"):
+        effective_ladder_mode = detected
+ladder, chosen_mode = build_ladder(mu, sigma, effective_ladder_mode if effective_ladder_mode != "market_auto" else "auto")
 ordered = sorted(ladder, key=lambda x: x["WinProb"], reverse=True)
 top = ordered[0]
 second = ordered[1]
@@ -640,7 +729,6 @@ else:
 
 st.success(f"Suggested bracket: **{top['Bracket']}** (model ≈ **{top['WinProb']*100:.0f}%**)")
 
-market_prices = parse_market_lines(market_text) if market_text.strip() else {}
 rows = []
 best_bet = None
 
@@ -650,8 +738,9 @@ for x in ordered:
         "Win %": f"{x['WinProb']*100:.1f}%",
         "Fair YES": f"{fair_cents_from_prob(x['WinProb']):.1f}¢",
     }
-    if x["Bracket"] in market_prices:
-        yes_cents = market_prices[x["Bracket"]]
+    market_label = remap_label_to_market(x["Bracket"], list(market_prices.keys())) if market_prices else x["Bracket"]
+    if market_label in market_prices:
+        yes_cents = market_prices[market_label]
         market_prob = yes_cents / 100.0
         edge = (x["WinProb"] - market_prob) * 100.0
         ev = expected_value_per_1_dollar(x["WinProb"], yes_cents)
@@ -730,4 +819,4 @@ if show_hourly_chart and chart_df is not None and not chart_df.empty:
         peak_v = float(df_plot["temp_f"].max())
         st.caption(f"Peak hour (forecast): {peak_t.strftime('%I:%M %p')} at {peak_v:.1f}°F")
 
-st.caption("v9.1 adds city-specific distribution shaping so bracket probabilities are tighter in cities like Phoenix and Vegas, and wider in cities like Miami and Houston.")
+st.caption("v9.4 adds city-specific distribution shaping so bracket probabilities are tighter in cities like Phoenix and Vegas, and wider in cities like Miami and Houston.")
