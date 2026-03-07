@@ -1,5 +1,5 @@
 # streamlit_app.py
-# Kalshi Weather Model – Daily High [v9.0]
+# Kalshi Weather Model – Daily High [v9.1]
 # Adds city-specific distribution shaping on top of v8.5:
 # - city-specific sigma multiplier
 # - slight city bias defaults
@@ -22,11 +22,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Model – Daily High (v9.0)", layout="centered")
-st.title("Model – Daily High (v9.0)")
-st.caption("Adds city-specific distribution shaping so bracket probabilities better reflect how each city usually settles.")
+st.set_page_config(page_title="Model – Daily High (v9.1)", layout="centered")
+st.title("Model – Daily High (v9.1)")
+st.caption("Locks in your permanent core settings and leaves only the day-to-day items adjustable.")
 
-UA = {"User-Agent": "kalshi-weather-model/9.0"}
+UA = {"User-Agent": "kalshi-weather-model/9.1"}
 
 CITIES: Dict[str, Dict[str, str | float]] = {
     "Miami": {"lat": 25.7933, "lon": -80.2906, "station": "KMIA", "label": "Miami Intl Airport", "tz": "America/New_York"},
@@ -365,20 +365,37 @@ local_now = datetime.now(tzinfo)
 profile = CITY_PROFILE.get(city, {"sigma_mult": 1.0, "default_bias": 0.0})
 
 with st.expander("Settings", expanded=True):
+    st.caption("Locked core settings are built in below. Only the day-to-day items stay adjustable.")
+
     include_noaa = st.toggle("Include Open-Meteo NOAA GFS/HRRR", value=True)
     include_nws = st.toggle("Include NWS (api.weather.gov)", value=True)
     show_hourly_chart = st.toggle("Show hourly chart", value=True)
+
     grace_minutes = st.slider("Grace minutes after 10:30 local", 0, 180, 45, 5)
     ladder_mode = st.selectbox("Kalshi ladder alignment", ["auto", "even", "odd"], index=0)
-    do_not_bet_prob = st.slider("Trade filter: top probability must exceed", 0.40, 0.70, 0.58, 0.01)
-    strong_edge_threshold = st.slider("Strong edge threshold (%)", 1.0, 30.0, 8.0, 0.5)
-    small_edge_threshold = st.slider("Small edge threshold (%)", 0.5, 20.0, 3.0, 0.5)
-    settlement_bias = st.slider("Settlement station bias correction (°F)", -1.5, 1.5, float(profile["default_bias"]), 0.1)
-    momentum_weight = st.slider("Peak heating momentum weight", 0.0, 1.0, 0.35, 0.05)
-    noon_lag_threshold = st.slider("No-bet lag threshold (°F behind forecast track)", 0.5, 4.0, 1.5, 0.1)
-    no_bet_after_hour = st.slider("No new bets after local hour", 9, 15, 10, 1)
-    no_bet_after_minute = st.slider("No new bets after minute", 0, 59, 45, 5)
+    no_bet_after_hour = st.slider("No new bets after local hour", 9, 15, 12, 1)
+    no_bet_after_minute = st.slider("No new bets after minute", 0, 59, 35, 5)
     sigma_shape = st.slider("City distribution shaping", 0.70, 1.30, float(profile["sigma_mult"]), 0.01)
+
+    # Locked permanent settings
+    do_not_bet_prob = 0.58
+    strong_edge_threshold = 10.0
+    small_edge_threshold = 3.0
+    settlement_bias = 0.0
+    momentum_weight = 0.35
+    noon_lag_threshold = 1.5
+
+    st.markdown(
+        """
+**Permanent built-in settings**
+- Trade filter: **0.58**
+- Strong edge threshold: **10%**
+- Small edge threshold: **3%**
+- Settlement station bias: **0.0°F**
+- Peak heating momentum weight: **0.35**
+- No-bet lag threshold: **1.5°F**
+        """
+    )
 
 with st.expander("Forecast revision tracker (paste recent forecast updates)", expanded=False):
     revision_text = st.text_area(
@@ -713,4 +730,4 @@ if show_hourly_chart and chart_df is not None and not chart_df.empty:
         peak_v = float(df_plot["temp_f"].max())
         st.caption(f"Peak hour (forecast): {peak_t.strftime('%I:%M %p')} at {peak_v:.1f}°F")
 
-st.caption("v9.0 adds city-specific distribution shaping so bracket probabilities are tighter in cities like Phoenix and Vegas, and wider in cities like Miami and Houston.")
+st.caption("v9.1 adds city-specific distribution shaping so bracket probabilities are tighter in cities like Phoenix and Vegas, and wider in cities like Miami and Houston.")
