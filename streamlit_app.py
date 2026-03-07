@@ -1,5 +1,5 @@
 # streamlit_app.py
-# Kalshi Weather Model – Daily High [v9.4]
+# Kalshi Weather Model – Daily High [v9.5]
 # Adds city-specific distribution shaping on top of v8.5:
 # - city-specific sigma multiplier
 # - slight city bias defaults
@@ -22,11 +22,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Model – Daily High (v9.4)", layout="centered")
-st.title("Model – Daily High (v9.4)")
+st.set_page_config(page_title="Model – Daily High (v9.5)", layout="centered")
+st.title("Model – Daily High (v9.5)")
 st.caption("Adds locked core settings, mobile-friendly Kalshi entry, market ladder auto-detection, auto city shaping, and stronger live momentum handling.")
 
-UA = {"User-Agent": "kalshi-weather-model/9.4"}
+UA = {"User-Agent": "kalshi-weather-model/9.5"}
 
 CITIES: Dict[str, Dict[str, str | float]] = {
     "Miami": {"lat": 25.7933, "lon": -80.2906, "station": "KMIA", "label": "Miami Intl Airport", "tz": "America/New_York"},
@@ -59,6 +59,14 @@ CITY_PROFILE = {
     "Houston": {"sigma_mult": 1.18, "default_bias": 0.0},
     "New Orleans": {"sigma_mult": 1.16, "default_bias": 0.0},
 }
+
+CITY_PROB_FILTERS = {
+    "Phoenix": 0.55,
+    "Las Vegas": 0.55,
+    "Houston": 0.62,
+}
+DEFAULT_PROB_FILTER = 0.58
+MIN_TOP_TWO_GAP = 0.12
 
 
 def safe_get_json(url: str, params: Optional[dict] = None, timeout: int = 12):
@@ -406,7 +414,7 @@ local_now = datetime.now(tzinfo)
 profile = CITY_PROFILE.get(city, {"sigma_mult": 1.0, "default_bias": 0.0})
 
 with st.expander("Settings", expanded=True):
-    st.caption("Core settings are locked in. Only the day-to-day items stay adjustable.")
+    st.caption("Core settings are locked in. Only day-to-day items stay adjustable.")
 
     include_noaa = st.toggle("Include Open-Meteo NOAA GFS/HRRR", value=True)
     include_nws = st.toggle("Include NWS (api.weather.gov)", value=True)
@@ -418,26 +426,25 @@ with st.expander("Settings", expanded=True):
     no_bet_after_minute = st.slider("No new bets after minute", 0, 59, 35, 5)
 
     # Locked permanent settings
-    do_not_bet_prob = 0.58
     strong_edge_threshold = 10.0
     small_edge_threshold = 3.0
     settlement_bias = 0.0
     momentum_weight = 0.35
     noon_lag_threshold = 1.5
 
-    # Auto city shaping
-    sigma_shape = float(profile["sigma_mult"])
+    # City-specific probability filters
+    do_not_bet_prob = CITY_PROB_FILTERS.get(city, DEFAULT_PROB_FILTER)
 
     st.markdown(
-        """
+        f"""
 **Permanent built-in settings**
-- Trade filter: **0.58**
+- Probability filter for **{city}**: **{do_not_bet_prob:.2f}**
 - Strong edge threshold: **10%**
 - Small edge threshold: **3%**
 - Settlement station bias: **0.0°F**
 - Peak heating momentum weight: **0.35**
 - No-bet lag threshold: **1.5°F**
-- City distribution shaping: **auto by city**
+- Minimum top-two gap: **{MIN_TOP_TWO_GAP*100:.0f}%**
         """
     )
 
@@ -485,7 +492,7 @@ with st.expander("Kalshi Odds / EV (recommended)", expanded=True):
         st.code(market_text, language="text")
 
 st.info(f"Settlement station for **{city}**: **{station}** — {station_label}")
-st.caption(f"City profile: sigma × **{sigma_shape:.2f}** (auto), default bias **{float(profile['default_bias']):+.1f}°F**")
+st.caption(f"City profile: sigma × **{sigma_shape:.2f}** (auto), default bias **{float(profile['default_bias']):+.1f}°F**, active probability filter **{do_not_bet_prob:.2f}**")
 
 sources = []
 chart_df = None
@@ -703,6 +710,8 @@ current_cutoff = local_now.replace(hour=no_bet_after_hour, minute=no_bet_after_m
 trade_filter_reasons = []
 if top["WinProb"] < do_not_bet_prob:
     trade_filter_reasons.append(f"Top bracket only {top['WinProb']*100:.1f}% (< {do_not_bet_prob*100:.0f}%)")
+if top_gap < MIN_TOP_TWO_GAP:
+    trade_filter_reasons.append(f"Top-two gap too small ({top_gap*100:.1f}% < {MIN_TOP_TWO_GAP*100:.0f}%)")
 if local_now > current_cutoff:
     trade_filter_reasons.append(f"Past cutoff ({current_cutoff.strftime('%I:%M %p')} local)")
 if risk_level == "PASS":
@@ -820,4 +829,4 @@ if show_hourly_chart and chart_df is not None and not chart_df.empty:
         peak_v = float(df_plot["temp_f"].max())
         st.caption(f"Peak hour (forecast): {peak_t.strftime('%I:%M %p')} at {peak_v:.1f}°F")
 
-st.caption("v9.4 adds city-specific distribution shaping so bracket probabilities are tighter in cities like Phoenix and Vegas, and wider in cities like Miami and Houston.")
+st.caption("v9.5 adds city-specific distribution shaping so bracket probabilities are tighter in cities like Phoenix and Vegas, and wider in cities like Miami and Houston.")
