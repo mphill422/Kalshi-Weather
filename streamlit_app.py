@@ -448,10 +448,7 @@ with st.expander("Kalshi Odds / EV (recommended)", expanded=True):
     market_text = st.text_area(
         "Paste Kalshi lines with YES odds or cents",
         height=140,
-        placeholder="82° to 83° +566
-84° to 85° -489
-86° or above +1011
-77° or below 1c",
+        placeholder="82° to 83° +566\n84° to 85° -489\n86° or above +1011\n77° or below 1c",
     )
 
     st.markdown("**Mobile quick entry (use this if paste won't work)**")
