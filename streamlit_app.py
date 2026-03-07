@@ -24,7 +24,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Model – Daily High (v9.4)", layout="centered")
 st.title("Model – Daily High (v9.4)")
-st.caption("Adds auto city shaping, locked core settings, mobile Kalshi entry, ladder auto-detection, and stronger live momentum detection.")
+st.caption("Adds locked core settings, mobile-friendly Kalshi entry, market ladder auto-detection, auto city shaping, and stronger live momentum handling.")
 
 UA = {"User-Agent": "kalshi-weather-model/9.4"}
 
@@ -117,46 +117,6 @@ def expected_value_per_1_dollar(p: float, yes_price_cents: float) -> float:
 
 
 def parse_market_lines(text: str):
-
-def detect_market_ladder(market_labels):
-    nums = []
-    for label in market_labels:
-        found = re.findall(r"\d+", label)
-        nums.extend(int(x) for x in found[:2])
-    if not nums:
-        return None
-    odd_hits = 0
-    even_hits = 0
-    for label in market_labels:
-        found = [int(x) for x in re.findall(r"\d+", label)[:1]]
-        if not found:
-            continue
-        if found[0] % 2 == 0:
-            even_hits += 1
-        else:
-            odd_hits += 1
-    return "odd" if odd_hits > even_hits else "even"
-
-
-def remap_label_to_market(target_label, market_labels):
-    if target_label in market_labels:
-        return target_label
-    target_nums = [int(x) for x in re.findall(r"\d+", target_label)]
-    if not target_nums:
-        return target_label
-    # map 82-83 -> 81-82 / 83-84 style closest bracket if needed
-    best = None
-    best_score = None
-    for lab in market_labels:
-        lab_nums = [int(x) for x in re.findall(r"\d+", lab)]
-        if not lab_nums:
-            continue
-        score = abs(sum(lab_nums[:2]) / max(1, len(lab_nums[:2])) - sum(target_nums[:2]) / max(1, len(target_nums[:2])))
-        if best_score is None or score < best_score:
-            best_score = score
-            best = lab
-    return best or target_label
-
     out = {}
     for raw in (text or "").splitlines():
         line = raw.strip()
@@ -177,6 +137,47 @@ def remap_label_to_market(target_label, market_labels):
             out[label] = clamp(price_cents, 0.0, 100.0)
     return out
 
+
+
+
+def detect_market_ladder(market_labels):
+    nums = []
+    odd_hits = 0
+    even_hits = 0
+    for label in market_labels:
+        found = re.findall(r"\d+", label)
+        if found:
+            first = int(found[0])
+            if first % 2 == 0:
+                even_hits += 1
+            else:
+                odd_hits += 1
+            nums.extend(int(x) for x in found[:2])
+    if not nums:
+        return None
+    return "odd" if odd_hits > even_hits else "even"
+
+
+def remap_label_to_market(target_label, market_labels):
+    if target_label in market_labels:
+        return target_label
+    target_nums = [int(x) for x in re.findall(r"\d+", target_label)]
+    if not target_nums:
+        return target_label
+
+    target_center = sum(target_nums[:2]) / max(1, len(target_nums[:2]))
+    best = None
+    best_score = None
+    for label in market_labels:
+        nums = [int(x) for x in re.findall(r"\d+", label)]
+        if not nums:
+            continue
+        center = sum(nums[:2]) / max(1, len(nums[:2]))
+        score = abs(center - target_center)
+        if best_score is None or score < best_score:
+            best_score = score
+            best = label
+    return best or target_label
 
 def parse_revision_lines(text: str):
     rows = []
@@ -424,6 +425,9 @@ with st.expander("Settings", expanded=True):
     momentum_weight = 0.35
     noon_lag_threshold = 1.5
 
+    # Auto city shaping
+    sigma_shape = float(profile["sigma_mult"])
+
     st.markdown(
         """
 **Permanent built-in settings**
@@ -433,6 +437,7 @@ with st.expander("Settings", expanded=True):
 - Settlement station bias: **0.0°F**
 - Peak heating momentum weight: **0.35**
 - No-bet lag threshold: **1.5°F**
+- City distribution shaping: **auto by city**
         """
     )
 
@@ -476,7 +481,7 @@ with st.expander("Kalshi Odds / EV (recommended)", expanded=True):
                 quick_lines.append(f"{bracket.strip()} {price.strip()}")
 
     if quick_mode and quick_lines:
-TEMP_PLACEHOLDER
+        market_text = "\n".join(quick_lines)
         st.code(market_text, language="text")
 
 st.info(f"Settlement station for **{city}**: **{station}** — {station_label}")
@@ -645,7 +650,7 @@ if trend_proj_high is not None:
 if momentum_delta is not None:
     momentum_adjust = momentum_weight * momentum_delta
     if momentum_delta <= -1.5:
-        momentum_adjust += -0.3
+        momentum_adjust -= 0.3
     elif momentum_delta >= 1.5:
         momentum_adjust += 0.2
     mu = mu + momentum_adjust
@@ -664,9 +669,9 @@ st.subheader("Suggested Kalshi Bracket")
 market_prices = parse_market_lines(market_text) if market_text.strip() else {}
 effective_ladder_mode = ladder_mode
 if ladder_mode == "market_auto" and market_prices:
-    detected = detect_market_ladder(list(market_prices.keys()))
-    if detected in ("even", "odd"):
-        effective_ladder_mode = detected
+    detected_mode = detect_market_ladder(list(market_prices.keys()))
+    if detected_mode in ("even", "odd"):
+        effective_ladder_mode = detected_mode
 ladder, chosen_mode = build_ladder(mu, sigma, effective_ladder_mode if effective_ladder_mode != "market_auto" else "auto")
 ordered = sorted(ladder, key=lambda x: x["WinProb"], reverse=True)
 top = ordered[0]
