@@ -4,9 +4,9 @@ import pandas as pd
 import requests
 import math
 
-st.set_page_config(page_title="Kalshi Temperature Model v10.5")
+st.set_page_config(page_title="Kalshi Temperature Model v11")
 
-st.title("Kalshi Temperature Model v10.5")
+st.title("Kalshi Temperature Model v11")
 
 cities = {
     "Phoenix": (33.4342,-112.0116),
@@ -20,7 +20,6 @@ cities = {
 city = st.selectbox("City", list(cities.keys()))
 lat, lon = cities[city]
 
-# normal CDF without scipy
 def normal_cdf(x, mu, sigma):
     return 0.5 * (1 + math.erf((x - mu) / (sigma * math.sqrt(2))))
 
@@ -29,26 +28,61 @@ def nws_high():
     r=requests.get(url).json()
     grid=r["properties"]["forecastHourly"]
     data=requests.get(grid).json()
-
-    temps=[]
-    for p in data["properties"]["periods"][:24]:
-        temps.append(p["temperature"])
-
+    temps=[p["temperature"] for p in data["properties"]["periods"][:24]]
     return max(temps)
+
+def open_meteo_high():
+    url=f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m&temperature_unit=fahrenheit"
+    r=requests.get(url).json()
+    temps=r["hourly"]["temperature_2m"][:24]
+    return max(temps)
+
+def current_temp():
+    url=f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&temperature_unit=fahrenheit"
+    r=requests.get(url).json()
+    return r["current_weather"]["temperature"]
+
+sources=[]
+labels=[]
 
 try:
     nws=nws_high()
+    sources.append(nws)
+    labels.append(("NWS",nws))
 except:
-    nws=None
+    pass
 
-consensus=nws
-sigma=1.0
+try:
+    om=open_meteo_high()
+    sources.append(om)
+    labels.append(("OpenMeteo",om))
+except:
+    pass
 
-st.subheader("Consensus High")
-st.write(consensus)
+consensus=np.mean(sources)
 
-st.write("Sigma")
-st.write(sigma)
+try:
+    cur=current_temp()
+except:
+    cur=None
+
+spread=max(sources)-min(sources) if len(sources)>1 else 0
+
+sigma=1+spread*0.3
+
+st.subheader("Forecast Sources")
+
+df=pd.DataFrame(labels,columns=["Source","High"])
+st.dataframe(df)
+
+st.subheader("Model Inputs")
+
+st.write("Consensus High:",round(consensus,2))
+st.write("Forecast Spread:",round(spread,2))
+st.write("Sigma:",round(sigma,2))
+
+if cur:
+    st.write("Current Temperature:",cur)
 
 brackets=[
 ("69 or below",-100,69),
@@ -76,11 +110,13 @@ for name,lo,hi in brackets:
 
 df=pd.DataFrame({
 "Bracket":[b[0] for b in brackets],
-"Win Probability":np.round(np.array(probs)*100,1)
+"Win Probability":np.round(np.array(probs)*100,1),
+"Fair YES price":np.round(np.array(probs)*100,1)
 })
 
-st.subheader("Model Bracket Probabilities")
+st.subheader("Kalshi Probability Table")
 st.dataframe(df)
 
 best=df.iloc[df["Win Probability"].idxmax()]
-st.success(f"BET SIGNAL: {best['Bracket']}")
+
+st.success(f"BET SIGNAL: {best['Bracket']} ({best['Win Probability']}%)")
