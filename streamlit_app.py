@@ -1,176 +1,398 @@
-import streamlit as st
-import numpy as np
+import math
+import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import requests
-import math
+import streamlit as st
 
-st.set_page_config(page_title="Kalshi Temp Model v12")
+st.set_page_config(page_title="Kalshi Temperature Model v11.3", layout="wide")
+st.title("Kalshi Temperature Model v11.3")
+st.caption("Phone-safe full model: source diagnostics, current temp, expected-now, momentum, full probability table, and BET/PASS.")
 
-st.title("Kalshi Temperature Model v12")
-
-cities = {
-    "Phoenix": (33.4342,-112.0116),
-    "Las Vegas": (36.0840,-115.1537),
-    "Los Angeles": (33.9416,-118.4085),
-    "Dallas": (32.8998,-97.0403),
-    "Austin": (30.1945,-97.6699),
-    "Houston": (29.9902,-95.3368)
+CITIES = {
+    "Phoenix": {"lat": 33.4342, "lon": -112.0116, "tz": "America/Phoenix", "station": "KPHX", "sigma": 1.10, "bias": 0.60, "prob_filter": 0.55},
+    "Las Vegas": {"lat": 36.0840, "lon": -115.1537, "tz": "America/Los_Angeles", "station": "KLAS", "sigma": 1.00, "bias": 0.00, "prob_filter": 0.55},
+    "Los Angeles": {"lat": 33.9416, "lon": -118.4085, "tz": "America/Los_Angeles", "station": "KLAX", "sigma": 1.10, "bias": -0.40, "prob_filter": 0.58},
+    "Dallas": {"lat": 32.8998, "lon": -97.0403, "tz": "America/Chicago", "station": "KDFW", "sigma": 1.00, "bias": 0.15, "prob_filter": 0.58},
+    "Austin": {"lat": 30.1945, "lon": -97.6699, "tz": "America/Chicago", "station": "KAUS", "sigma": 1.10, "bias": 0.20, "prob_filter": 0.58},
+    "Houston": {"lat": 29.9902, "lon": -95.3368, "tz": "America/Chicago", "station": "KIAH", "sigma": 1.50, "bias": 0.30, "prob_filter": 0.62},
 }
 
-city = st.selectbox("City", list(cities.keys()))
-lat, lon = cities[city]
+MIN_TOP_TWO_GAP = 0.12
+MOMENTUM_WEIGHT = 0.35
+NO_BET_LAG = 1.5
 
+@st.cache_data(ttl=300, show_spinner=False)
+def safe_get_json(url, params=None):
+    try:
+        r = requests.get(url, params=params, headers={"User-Agent": "kalshi-temp-v11-3"}, timeout=12)
+        r.raise_for_status()
+        return r.json(), "OK"
+    except Exception as e:
+        return None, str(e)
 
 def normal_cdf(x, mu, sigma):
-    return 0.5 * (1 + math.erf((x - mu) / (sigma * math.sqrt(2))))
+    z = (x - mu) / (sigma * math.sqrt(2))
+    return 0.5 * (1 + math.erf(z))
 
+def parse_label_numbers(label):
+    nums = [int(x) for x in re.findall(r"\d+", label)]
+    low = label.lower()
+    if "below" in low:
+        return ("below", nums[0] if nums else None)
+    if "above" in low:
+        return ("above", nums[0] if nums else None)
+    if len(nums) >= 2:
+        return ("range", nums[0], nums[1])
+    return None
 
-sources=[]
-table=[]
+def label_prob(label, mu, sigma):
+    parsed = parse_label_numbers(label)
+    if parsed is None:
+        return 0.0
+    kind = parsed[0]
+    if kind == "below":
+        return normal_cdf(parsed[1] + 0.5, mu, sigma)
+    if kind == "above":
+        return 1.0 - normal_cdf(parsed[1] - 0.5, mu, sigma)
+    _, lo, hi = parsed
+    return max(0.0, normal_cdf(hi + 0.5, mu, sigma) - normal_cdf(lo - 0.5, mu, sigma))
 
-# --- NWS ---
-try:
-    url=f"https://api.weather.gov/points/{lat},{lon}"
-    r=requests.get(url,timeout=5).json()
-    grid=r["properties"]["forecastHourly"]
+def default_ladder(mu, mode="auto"):
+    center = round(mu)
+    if mode == "auto":
+        mode = "even" if center % 2 == 0 else "odd"
+    if mode == "even":
+        labels = [
+            f"{center-5} or below",
+            f"{center-4} to {center-3}",
+            f"{center-2} to {center-1}",
+            f"{center} to {center+1}",
+            f"{center+2} to {center+3}",
+            f"{center+4} or above",
+        ]
+    else:
+        labels = [
+            f"{center-4} or below",
+            f"{center-3} to {center-2}",
+            f"{center-1} to {center}",
+            f"{center+1} to {center+2}",
+            f"{center+3} to {center+4}",
+            f"{center+5} or above",
+        ]
+    return labels, mode
 
-    data=requests.get(grid,timeout=5).json()
+def detect_market_ladder(labels):
+    starts = []
+    for lab in labels:
+        nums = [int(x) for x in re.findall(r"\d+", lab)]
+        if nums:
+            starts.append(nums[0])
+    if not starts:
+        return None
+    odd = sum(x % 2 == 1 for x in starts)
+    even = sum(x % 2 == 0 for x in starts)
+    return "odd" if odd > even else "even"
 
-    temps=[p["temperature"] for p in data["properties"]["periods"][:24]]
+def parse_market_lines(text):
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    out = {}
+    for ln in lines:
+        m = re.match(r"(.+?)\s+([+-]?\d+(?:\.\d+)?c?)$", ln)
+        if m:
+            out[m.group(1).strip()] = m.group(2).strip().lower()
+    return out
 
-    nws=max(temps)
+def price_to_prob(price):
+    if price.endswith("c"):
+        return float(price[:-1]) / 100.0
+    val = float(price)
+    if val > 0:
+        return 100.0 / (val + 100.0)
+    return abs(val) / (abs(val) + 100.0)
 
-    sources.append(nws)
-    table.append(["NWS",nws,"OK"])
+def fetch_nws_all(lat, lon, tzname, station):
+    daily_high = None
+    hourly_high = None
+    hourly_periods = None
+    obs_temp = None
+    obs_ts = None
+    notes = {"NWS forecast": "FAILED", "NWS hourly": "FAILED", "Station obs": "FAILED"}
 
-except:
-    table.append(["NWS","-","FAILED"])
+    points, status = safe_get_json(f"https://api.weather.gov/points/{lat},{lon}")
+    if not points:
+        return daily_high, hourly_high, hourly_periods, obs_temp, obs_ts, {
+            "NWS forecast": status, "NWS hourly": status, "Station obs": "FAILED"
+        }
 
+    forecast_url = points["properties"].get("forecast")
+    hourly_url = points["properties"].get("forecastHourly")
 
-# --- Open Meteo ---
-try:
-    url=f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m&temperature_unit=fahrenheit"
+    if forecast_url:
+        data, s = safe_get_json(forecast_url)
+        if data:
+            try:
+                periods = data["properties"]["periods"]
+                tz = ZoneInfo(tzname)
+                now_local = datetime.now(tz)
+                best = None
+                for p in periods:
+                    start = datetime.fromisoformat(p["startTime"]).astimezone(tz)
+                    end = datetime.fromisoformat(p["endTime"]).astimezone(tz)
+                    if bool(p.get("isDaytime")) and start.date() <= now_local.date() <= end.date():
+                        best = p
+                        break
+                if best is None:
+                    for p in periods:
+                        if bool(p.get("isDaytime")):
+                            best = p
+                            break
+                if best:
+                    daily_high = float(best["temperature"])
+                    notes["NWS forecast"] = "OK"
+            except Exception as e:
+                notes["NWS forecast"] = str(e)
+        else:
+            notes["NWS forecast"] = s
 
-    r=requests.get(url,timeout=5).json()
+    if hourly_url:
+        data, s = safe_get_json(hourly_url)
+        if data:
+            try:
+                hourly_periods = data["properties"]["periods"]
+                vals = []
+                tz = ZoneInfo(tzname)
+                now_local = datetime.now(tz)
+                for p in hourly_periods[:24]:
+                    dt = datetime.fromisoformat(p["startTime"]).astimezone(tz)
+                    if dt.date() == now_local.date():
+                        temp = p.get("temperature")
+                        if temp is not None:
+                            vals.append(float(temp))
+                if vals:
+                    hourly_high = max(vals)
+                    notes["NWS hourly"] = "OK"
+                else:
+                    notes["NWS hourly"] = "No values"
+            except Exception as e:
+                notes["NWS hourly"] = str(e)
+        else:
+            notes["NWS hourly"] = s
 
-    temps=r["hourly"]["temperature_2m"][:24]
+    obs, s = safe_get_json(f"https://api.weather.gov/stations/{station}/observations/latest")
+    if obs:
+        try:
+            c = obs["properties"]["temperature"]["value"]
+            obs_ts = obs["properties"]["timestamp"]
+            if c is not None:
+                obs_temp = float(c) * 9.0 / 5.0 + 32.0
+                notes["Station obs"] = "OK"
+            else:
+                notes["Station obs"] = "Unavailable"
+        except Exception as e:
+            notes["Station obs"] = str(e)
+    else:
+        notes["Station obs"] = s
 
-    om=max(temps)
+    return daily_high, hourly_high, hourly_periods, obs_temp, obs_ts, notes
 
-    sources.append(om)
-    table.append(["Open-Meteo",om,"OK"])
+def fetch_open_meteo(lat, lon, model=None):
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "temperature_2m_max",
+        "hourly": "temperature_2m",
+        "current": "temperature_2m",
+        "temperature_unit": "fahrenheit",
+        "timezone": "auto",
+        "forecast_days": 1,
+    }
+    if model:
+        params["models"] = model
+    data, status = safe_get_json("https://api.open-meteo.com/v1/forecast", params=params)
+    if not data:
+        return None, None, None, status
+    try:
+        daily_high = float(data["daily"]["temperature_2m_max"][0])
+    except Exception:
+        daily_high = None
+    try:
+        current_temp = float(data["current"]["temperature_2m"])
+    except Exception:
+        current_temp = None
+    try:
+        hourly = data["hourly"]["temperature_2m"]
+        hourly_high = max(hourly[:24]) if hourly else None
+    except Exception:
+        hourly_high = None
+    return daily_high, hourly_high, current_temp, "OK"
 
-except:
-    table.append(["Open-Meteo","-","FAILED"])
+city = st.selectbox("City", list(CITIES.keys()))
+profile = CITIES[city]
+local_now = datetime.now(ZoneInfo(profile["tz"]))
 
+c1, c2 = st.columns(2)
+with c1:
+    ladder_mode = st.selectbox("Kalshi ladder alignment", ["market_auto", "auto", "even", "odd"], index=0)
+with c2:
+    no_bet_after_hour = st.slider("No new bets after local hour", 9, 15, 12)
+    no_bet_after_minute = st.slider("No new bets after minute", 0, 59, 35, step=5)
 
-# --- GFS ---
-try:
-    url=f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&models=gfs&hourly=temperature_2m&temperature_unit=fahrenheit"
+with st.expander("Paste Kalshi ladder (optional but recommended)", expanded=False):
+    market_text = st.text_area(
+        "Paste lines like: 72 to 73 +100",
+        height=120,
+        placeholder="72 to 73 +100\n70 to 71 +316\n74 to 75 +376"
+    )
 
-    r=requests.get(url,timeout=5).json()
+daily_nws, hourly_nws, hourly_periods, obs_temp, obs_ts, nws_notes = fetch_nws_all(
+    profile["lat"], profile["lon"], profile["tz"], profile["station"]
+)
+daily_om, hourly_om, current_om, om_note = fetch_open_meteo(profile["lat"], profile["lon"], None)
+daily_gfs, hourly_gfs, current_gfs, gfs_note = fetch_open_meteo(profile["lat"], profile["lon"], "gfs_seamless")
 
-    temps=r["hourly"]["temperature_2m"][:24]
-
-    gfs=max(temps)
-
-    sources.append(gfs)
-    table.append(["GFS",gfs,"OK"])
-
-except:
-    table.append(["GFS","-","FAILED"])
-
-
-# --- ECMWF ---
-try:
-    url=f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&models=ecmwf&hourly=temperature_2m&temperature_unit=fahrenheit"
-
-    r=requests.get(url,timeout=5).json()
-
-    temps=r["hourly"]["temperature_2m"][:24]
-
-    ecm=max(temps)
-
-    sources.append(ecm)
-    table.append(["ECMWF",ecm,"OK"])
-
-except:
-    table.append(["ECMWF","-","FAILED"])
-
-
-
-st.subheader("Forecast Sources")
-
-df_sources=pd.DataFrame(table,columns=["Source","Forecast High","Status"])
-
-st.dataframe(df_sources)
-
-
-
-if len(sources)==0:
-    st.error("No sources available")
-    st.stop()
-
-
-consensus=np.mean(sources)
-
-spread=max(sources)-min(sources) if len(sources)>1 else 0
-
-sigma=1 + spread*0.35
-
-
-st.subheader("Model Inputs")
-
-st.write("Consensus High:",round(consensus,2))
-
-st.write("Forecast Spread:",round(spread,2))
-
-st.write("Sigma:",round(sigma,2))
-
-
-brackets=[
-("69 or below",-100,69),
-("70-71",70,71),
-("72-73",72,73),
-("74-75",74,75),
-("76-77",76,77),
-("78 or above",78,200)
+source_rows = [
+    {"Source": "NWS forecast", "Forecast High": daily_nws, "Status": nws_notes["NWS forecast"]},
+    {"Source": "NWS hourly", "Forecast High": hourly_nws, "Status": nws_notes["NWS hourly"]},
+    {"Source": "Open-Meteo", "Forecast High": daily_om, "Status": om_note},
+    {"Source": "GFS", "Forecast High": daily_gfs, "Status": gfs_note},
 ]
 
+df_sources = pd.DataFrame(source_rows)
 
-probs=[]
+def fmt_num(x):
+    try:
+        if x is None:
+            return "-"
+        xf = float(x)
+        if math.isnan(xf):
+            return "-"
+        return f"{xf:.1f}"
+    except Exception:
+        return "-"
 
-for name,lo,hi in brackets:
+df_show = df_sources.copy()
+df_show["Forecast High"] = df_show["Forecast High"].apply(fmt_num)
+st.subheader("Forecast Source Diagnostics")
+st.dataframe(df_show, use_container_width=True, hide_index=True)
 
-    if lo==-100:
-        p=normal_cdf(69,consensus,sigma)
+usable = []
+for x in [daily_nws, hourly_nws, daily_om, daily_gfs]:
+    if isinstance(x, (int, float)):
+        xf = float(x)
+        if not math.isnan(xf):
+            usable.append(xf)
 
-    elif hi==200:
-        p=1-normal_cdf(78,consensus,sigma)
+if not usable:
+    st.error("No usable forecast sources available right now.")
+    st.stop()
 
-    else:
-        p=normal_cdf(hi,consensus,sigma)-normal_cdf(lo,consensus,sigma)
+consensus = sum(usable) / len(usable) + float(profile["bias"])
+spread = max(usable) - min(usable) if len(usable) >= 2 else 0.0
+sigma = max(0.85, float(profile["sigma"]) + spread * 0.25)
 
-    probs.append(p)
+current_candidates = []
+for x in [obs_temp, current_om, current_gfs]:
+    if isinstance(x, (int, float)):
+        xf = float(x)
+        if not math.isnan(xf):
+            current_candidates.append(xf)
+current_temp = sum(current_candidates) / len(current_candidates) if current_candidates else None
 
+expected_now = None
+momentum_delta = None
+heating_needed = None
+if current_temp is not None:
+    heating_needed = consensus - current_temp
+if hourly_periods and current_temp is not None:
+    try:
+        best = None
+        best_delta = None
+        tz = ZoneInfo(profile["tz"])
+        for p in hourly_periods[:18]:
+            dt = datetime.fromisoformat(p["startTime"]).astimezone(tz)
+            delta = abs((dt - local_now).total_seconds())
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+                best = p
+        if best and best.get("temperature") is not None:
+            expected_now = float(best["temperature"])
+            momentum_delta = current_temp - expected_now
+    except Exception:
+        pass
 
+st.subheader("Model Inputs")
+m1, m2, m3 = st.columns(3)
+m1.metric("Consensus High", f"{consensus:.1f}")
+m2.metric("Forecast Spread", f"{spread:.1f}")
+m3.metric("Sigma", f"{sigma:.2f}")
 
-df=pd.DataFrame({
+m4, m5, m6 = st.columns(3)
+m4.metric("Current Temperature", f"{current_temp:.1f}" if current_temp is not None else "-")
+m5.metric("Expected Now", f"{expected_now:.1f}" if expected_now is not None else "-")
+m6.metric("Live Momentum", f"{momentum_delta:+.1f}" if momentum_delta is not None else "-")
 
-"Bracket":[b[0] for b in brackets],
+if heating_needed is not None:
+    st.write("Heating still needed to reach consensus:", round(heating_needed, 1))
+if obs_ts:
+    st.caption(f"Station observation time: {obs_ts}")
 
-"Win Probability":np.round(np.array(probs)*100,1),
+mu = consensus
+if momentum_delta is not None:
+    mu = mu + MOMENTUM_WEIGHT * momentum_delta
+    st.caption(f"Momentum-adjusted consensus: {mu:.1f}")
 
-"Fair YES Price":np.round(np.array(probs)*100,1)
+market_prices = parse_market_lines(market_text) if market_text.strip() else {}
+market_labels = list(market_prices.keys())
+detected = detect_market_ladder(market_labels) if market_labels else None
+effective_mode = detected if ladder_mode == "market_auto" and detected else ladder_mode
 
-})
+labels, chosen_mode = default_ladder(mu, "auto" if effective_mode == "market_auto" else effective_mode)
+if market_labels:
+    labels = market_labels
 
+rows = []
+for lab in labels:
+    p = label_prob(lab, mu, sigma)
+    rows.append({"Bracket": lab, "WinProb": p, "FairYES": p})
+rows.sort(key=lambda x: x["WinProb"], reverse=True)
+
+top = rows[0]
+second = rows[1] if len(rows) > 1 else {"WinProb": 0.0}
+top_gap = top["WinProb"] - second["WinProb"]
+
+table_rows = []
+for r in rows:
+    item = {
+        "Bracket": r["Bracket"],
+        "Win Probability": f"{r['WinProb']*100:.1f}%",
+        "Fair YES Price": f"{r['FairYES']*100:.1f}c",
+    }
+    if r["Bracket"] in market_prices:
+        mprob = price_to_prob(market_prices[r["Bracket"]])
+        item["Market YES"] = market_prices[r["Bracket"]]
+        item["Edge"] = f"{(r['WinProb'] - mprob)*100:+.1f}%"
+    table_rows.append(item)
 
 st.subheader("Kalshi Probability Table")
+st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
 
-st.dataframe(df)
+st.metric("Top-two bracket gap", f"{top_gap*100:.1f}%")
 
+cutoff = local_now.replace(hour=no_bet_after_hour, minute=no_bet_after_minute, second=0, microsecond=0)
+reasons = []
+if top["WinProb"] < float(profile["prob_filter"]):
+    reasons.append(f"Top bracket only {top['WinProb']*100:.1f}% (< {profile['prob_filter']*100:.0f}%)")
+if top_gap < MIN_TOP_TWO_GAP:
+    reasons.append(f"Top-two gap too small ({top_gap*100:.1f}% < {MIN_TOP_TWO_GAP*100:.0f}%)")
+if local_now > cutoff:
+    reasons.append(f"Past cutoff ({cutoff.strftime('%I:%M %p')} local)")
+if momentum_delta is not None and momentum_delta <= -NO_BET_LAG and local_now.hour >= 11:
+    reasons.append(f"Live temp is {abs(momentum_delta):.1f} behind forecast track")
 
-best=df.iloc[df["Win Probability"].idxmax()]
-
-st.success(f"BET SIGNAL: {best['Bracket']} ({best['Win Probability']}%)")
+if reasons:
+    st.error("PASS - " + " | ".join(reasons))
+else:
+    st.success(f"BET SIGNAL: {top['Bracket']} ({top['WinProb']*100:.1f}%)")
