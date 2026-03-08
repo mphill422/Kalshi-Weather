@@ -2,7 +2,7 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import requests
-from scipy.stats import norm
+import math
 
 st.set_page_config(page_title="Kalshi Temperature Model v10.5")
 
@@ -18,20 +18,19 @@ cities = {
 }
 
 city = st.selectbox("City", list(cities.keys()))
+lat, lon = cities[city]
 
-lat,lon = cities[city]
+# normal CDF without scipy
+def normal_cdf(x, mu, sigma):
+    return 0.5 * (1 + math.erf((x - mu) / (sigma * math.sqrt(2))))
 
 def nws_high():
-
     url=f"https://api.weather.gov/points/{lat},{lon}"
     r=requests.get(url).json()
-
     grid=r["properties"]["forecastHourly"]
-
     data=requests.get(grid).json()
 
     temps=[]
-
     for p in data["properties"]["periods"][:24]:
         temps.append(p["temperature"])
 
@@ -43,7 +42,6 @@ except:
     nws=None
 
 consensus=nws
-
 sigma=1.0
 
 st.subheader("Consensus High")
@@ -52,7 +50,6 @@ st.write(consensus)
 st.write("Sigma")
 st.write(sigma)
 
-# Kalshi bracket structure
 brackets=[
 ("69 or below",-100,69),
 ("70-71",70,71),
@@ -67,13 +64,13 @@ probs=[]
 for name,lo,hi in brackets:
 
     if lo==-100:
-        p=norm.cdf(69-consensus,sigma)
+        p=normal_cdf(69,consensus,sigma)
 
     elif hi==200:
-        p=1-norm.cdf(78-consensus,sigma)
+        p=1-normal_cdf(78,consensus,sigma)
 
     else:
-        p=norm.cdf(hi-consensus,sigma)-norm.cdf(lo-consensus,sigma)
+        p=normal_cdf(hi,consensus,sigma)-normal_cdf(lo,consensus,sigma)
 
     probs.append(p)
 
@@ -86,5 +83,4 @@ st.subheader("Model Bracket Probabilities")
 st.dataframe(df)
 
 best=df.iloc[df["Win Probability"].idxmax()]
-
 st.success(f"BET SIGNAL: {best['Bracket']}")
