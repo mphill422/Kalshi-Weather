@@ -1,193 +1,90 @@
-# Kalshi Temperature Model v10.4
-# Calibrated version for temperature markets
-
 import streamlit as st
-import requests
+import numpy as np
 import pandas as pd
-import math
-import re
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import requests
+from scipy.stats import norm
 
-st.set_page_config(page_title="Kalshi Temperature Model v10.4", layout="wide")
+st.set_page_config(page_title="Kalshi Temperature Model v10.5")
 
-st.title("Kalshi Temperature Model v10.4")
+st.title("Kalshi Temperature Model v10.5")
 
-# -----------------------------
-# City configuration
-# -----------------------------
-
-CITIES = {
-    "Phoenix": {
-        "lat": 33.4342,
-        "lon": -112.0116,
-        "station": "KPHX",
-        "sigma": 1.10,
-        "bias": 0.60,
-        "prob_filter": 0.55
-    },
-    "Las Vegas": {
-        "lat": 36.0801,
-        "lon": -115.1522,
-        "station": "KLAS",
-        "sigma": 1.00,
-        "bias": 0.00,
-        "prob_filter": 0.55
-    },
-    "Los Angeles": {
-        "lat": 33.9425,
-        "lon": -118.4081,
-        "station": "KLAX",
-        "sigma": 1.10,
-        "bias": -0.40,
-        "prob_filter": 0.58
-    },
-    "Dallas": {
-        "lat": 32.8998,
-        "lon": -97.0403,
-        "station": "KDFW",
-        "sigma": 1.00,
-        "bias": 0.15,
-        "prob_filter": 0.58
-    },
-    "Austin": {
-        "lat": 30.1945,
-        "lon": -97.6699,
-        "station": "KAUS",
-        "sigma": 1.10,
-        "bias": 0.20,
-        "prob_filter": 0.58
-    },
-    "Houston": {
-        "lat": 29.9902,
-        "lon": -95.3368,
-        "station": "KIAH",
-        "sigma": 1.50,
-        "bias": 0.30,
-        "prob_filter": 0.62
-    },
+cities = {
+    "Phoenix": (33.4342,-112.0116),
+    "Las Vegas": (36.0840,-115.1537),
+    "Los Angeles": (33.9416,-118.4085),
+    "Dallas": (32.8998,-97.0403),
+    "Austin": (30.1945,-97.6699),
+    "Houston": (29.9902,-95.3368)
 }
 
-# -----------------------------
-# Probability functions
-# -----------------------------
+city = st.selectbox("City", list(cities.keys()))
 
-def normal_cdf(x, mu, sigma):
-    z = (x - mu) / (sigma * math.sqrt(2))
-    return 0.5 * (1 + math.erf(z))
+lat,lon = cities[city]
 
-def bracket_probability(low, high, mu, sigma):
-    return normal_cdf(high + 0.5, mu, sigma) - normal_cdf(low - 0.5, mu, sigma)
+def nws_high():
 
-# -----------------------------
-# Weather API
-# -----------------------------
+    url=f"https://api.weather.gov/points/{lat},{lon}"
+    r=requests.get(url).json()
 
-def get_nws_forecast(lat, lon):
+    grid=r["properties"]["forecastHourly"]
 
-    url = f"https://api.weather.gov/points/{lat},{lon}"
-    r = requests.get(url).json()
+    data=requests.get(grid).json()
 
-    forecast_url = r["properties"]["forecast"]
-    hourly_url = r["properties"]["forecastHourly"]
+    temps=[]
 
-    forecast = requests.get(forecast_url).json()
-    hourly = requests.get(hourly_url).json()
+    for p in data["properties"]["periods"][:24]:
+        temps.append(p["temperature"])
 
-    daily_high = None
+    return max(temps)
 
-    for p in forecast["properties"]["periods"]:
-        if p["isDaytime"]:
-            daily_high = p["temperature"]
-            break
+try:
+    nws=nws_high()
+except:
+    nws=None
 
-    hourly_high = max(
-        p["temperature"] for p in hourly["properties"]["periods"][:24]
-    )
+consensus=nws
 
-    return daily_high, hourly_high
+sigma=1.0
 
-# -----------------------------
-# Model logic
-# -----------------------------
+st.subheader("Consensus High")
+st.write(consensus)
 
-city = st.selectbox("City", list(CITIES.keys()))
+st.write("Sigma")
+st.write(sigma)
 
-profile = CITIES[city]
-
-daily_high, hourly_high = get_nws_forecast(
-    profile["lat"],
-    profile["lon"]
-)
-
-sources = []
-
-if daily_high:
-    sources.append(daily_high)
-
-if hourly_high:
-    sources.append(hourly_high)
-
-consensus = sum(sources) / len(sources)
-
-# Apply bias
-consensus += profile["bias"]
-
-spread = max(sources) - min(sources) if len(sources) > 1 else 0
-
-sigma = profile["sigma"] + spread / 3
-
-st.subheader("Forecast Inputs")
-
-df = pd.DataFrame({
-    "Source": ["NWS Forecast", "NWS Hourly"],
-    "High": [daily_high, hourly_high]
-})
-
-st.dataframe(df)
-
-# -----------------------------
-# Model metrics
-# -----------------------------
-
-c1, c2, c3 = st.columns(3)
-
-c1.metric("Consensus High", round(consensus,1))
-c2.metric("Spread", spread)
-c3.metric("Sigma", round(sigma,2))
-
-# -----------------------------
-# Generate brackets
-# -----------------------------
-
-center = round(consensus)
-
-brackets = [
-    (center-3, center-2),
-    (center-1, center),
-    (center+1, center+2),
+# Kalshi bracket structure
+brackets=[
+("69 or below",-100,69),
+("70-71",70,71),
+("72-73",72,73),
+("74-75",74,75),
+("76-77",76,77),
+("78 or above",78,200)
 ]
 
-rows = []
+probs=[]
 
-for lo, hi in brackets:
+for name,lo,hi in brackets:
 
-    p = bracket_probability(lo, hi, consensus, sigma)
+    if lo==-100:
+        p=norm.cdf(69-consensus,sigma)
 
-    rows.append({
-        "Bracket": f"{lo}-{hi}",
-        "Win Probability": round(p*100,1)
-    })
+    elif hi==200:
+        p=1-norm.cdf(78-consensus,sigma)
 
-table = pd.DataFrame(rows).sort_values("Win Probability", ascending=False)
+    else:
+        p=norm.cdf(hi-consensus,sigma)-norm.cdf(lo-consensus,sigma)
+
+    probs.append(p)
+
+df=pd.DataFrame({
+"Bracket":[b[0] for b in brackets],
+"Win Probability":np.round(np.array(probs)*100,1)
+})
 
 st.subheader("Model Bracket Probabilities")
+st.dataframe(df)
 
-st.dataframe(table)
+best=df.iloc[df["Win Probability"].idxmax()]
 
-top = table.iloc[0]
-
-if top["Win Probability"]/100 >= profile["prob_filter"]:
-    st.success(f"BET SIGNAL: {top['Bracket']}")
-else:
-    st.error("PASS")
+st.success(f"BET SIGNAL: {best['Bracket']}")
