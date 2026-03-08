@@ -7,9 +7,12 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Kalshi Temperature Model v11.3", layout="wide")
-st.title("Kalshi Temperature Model v11.3")
-st.caption("Phone-safe full model: source diagnostics, current temp, expected-now, momentum, full probability table, and BET/PASS.")
+st.set_page_config(page_title="Kalshi Temperature Model v11.4", layout="wide")
+st.title("Kalshi Temperature Model v11.4")
+st.caption(
+    "Expanded city list plus extra weather sources with safer fallbacks. "
+    "If outside APIs rate-limit, the app falls back to NWS-only."
+)
 
 CITIES = {
     "Phoenix": {"lat": 33.4342, "lon": -112.0116, "tz": "America/Phoenix", "station": "KPHX", "sigma": 1.10, "bias": 0.60, "prob_filter": 0.55},
@@ -18,6 +21,10 @@ CITIES = {
     "Dallas": {"lat": 32.8998, "lon": -97.0403, "tz": "America/Chicago", "station": "KDFW", "sigma": 1.00, "bias": 0.15, "prob_filter": 0.58},
     "Austin": {"lat": 30.1945, "lon": -97.6699, "tz": "America/Chicago", "station": "KAUS", "sigma": 1.10, "bias": 0.20, "prob_filter": 0.58},
     "Houston": {"lat": 29.9902, "lon": -95.3368, "tz": "America/Chicago", "station": "KIAH", "sigma": 1.50, "bias": 0.30, "prob_filter": 0.62},
+    "New Orleans": {"lat": 29.9934, "lon": -90.2580, "tz": "America/Chicago", "station": "KMSY", "sigma": 1.40, "bias": 0.20, "prob_filter": 0.62},
+    "Miami": {"lat": 25.7959, "lon": -80.2870, "tz": "America/New_York", "station": "KMIA", "sigma": 1.40, "bias": 0.10, "prob_filter": 0.62},
+    "Washington DC": {"lat": 38.8521, "lon": -77.0377, "tz": "America/New_York", "station": "KDCA", "sigma": 1.15, "bias": 0.00, "prob_filter": 0.58},
+    "Atlanta": {"lat": 33.6407, "lon": -84.4277, "tz": "America/New_York", "station": "KATL", "sigma": 1.15, "bias": 0.10, "prob_filter": 0.58},
 }
 
 MIN_TOP_TWO_GAP = 0.12
@@ -27,7 +34,12 @@ NO_BET_LAG = 1.5
 @st.cache_data(ttl=300, show_spinner=False)
 def safe_get_json(url, params=None):
     try:
-        r = requests.get(url, params=params, headers={"User-Agent": "kalshi-temp-v11-3"}, timeout=12)
+        r = requests.get(
+            url,
+            params=params,
+            headers={"User-Agent": "kalshi-temp-v11-4"},
+            timeout=12,
+        )
         r.raise_for_status()
         return r.json(), "OK"
     except Exception as e:
@@ -82,7 +94,7 @@ def default_ladder(mu, mode="auto"):
             f"{center+3} to {center+4}",
             f"{center+5} or above",
         ]
-    return labels, mode
+    return labels
 
 def detect_market_ladder(labels):
     starts = []
@@ -112,6 +124,17 @@ def price_to_prob(price):
     if val > 0:
         return 100.0 / (val + 100.0)
     return abs(val) / (abs(val) + 100.0)
+
+def fmt_num(x):
+    try:
+        if x is None:
+            return "-"
+        xf = float(x)
+        if math.isnan(xf):
+            return "-"
+        return f"{xf:.1f}"
+    except Exception:
+        return "-"
 
 def fetch_nws_all(lat, lon, tzname, station):
     daily_high = None
@@ -229,6 +252,38 @@ def fetch_open_meteo(lat, lon, model=None):
         hourly_high = None
     return daily_high, hourly_high, current_temp, "OK"
 
+def fetch_metno(lat, lon):
+    params = {"lat": lat, "lon": lon}
+    try:
+        r = requests.get(
+            "https://api.met.no/weatherapi/locationforecast/2.0/compact",
+            params=params,
+            headers={"User-Agent": "kalshi-temp-v11-4"},
+            timeout=12,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return None, None, None, str(e)
+
+    try:
+        ts = data["properties"]["timeseries"][:24]
+        vals = []
+        current_temp = None
+        for i, item in enumerate(ts):
+            det = item["data"]["instant"]["details"]
+            t = det.get("air_temperature")
+            if t is not None:
+                tf = float(t) * 9.0 / 5.0 + 32.0
+                vals.append(tf)
+                if i == 0:
+                    current_temp = tf
+        daily_high = max(vals) if vals else None
+        hourly_high = daily_high
+        return daily_high, hourly_high, current_temp, "OK"
+    except Exception as e:
+        return None, None, None, str(e)
+
 city = st.selectbox("City", list(CITIES.keys()))
 profile = CITIES[city]
 local_now = datetime.now(ZoneInfo(profile["tz"]))
@@ -237,7 +292,7 @@ c1, c2 = st.columns(2)
 with c1:
     ladder_mode = st.selectbox("Kalshi ladder alignment", ["market_auto", "auto", "even", "odd"], index=0)
 with c2:
-    no_bet_after_hour = st.slider("No new bets after local hour", 9, 15, 12)
+    no_bet_after_hour = st.slider("No new bets after local hour", 9, 18, 12)
     no_bet_after_minute = st.slider("No new bets after minute", 0, 59, 35, step=5)
 
 with st.expander("Paste Kalshi ladder (optional but recommended)", expanded=False):
@@ -252,34 +307,24 @@ daily_nws, hourly_nws, hourly_periods, obs_temp, obs_ts, nws_notes = fetch_nws_a
 )
 daily_om, hourly_om, current_om, om_note = fetch_open_meteo(profile["lat"], profile["lon"], None)
 daily_gfs, hourly_gfs, current_gfs, gfs_note = fetch_open_meteo(profile["lat"], profile["lon"], "gfs_seamless")
+daily_metno, hourly_metno, current_metno, metno_note = fetch_metno(profile["lat"], profile["lon"])
 
 source_rows = [
     {"Source": "NWS forecast", "Forecast High": daily_nws, "Status": nws_notes["NWS forecast"]},
     {"Source": "NWS hourly", "Forecast High": hourly_nws, "Status": nws_notes["NWS hourly"]},
     {"Source": "Open-Meteo", "Forecast High": daily_om, "Status": om_note},
     {"Source": "GFS", "Forecast High": daily_gfs, "Status": gfs_note},
+    {"Source": "MET Norway", "Forecast High": daily_metno, "Status": metno_note},
 ]
 
-df_sources = pd.DataFrame(source_rows)
-
-def fmt_num(x):
-    try:
-        if x is None:
-            return "-"
-        xf = float(x)
-        if math.isnan(xf):
-            return "-"
-        return f"{xf:.1f}"
-    except Exception:
-        return "-"
-
-df_show = df_sources.copy()
+df_show = pd.DataFrame(source_rows)
 df_show["Forecast High"] = df_show["Forecast High"].apply(fmt_num)
+
 st.subheader("Forecast Source Diagnostics")
 st.dataframe(df_show, use_container_width=True, hide_index=True)
 
 usable = []
-for x in [daily_nws, hourly_nws, daily_om, daily_gfs]:
+for x in [daily_nws, hourly_nws, daily_om, daily_gfs, daily_metno]:
     if isinstance(x, (int, float)):
         xf = float(x)
         if not math.isnan(xf):
@@ -289,12 +334,14 @@ if not usable:
     st.error("No usable forecast sources available right now.")
     st.stop()
 
-consensus = sum(usable) / len(usable) + float(profile["bias"])
+sorted_vals = sorted(usable)
+core = sorted_vals[1:-1] if len(sorted_vals) >= 4 else sorted_vals
+consensus = sum(core) / len(core) + float(profile["bias"])
 spread = max(usable) - min(usable) if len(usable) >= 2 else 0.0
-sigma = max(0.85, float(profile["sigma"]) + spread * 0.25)
+sigma = max(0.85, float(profile["sigma"]) + spread * 0.22)
 
 current_candidates = []
-for x in [obs_temp, current_om, current_gfs]:
+for x in [obs_temp, current_om, current_gfs, current_metno]:
     if isinstance(x, (int, float)):
         xf = float(x)
         if not math.isnan(xf):
@@ -306,6 +353,7 @@ momentum_delta = None
 heating_needed = None
 if current_temp is not None:
     heating_needed = consensus - current_temp
+
 if hourly_periods and current_temp is not None:
     try:
         best = None
@@ -347,11 +395,14 @@ if momentum_delta is not None:
 market_prices = parse_market_lines(market_text) if market_text.strip() else {}
 market_labels = list(market_prices.keys())
 detected = detect_market_ladder(market_labels) if market_labels else None
-effective_mode = detected if ladder_mode == "market_auto" and detected else ladder_mode
 
-labels, chosen_mode = default_ladder(mu, "auto" if effective_mode == "market_auto" else effective_mode)
-if market_labels:
-    labels = market_labels
+effective_mode = ladder_mode
+if ladder_mode == "market_auto" and detected:
+    effective_mode = detected
+elif ladder_mode == "market_auto":
+    effective_mode = "auto"
+
+labels = market_labels if market_labels else default_ladder(mu, effective_mode)
 
 rows = []
 for lab in labels:
@@ -367,8 +418,8 @@ table_rows = []
 for r in rows:
     item = {
         "Bracket": r["Bracket"],
-        "Win Probability": f"{r['WinProb']*100:.1f}%",
         "Fair YES Price": f"{r['FairYES']*100:.1f}c",
+        "Win Probability": f"{r['WinProb']*100:.1f}%",
     }
     if r["Bracket"] in market_prices:
         mprob = price_to_prob(market_prices[r["Bracket"]])
@@ -378,7 +429,6 @@ for r in rows:
 
 st.subheader("Kalshi Probability Table")
 st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
-
 st.metric("Top-two bracket gap", f"{top_gap*100:.1f}%")
 
 cutoff = local_now.replace(hour=no_bet_after_hour, minute=no_bet_after_minute, second=0, microsecond=0)
@@ -396,3 +446,5 @@ if reasons:
     st.error("PASS - " + " | ".join(reasons))
 else:
     st.success(f"BET SIGNAL: {top['Bracket']} ({top['WinProb']*100:.1f}%)")
+
+st.caption("v11.4 adds New Orleans, Miami, Washington DC, Atlanta, and extra fallback sources (MET Norway + trimmed-average consensus).")
