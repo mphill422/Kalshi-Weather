@@ -1,10 +1,11 @@
+# Kalshi Temperature Model - Stable TX Hotfix
 import math,re,requests,streamlit as st,pandas as pd
 from datetime import datetime
 from zoneinfo import ZoneInfo
-st.set_page_config(page_title='Kalshi Temperature Model - Stable',layout='wide')
-st.title('Kalshi Temperature Model - Stable')
+st.set_page_config(page_title='Kalshi Temperature Model - Stable TX Hotfix',layout='wide')
+st.title('Kalshi Temperature Model - Stable TX Hotfix')
 CITIES={'Phoenix':{'lat':33.4342,'lon':-112.0116,'tz':'America/Phoenix','bias':0.5,'afternoon_bump':0.3},'Las Vegas':{'lat':36.0840,'lon':-115.1537,'tz':'America/Los_Angeles','bias':0.4,'afternoon_bump':0.3},'Los Angeles':{'lat':33.9416,'lon':-118.4085,'tz':'America/Los_Angeles','bias':-0.6,'afternoon_bump':0.0},'Dallas':{'lat':32.8998,'lon':-97.0403,'tz':'America/Chicago','bias':0.4,'afternoon_bump':0.3},'Austin':{'lat':30.1945,'lon':-97.6699,'tz':'America/Chicago','bias':0.3,'afternoon_bump':0.2},'Houston':{'lat':29.9902,'lon':-95.3368,'tz':'America/Chicago','bias':0.3,'afternoon_bump':0.2},'Atlanta':{'lat':33.6407,'lon':-84.4277,'tz':'America/New_York','bias':0.2,'afternoon_bump':0.2},'NYC':{'lat':40.7829,'lon':-73.9654,'tz':'America/New_York','bias':0.6,'afternoon_bump':0.1},'Miami':{'lat':25.7959,'lon':-80.2870,'tz':'America/New_York','bias':0.2,'afternoon_bump':0.1}}
-LADDERS={'Phoenix':'78 or below | 79-80 | 81-82 | 83-84 | 85-86 | 87 or above','Las Vegas':'73 or below | 74-75 | 76-77 | 78-79 | 80-81 | 82 or above','Los Angeles':'65 or below | 66-67 | 68-69 | 70-71 | 72-73 | 74 or above','Dallas':'78 or below | 79-80 | 81-82 | 83-84 | 85-86 | 87 or above','Austin':'76 or below | 77-78 | 79-80 | 81-82 | 83-84 | 85 or above','Houston':'76 or below | 77-78 | 79-80 | 81-82 | 83-84 | 85 or above','Atlanta':'74 or below | 75-76 | 77-78 | 79-80 | 81-82 | 83 or above','NYC':'62 or below | 63-64 | 65-66 | 67-68 | 69-70 | 71 or above','Miami':'79 or below | 80-81 | 82-83 | 84-85 | 86-87 | 88 or above'}
+LADDERS={'Phoenix':'78 or below | 79-80 | 81-82 | 83-84 | 85-86 | 87 or above','Las Vegas':'73 or below | 74-75 | 76-77 | 78-79 | 80-81 | 82 or above','Los Angeles':'65 or below | 66-67 | 68-69 | 70-71 | 72-73 | 74 or above','Dallas':'78 or below | 79-80 | 81-82 | 83-84 | 85-86 | 87 or above','Austin':'78 or below | 79-80 | 81-82 | 83-84 | 85-86 | 87 or above','Houston':'79 or below | 80-81 | 82-83 | 84-85 | 86-87 | 88 or above','Atlanta':'74 or below | 75-76 | 77-78 | 79-80 | 81-82 | 83 or above','NYC':'62 or below | 63-64 | 65-66 | 67-68 | 69-70 | 71 or above','Miami':'79 or below | 80-81 | 82-83 | 84-85 | 86-87 | 88 or above'}
 W={'ICON':0.35,'OpenMeteo':0.30,'GFS':0.20,'NWS':0.15}
 OUTLIER_HALF=3.0; OUTLIER_REMOVE=4.5; SIGMA_MIN=1.25; SIGMA_MAX=2.0; SPREAD_SAFETY_THRESHOLD=5.0; SPREAD_SAFETY_MULTIPLIER=0.4
 def safe_get(url,params=None):
@@ -47,6 +48,14 @@ def raw_traj(current,high,hour):
     diff=current-high*expected_curve(hour); adj=diff*0.35
     return max(min(adj,2.0),-2.0)
 def valve(traj,spread): return traj*SPREAD_SAFETY_MULTIPLIER if spread>SPREAD_SAFETY_THRESHOLD else traj
+def texas_cloud_cap(city,cloud,hour,current,proj):
+    if city not in {'Dallas','Austin','Houston'} or current is None or proj is None or cloud is None: return proj,0.0
+    reduction=0.0
+    if hour>=13 and cloud>=70:
+        cap=min(proj,current+4.0); reduction=proj-cap; proj=cap
+    elif hour>=14 and cloud>=50:
+        cap=min(proj,current+5.0); reduction=proj-cap; proj=cap
+    return proj,reduction
 def cdf(x,mu,s): return 0.5*(1+math.erf((x-mu)/(s*math.sqrt(2))))
 def parse_ladder(text):
     out=[]
@@ -80,10 +89,11 @@ cloud=current=None
 if om and 'current' in om:
     cloud=om['current'].get('cloud_cover'); current=om['current'].get('temperature_2m')
 vals=[v for v in f.values() if v is not None]; spread=(max(vals)-min(vals)) if len(vals)>=2 else 0.0; sigma=min(max(1.3+spread*0.25,SIGMA_MIN),SIGMA_MAX)
-rtraj=traj=0.0
+rtraj=traj=cloud_cap=0.0
 if cons is not None:
     cons+=p['bias']; cons+=solar_adjust(cloud,hour,city); rtraj=raw_traj(current,cons,hour); traj=valve(rtraj,spread); cons+=traj
     if hour>=13: cons+=p.get('afternoon_bump',0.0)
+    cons,cloud_cap=texas_cloud_cap(city,cloud,hour,current,cons)
 st.subheader('Forecast Sources'); st.write(f)
 st.subheader('Weights'); st.write(weights)
 st.subheader('Consensus High'); st.write(round(cons,2) if cons is not None else 'N/A')
@@ -91,6 +101,7 @@ st.subheader('Current Station Temp'); st.write(current)
 st.subheader('Cloud Cover'); st.write(cloud)
 st.subheader('Raw Trajectory Adjustment'); st.write(round(rtraj,2) if cons is not None else 'N/A')
 st.subheader('Trajectory Adjustment'); st.write(round(traj,2) if cons is not None else 'N/A')
+st.subheader('Texas Cloud Cap Reduction'); st.write(round(cloud_cap,2) if cons is not None else 'N/A')
 st.subheader('Forecast Spread'); st.write(round(spread,2))
 st.subheader('Sigma'); st.write(round(sigma,2))
 st.subheader('Spread Safety Valve'); st.write('ON' if spread>SPREAD_SAFETY_THRESHOLD else 'OFF')
@@ -98,4 +109,4 @@ if cons is not None:
     df=pd.DataFrame(probs(cons,sigma,parse_ladder(ladder_text)),columns=['Bracket','Model Probability'])
     df['Model Probability']=df['Model Probability'].apply(lambda x:f'{x*100:.1f}%')
     st.subheader('Kalshi Bracket Probabilities'); st.dataframe(df,use_container_width=True)
-st.caption('Stable Baseline â multi-source + NWS + trajectory + solar + sigma cap')
+st.caption('Stable TX Hotfix â stable baseline + Texas cloud suppression')
