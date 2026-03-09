@@ -1,10 +1,11 @@
-# Kalshi Temperature Model v14.1
+# Kalshi Temperature Model v14.2
 # Full Streamlit model with:
 # - All requested cities
 # - NWS forecast / NWS hourly / NWS station observation
 # - Open-Meteo / GFS / MET Norway
-# - Weighted consensus
-# - Forecast spread / sigma
+# - Reweighted forecast blend
+# - Desert boost for Phoenix / Las Vegas
+# - NOAA station-of-record tracking panel
 # - Airport observation trend
 # - Cloud penalty
 # - Peak-time logic
@@ -23,11 +24,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Kalshi Temperature Model v14.1", layout="wide")
-st.title("Kalshi Temperature Model v14.1")
+st.set_page_config(page_title="Kalshi Temperature Model v14.2", layout="wide")
+st.title("Kalshi Temperature Model v14.2")
 st.caption(
-    "Full version with diagnostics, model inputs, airport trend, bracket probabilities, "
-    "optional market edge comparison, and BET / PASS / HOLD / CASHOUT notes."
+    "Full version with rebalanced source weights, desert boost, NOAA station-of-record tracking, "
+    "airport trend, bracket probabilities, optional market edge comparison, and trade notes."
 )
 
 CITIES = {
@@ -43,13 +44,17 @@ CITIES = {
     "Atlanta": {"lat": 33.6407, "lon": -84.4277, "tz": "America/New_York", "station": "KATL", "sigma": 1.15, "bias": 0.10, "prob_filter": 0.58, "peak_hour": 15, "peak_minute": 45},
 }
 
+# Reweighted to lean more on NWS and reduce MET Norway drag on U.S. highs
 SOURCE_WEIGHTS = {
-    "NWS forecast": 0.35,
-    "NWS hourly": 0.25,
-    "MET Norway": 0.20,
-    "Open-Meteo": 0.10,
+    "NWS forecast": 0.40,
+    "NWS hourly": 0.30,
+    "Open-Meteo": 0.15,
     "GFS": 0.10,
+    "MET Norway": 0.05,
 }
+
+DESERT_BOOST_CITIES = {"Phoenix", "Las Vegas"}
+DESERT_BOOST_VALUE = 0.4
 
 MAX_SPREAD_FOR_TRADE = 3.0
 MIN_TOP_TWO_GAP = 0.12
@@ -59,13 +64,13 @@ HEATING_STALL_THRESHOLD_30M = 0.5
 DEFAULT_CUTOFF_HOUR = 12
 DEFAULT_CUTOFF_MINUTE = 35
 CONFIDENCE_MIN = 70
-MIN_EDGE_TO_BET = 0.05  # 5 percentage points
+MIN_EDGE_TO_BET = 0.05
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def safe_get_json(url, params=None, headers=None):
     try:
-        final_headers = {"User-Agent": "kalshi-temp-v14-1"}
+        final_headers = {"User-Agent": "kalshi-temp-v14-2"}
         if headers:
             final_headers.update(headers)
         r = requests.get(url, params=params, headers=final_headers, timeout=12)
@@ -320,7 +325,7 @@ def fetch_metno(lat, lon):
     data, status = safe_get_json(
         "https://api.met.no/weatherapi/locationforecast/2.0/compact",
         params={"lat": lat, "lon": lon},
-        headers={"User-Agent": "kalshi-temp-v14-1"},
+        headers={"User-Agent": "kalshi-temp-v14-2"},
     )
     if not data:
         return {"daily_high": None, "hourly_high": None, "current_temp": None, "status": status}
@@ -380,9 +385,6 @@ def nearest_prior_temp(df, target_ts):
     return float(prior.iloc[-1]["temp_f"])
 
 
-# ------------------------------------------------------------
-# UI
-# ------------------------------------------------------------
 city = st.selectbox("City", list(CITIES.keys()))
 profile = CITIES[city]
 local_now = datetime.now(ZoneInfo(profile["tz"]))
@@ -401,9 +403,6 @@ with st.expander("Paste Kalshi ladder / odds (optional but recommended)", expand
         placeholder="88 to 89 +127\n90 to 91 +244\n86 to 87 +809\n85 or below +2400"
     )
 
-# ------------------------------------------------------------
-# Fetch all sources
-# ------------------------------------------------------------
 daily_nws, hourly_nws, hourly_periods, obs_temp, obs_ts, nws_notes = fetch_nws_all(
     profile["lat"], profile["lon"], profile["tz"], profile["station"]
 )
@@ -425,9 +424,6 @@ df_sources["Forecast High"] = df_sources["Forecast High"].apply(lambda x: fmt_nu
 st.subheader("Forecast Source Diagnostics")
 st.dataframe(df_sources, use_container_width=True, hide_index=True)
 
-# ------------------------------------------------------------
-# Build model inputs
-# ------------------------------------------------------------
 source_values = {
     "NWS forecast": daily_nws,
     "NWS hourly": hourly_nws,
@@ -442,6 +438,10 @@ if not usable:
     st.stop()
 
 consensus = weighted_consensus(source_values, float(profile["bias"]))
+
+if city in DESERT_BOOST_CITIES:
+    consensus += DESERT_BOOST_VALUE
+
 spread = max(usable) - min(usable) if len(usable) >= 2 else 0.0
 sigma = max(0.85, float(profile["sigma"]) + spread * 0.22)
 
@@ -514,9 +514,16 @@ mu = consensus
 if momentum_delta is not None:
     mu = mu + MOMENTUM_WEIGHT * momentum_delta
 
-# ------------------------------------------------------------
-# Display inputs
-# ------------------------------------------------------------
+# NOAA station-of-record tracking
+station_bias = None
+if obs_temp is not None and current_temp is not None:
+    station_bias = obs_temp - current_temp
+
+record_note = "Official station is being used for trend"
+if station_bias is not None:
+    if abs(station_bias) >= 1.0:
+        record_note = f"Official station differs from blended current by {station_bias:+.1f}Â°"
+
 st.subheader("Model Inputs")
 m1, m2, m3 = st.columns(3)
 m1.metric("Consensus High", fmt_num(consensus))
@@ -532,6 +539,13 @@ m7, m8, m9 = st.columns(3)
 m7.metric("Cloud Cover", "-" if current_cloud is None else f"{current_cloud:.0f}%")
 m8.metric("Minutes to Peak", f"{minutes_to_peak}")
 m9.metric("Obs History Status", obs_hist_status)
+
+st.subheader("NOAA Station-of-Record")
+s1, s2, s3 = st.columns(3)
+s1.metric("Official Station", profile["station"])
+s2.metric("Official Station Temp", fmt_num(obs_temp))
+s3.metric("Station vs Blend", "-" if station_bias is None else f"{station_bias:+.1f}")
+st.caption(record_note)
 
 st.subheader("Airport Trend")
 a1, a2, a3 = st.columns(3)
@@ -561,12 +575,19 @@ cloud_score = 100 if current_cloud is None else max(0, 100 - current_cloud * 1.2
 trend_score = 50
 if heating_rate_30m is not None:
     trend_score = max(0, min(100, 50 + heating_rate_30m * 25))
-confidence = round(0.35 * source_agreement + 0.20 * momentum_score + 0.20 * cloud_score + 0.25 * trend_score, 1)
+station_score = 50
+if station_bias is not None:
+    station_score = max(0, 100 - abs(station_bias) * 25)
+
+confidence = round(
+    0.30 * source_agreement +
+    0.20 * momentum_score +
+    0.15 * cloud_score +
+    0.20 * trend_score +
+    0.15 * station_score, 1
+)
 st.metric("Trade Confidence", f"{confidence}/100")
 
-# ------------------------------------------------------------
-# Ladder + probabilities + market comparison
-# ------------------------------------------------------------
 market_prices = parse_market_lines(market_text) if market_text.strip() else {}
 market_labels = list(market_prices.keys())
 detected = detect_market_ladder(market_labels) if market_labels else None
@@ -615,9 +636,6 @@ st.metric("Top-two bracket gap", f"{top_gap*100:.1f}%")
 if best_edge is not None:
     st.metric("Best Model Edge", f"{best_edge*100:+.1f}% on {best_edge_bracket}")
 
-# ------------------------------------------------------------
-# Trade rules / notes
-# ------------------------------------------------------------
 cutoff = local_now.replace(hour=no_bet_after_hour, minute=no_bet_after_minute, second=0, microsecond=0)
 reasons = []
 
@@ -642,9 +660,9 @@ hold_notes = []
 if top["WinProb"] >= 0.70:
     hold_notes.append("Top bracket still dominant")
 if heating_rate_30m is not None and heating_rate_30m > 0.8:
-    hold_notes.append("Airport still heating")
+    hold_notes.append("Official station still heating")
 if late_peak_window and heating_rate_30m is not None and heating_rate_30m < 0.0:
-    hold_notes.append("Consider cashout: airport cooling")
+    hold_notes.append("Consider cashout: official station cooling")
 if best_edge is not None and best_edge >= MIN_EDGE_TO_BET:
     hold_notes.append(f"Best tradable edge appears on {best_edge_bracket}")
 
@@ -660,6 +678,6 @@ if hold_notes:
     st.info("Hold / exit notes: " + " | ".join(hold_notes))
 
 st.caption(
-    "v14.1 restores the richer interface: diagnostics, model inputs, airport trend, "
-    "bracket probabilities, optional market edge comparison, confidence score, and trade notes."
+    "v14.2 adds rebalanced forecast weights, desert boost, NOAA station-of-record tracking, "
+    "airport trend, bracket probabilities, optional market edge comparison, confidence score, and trade notes."
 )
