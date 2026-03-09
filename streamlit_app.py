@@ -1,5 +1,5 @@
-# Kalshi High Temperature Model - Final Stable
-# Focused on 7 cities for daily high-temperature betting
+# Kalshi High Temperature Model - Final Stable v2
+# Complete version with corrected exact ladders for the main cities being tracked.
 
 import math
 import re
@@ -10,8 +10,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Kalshi High Temperature Model - Final Stable", layout="wide")
-st.title("Kalshi High Temperature Model - Final Stable")
+st.set_page_config(page_title="Kalshi High Temperature Model - Final Stable v2", layout="wide")
+st.title("Kalshi High Temperature Model - Final Stable v2")
 
 CITIES = {
     "Phoenix": {"lat": 33.4342, "lon": -112.0116, "tz": "America/Phoenix", "bias": 0.4, "city_type": "desert"},
@@ -26,7 +26,7 @@ CITIES = {
 DEFAULT_LADDERS = {
     "Phoenix": "74 or below | 75-76 | 77-78 | 79-80 | 81-82 | 83 or above",
     "Las Vegas": "74 or below | 75-76 | 77-78 | 79-80 | 81-82 | 83 or above",
-    "Los Angeles": "63 or below | 64-65 | 66-67 | 68-69 | 70-71 | 72 or above",
+    "Los Angeles": "66 or below | 67-68 | 69-70 | 71-72 | 73-74 | 75 or above",
     "Dallas": "78 or below | 79-80 | 81-82 | 83-84 | 85-86 | 87 or above",
     "Austin": "78 or below | 79-80 | 81-82 | 83-84 | 85-86 | 87 or above",
     "Houston": "79 or below | 80-81 | 82-83 | 84-85 | 86-87 | 88 or above",
@@ -37,7 +37,7 @@ BASE_WEIGHTS = {"OpenMeteo": 0.35, "GFS": 0.25, "ICON": 0.25, "NWS": 0.15}
 OUTLIER_HALF = 3.0
 OUTLIER_REMOVE = 4.5
 SIGMA_MIN = 1.15
-SIGMA_MAX = 1.95
+SIGMA_MAX = 1.90
 
 
 def safe_get(url, params=None):
@@ -93,32 +93,36 @@ def consensus(forecasts, weights):
 def solar_adjust(cloud, hour, city_type):
     if cloud is None or hour < 9 or hour > 17:
         return 0.0
+
     if city_type == "desert":
         if cloud < 10:
-            return 1.2
+            return 1.1
         if cloud < 25:
-            return 0.8
+            return 0.7
         if cloud < 50:
-            return 0.3
+            return 0.2
         return -0.5
+
     if city_type == "marine":
         if cloud < 20:
-            return 0.4
+            return 0.3
         if cloud < 50:
-            return 0.1
+            return 0.0
         return -0.6
+
     if city_type in {"texas", "gulf"}:
         if cloud < 15:
-            return 0.7
+            return 0.6
         if cloud < 40:
-            return 0.3
+            return 0.2
         if cloud < 70:
             return -0.1
-        return -0.7
+        return -0.6
+
     if cloud < 20:
-        return 0.6
+        return 0.5
     if cloud < 50:
-        return 0.2
+        return 0.1
     return -0.4
 
 
@@ -127,14 +131,14 @@ def humidity_suppression(city_type, dewpoint, hour):
         return 0.0
     if city_type == "gulf":
         if dewpoint >= 70:
-            return -0.5
+            return -0.4
         if dewpoint >= 66:
-            return -0.25
+            return -0.2
     if city_type == "texas":
         if dewpoint >= 68:
-            return -0.3
+            return -0.25
         if dewpoint >= 64:
-            return -0.15
+            return -0.1
     return 0.0
 
 
@@ -194,12 +198,14 @@ def bracket_probs(mu, sigma, brackets, current_temp=None):
         if current_temp is not None and hi is not None and current_temp > hi:
             rows.append((lab, 0.0))
             continue
+
         if lo is None:
             p = normal_cdf(hi + 0.5, mu, sigma)
         elif hi is None:
             p = 1 - normal_cdf(lo - 0.5, mu, sigma)
         else:
             p = normal_cdf(hi + 0.5, mu, sigma) - normal_cdf(lo - 0.5, mu, sigma)
+
         rows.append((lab, max(p, 0.0)))
 
     total = sum(p for _, p in rows)
@@ -209,29 +215,15 @@ def bracket_probs(mu, sigma, brackets, current_temp=None):
     return rows
 
 
-def implied_prob_from_american(odds):
-    try:
-        odds = int(odds)
-    except Exception:
-        return None
-    if odds == 0:
-        return None
-    if odds > 0:
-        return 100 / (odds + 100)
-    return abs(odds) / (abs(odds) + 100)
-
-
 def trade_grade(spread, sigma, current_temp, projected_high, cloud, city_type):
     if projected_high is None or current_temp is None:
         return "Pass"
     remaining = projected_high - current_temp
-    if spread >= 6.0 or sigma >= 1.95:
+    if spread >= 6.0 or sigma >= 1.90:
         return "Pass"
     if city_type in {"texas", "gulf"} and cloud is not None and cloud >= 75 and remaining >= 6:
         return "Pass"
-    if remaining <= 0.5:
-        return "Playable"
-    if spread <= 3.5 and sigma <= 1.6:
+    if spread <= 3.5 and sigma <= 1.55:
         return "Strong"
     return "Playable"
 
@@ -246,7 +238,7 @@ local_hour = datetime.now(ZoneInfo(tz)).hour
 
 ladder_text = st.text_input("Kalshi Ladder", DEFAULT_LADDERS[city])
 
-weather = safe_get(
+om = safe_get(
     "https://api.open-meteo.com/v1/forecast",
     {
         "latitude": lat,
@@ -292,13 +284,13 @@ if nws_point and "properties" in nws_point and nws_point["properties"].get("fore
                 nws_high = period.get("temperature")
                 break
 
-if weather:
-    current_temp = weather["current"].get("temperature_2m")
-    cloud = weather["current"].get("cloud_cover")
-    dew = weather["current"].get("dew_point_2m")
+if om:
+    current_temp = om["current"].get("temperature_2m")
+    cloud = om["current"].get("cloud_cover")
+    dew = om["current"].get("dew_point_2m")
 
     forecasts = {
-        "OpenMeteo": weather["daily"]["temperature_2m_max"][0] if "daily" in weather else None,
+        "OpenMeteo": om["daily"]["temperature_2m_max"][0] if "daily" in om else None,
         "GFS": gfs["daily"]["temperature_2m_max"][0] if gfs and "daily" in gfs else None,
         "ICON": icon["daily"]["temperature_2m_max"][0] if icon and "daily" in icon else None,
         "NWS": nws_high,
@@ -359,22 +351,6 @@ if weather:
     df["Model Probability"] = df["Model Probability"].apply(lambda x: f"{x*100:.1f}%")
     st.subheader("Kalshi Bracket Probabilities")
     st.dataframe(df, use_container_width=True)
-
-    st.divider()
-    st.subheader("Market Comparison")
-    st.caption("Optional: paste Kalshi YES odds to compare model vs market.")
-    market_rows = []
-    for bracket, prob in rows:
-        odds = st.text_input(f"{bracket} YES odds", value="", key=f"odds_{bracket}")
-        imp = implied_prob_from_american(odds) if odds.strip() else None
-        market_rows.append({
-            "Bracket": bracket,
-            "Model %": round(prob * 100, 1),
-            "Market %": round(imp * 100, 1) if imp is not None else None,
-            "Edge %": round((prob - imp) * 100, 1) if imp is not None else None,
-        })
-    mdf = pd.DataFrame(market_rows)
-    st.dataframe(mdf, use_container_width=True)
 
 else:
     st.error("Weather data unavailable")
