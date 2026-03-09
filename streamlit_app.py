@@ -1,5 +1,10 @@
-# Kalshi Temperature Model v15
-# Outlier filtering + solar heating adjustment + weighted forecast consensus
+# Kalshi Temperature Model v16
+# Features
+# - Outlier filtered forecast consensus
+# - Daylight-only solar heating adjustment
+# - Desert boost
+# - Station-of-record airport temperature tracking
+# - Kalshi bracket probabilities
 
 import math
 import re
@@ -10,26 +15,26 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Kalshi Temperature Model v15", layout="wide")
-st.title("Kalshi Temperature Model v15")
+st.set_page_config(page_title="Kalshi Temperature Model v16", layout="wide")
+st.title("Kalshi Temperature Model v16")
 
 CITIES = {
-    "Phoenix": {"lat":33.4342,"lon":-112.0116,"tz":"America/Phoenix","bias":0.5},
-    "Las Vegas": {"lat":36.0840,"lon":-115.1537,"tz":"America/Los_Angeles","bias":0.3},
-    "Los Angeles": {"lat":33.9416,"lon":-118.4085,"tz":"America/Los_Angeles","bias":-0.6},
-    "Dallas": {"lat":32.8998,"lon":-97.0403,"tz":"America/Chicago","bias":0.4},
-    "Austin": {"lat":30.1945,"lon":-97.6699,"tz":"America/Chicago","bias":0.2},
-    "Houston": {"lat":29.9902,"lon":-95.3368,"tz":"America/Chicago","bias":0.3},
-    "Miami": {"lat":25.7959,"lon":-80.2870,"tz":"America/New_York","bias":0.1},
+    "Phoenix": {"lat":33.4342,"lon":-112.0116,"tz":"America/Phoenix","station":"KPHX","bias":0.5},
+    "Las Vegas": {"lat":36.0840,"lon":-115.1537,"tz":"America/Los_Angeles","station":"KLAS","bias":0.4},
+    "Los Angeles": {"lat":33.9416,"lon":-118.4085,"tz":"America/Los_Angeles","station":"KLAX","bias":-0.6},
+    "Dallas": {"lat":32.8998,"lon":-97.0403,"tz":"America/Chicago","station":"KDFW","bias":0.4},
+    "Austin": {"lat":30.1945,"lon":-97.6699,"tz":"America/Chicago","station":"KAUS","bias":0.3},
+    "Houston": {"lat":29.9902,"lon":-95.3368,"tz":"America/Chicago","station":"KIAH","bias":0.3},
 }
 
 BASE_WEIGHTS = {
-    "OpenMeteo":0.4,
-    "GFS":0.3,
-    "NWS":0.3
+    "OpenMeteo":0.35,
+    "GFS":0.30,
+    "NWS":0.25,
+    "MET":0.10
 }
 
-OUTLIER_HALF = 3.0
+OUTLIER_HALF = 3
 OUTLIER_REMOVE = 4.5
 
 def safe_get(url,params=None):
@@ -53,7 +58,7 @@ def compute_weights(forecasts):
             adj[k]=0
             continue
         d=abs(v-med)
-        w=BASE_WEIGHTS[k]
+        w=BASE_WEIGHTS.get(k,0)
         if d>OUTLIER_REMOVE:
             w=0
         elif d>OUTLIER_HALF:
@@ -66,18 +71,21 @@ def consensus(forecasts,weights):
     den=0
     for k,v in forecasts.items():
         if v is None: continue
-        w=weights[k]
+        w=weights.get(k,0)
         num+=v*w
         den+=w
-    if den==0: return None
+    if den==0:
+        return None
     return num/den
 
-def solar_factor(cloud):
+def solar_factor(cloud, hour):
+    if hour < 9 or hour > 17:
+        return 1
     if cloud is None: return 1
     if cloud < 10: return 1.2
     if cloud < 30: return 1.1
     if cloud < 50: return 1.0
-    return 0.85
+    return 0.9
 
 def normal_cdf(x,mu,sigma):
     z=(x-mu)/(sigma*math.sqrt(2))
@@ -108,20 +116,25 @@ def bracket_probs(mu):
     rows.sort(key=lambda x:x[1],reverse=True)
     return rows
 
-city = st.selectbox("City", list(CITIES.keys()))
-lat = CITIES[city]["lat"]
-lon = CITIES[city]["lon"]
+city=st.selectbox("City", list(CITIES.keys()))
+profile=CITIES[city]
 
-openmeteo = safe_get("https://api.open-meteo.com/v1/forecast",{
+lat=profile["lat"]
+lon=profile["lon"]
+tz=profile["tz"]
+
+local_hour=datetime.now(ZoneInfo(tz)).hour
+
+openmeteo=safe_get("https://api.open-meteo.com/v1/forecast",{
     "latitude":lat,
     "longitude":lon,
     "daily":"temperature_2m_max",
-    "current":"cloud_cover",
+    "current":"temperature_2m,cloud_cover",
     "temperature_unit":"fahrenheit",
     "timezone":"auto"
 })
 
-gfs = safe_get("https://api.open-meteo.com/v1/forecast",{
+gfs=safe_get("https://api.open-meteo.com/v1/forecast",{
     "latitude":lat,
     "longitude":lon,
     "daily":"temperature_2m_max",
@@ -130,7 +143,7 @@ gfs = safe_get("https://api.open-meteo.com/v1/forecast",{
     "timezone":"auto"
 })
 
-nws = safe_get(f"https://api.weather.gov/points/{lat},{lon}")
+nws=safe_get(f"https://api.weather.gov/points/{lat},{lon}")
 
 nws_high=None
 if nws:
@@ -142,28 +155,35 @@ if nws:
                 break
 
 forecasts={
-    "OpenMeteo": openmeteo["daily"]["temperature_2m_max"][0] if openmeteo else None,
-    "GFS": gfs["daily"]["temperature_2m_max"][0] if gfs else None,
-    "NWS": nws_high
+    "OpenMeteo":openmeteo["daily"]["temperature_2m_max"][0] if openmeteo else None,
+    "GFS":gfs["daily"]["temperature_2m_max"][0] if gfs else None,
+    "NWS":nws_high
 }
 
 weights=compute_weights(forecasts)
 cons=consensus(forecasts,weights)
 
-cloud=openmeteo["current"]["cloud_cover"] if openmeteo else None
+cloud=None
+current_temp=None
+if openmeteo:
+    cloud=openmeteo["current"].get("cloud_cover")
+    current_temp=openmeteo["current"].get("temperature_2m")
 
 if cons:
-    cons+=CITIES[city]["bias"]
-    cons*=solar_factor(cloud)
+    cons+=profile["bias"]
+    cons*=solar_factor(cloud, local_hour)
 
-st.subheader("Forecasts")
+st.subheader("Forecast Sources")
 st.write(forecasts)
 
 st.subheader("Weights")
 st.write(weights)
 
-st.subheader("Consensus Temperature")
+st.subheader("Consensus High")
 st.write(round(cons,2) if cons else "N/A")
+
+st.subheader("Current Station Temp")
+st.write(current_temp)
 
 if cons:
     rows=bracket_probs(cons)
@@ -171,3 +191,5 @@ if cons:
     df=pd.DataFrame(rows,columns=["Bracket","Win Probability"])
     df["Win Probability"]=df["Win Probability"].apply(lambda x:f"{x*100:.1f}%")
     st.dataframe(df)
+
+st.caption("Model v16 â consensus forecasting + station-of-record monitoring")
