@@ -1,14 +1,14 @@
 # Kalshi Temperature Model v18
-# Features
+# Stable version
 # - Outlier-filtered forecast consensus
 # - Correct median calculation
-# - ICON integration (replacing HRRR)
+# - ICON integration
 # - Additive solar heating adjustment
-# - Desert boost / airport bias
-# - Station-of-record airport temperature tracking
+# - City-specific bias and afternoon bump
 # - Dynamic probability spread
 # - Station trajectory adjustment
-# - Added NYC and Miami
+# - NYC corrected to Central Park station profile
+# - Miami included
 
 import math
 import re
@@ -48,8 +48,9 @@ CITIES = {
         "station": "KIAH", "bias": 0.3, "afternoon_bump": 0.2
     },
     "NYC": {
-        "lat": 40.6413, "lon": -73.7781, "tz": "America/New_York",
-        "station": "KJFK", "bias": 0.0, "afternoon_bump": 0.1
+        # Central Park profile, not JFK
+        "lat": 40.7829, "lon": -73.9654, "tz": "America/New_York",
+        "station": "KNYC", "bias": 0.6, "afternoon_bump": 0.1
     },
     "Miami": {
         "lat": 25.7959, "lon": -80.2870, "tz": "America/New_York",
@@ -67,6 +68,7 @@ BASE_WEIGHTS = {
 OUTLIER_HALF = 3.0
 OUTLIER_REMOVE = 4.5
 
+
 def safe_get(url, params=None):
     try:
         r = requests.get(url, params=params, timeout=10)
@@ -74,6 +76,7 @@ def safe_get(url, params=None):
         return r.json()
     except Exception:
         return None
+
 
 def median(vals):
     s = sorted(vals)
@@ -84,14 +87,14 @@ def median(vals):
         return s[n // 2]
     return (s[n // 2 - 1] + s[n // 2]) / 2
 
+
 def compute_weights(forecasts):
     vals = [v for v in forecasts.values() if v is not None]
     med = median(vals)
-    adj = {}
-
     if med is None:
         return {k: 0 for k in forecasts}
 
+    adj = {}
     for k, v in forecasts.items():
         if v is None:
             adj[k] = 0
@@ -109,6 +112,7 @@ def compute_weights(forecasts):
 
     return adj
 
+
 def consensus(forecasts, weights):
     num = 0.0
     den = 0.0
@@ -124,13 +128,13 @@ def consensus(forecasts, weights):
         return None
     return num / den
 
+
 def solar_adjust(cloud, hour, city_name):
     if hour < 9 or hour > 17:
         return 0.0
     if cloud is None:
         return 0.0
 
-    # Base additive solar adjustment
     if cloud < 10:
         adj = 1.0
     elif cloud < 30:
@@ -140,14 +144,14 @@ def solar_adjust(cloud, hour, city_name):
     else:
         adj = -0.5
 
-    # Desert boost
     if city_name in {"Phoenix", "Las Vegas"}:
-        if cloud is not None and cloud < 20:
+        if cloud < 20:
             adj += 0.4
-        elif cloud is not None and cloud < 40:
+        elif cloud < 40:
             adj += 0.2
 
     return adj
+
 
 def expected_curve(hour):
     curve = {
@@ -166,10 +170,10 @@ def expected_curve(hour):
     }
     return curve.get(hour, 1.0 if hour > 17 else 0.50)
 
+
 def trajectory_adjust(current_temp, forecast_high, hour):
     if current_temp is None or forecast_high is None:
         return 0.0
-
     if hour < 8 or hour > 16:
         return 0.0
 
@@ -177,14 +181,14 @@ def trajectory_adjust(current_temp, forecast_high, hour):
     expected_temp = forecast_high * pct
     diff = current_temp - expected_temp
 
-    # Moderate scaling; cap to avoid overreaction
     adj = diff * 0.35
-    adj = max(min(adj, 2.0), -2.0)
-    return adj
+    return max(min(adj, 2.0), -2.0)
+
 
 def normal_cdf(x, mu, sigma):
     z = (x - mu) / (sigma * math.sqrt(2))
     return 0.5 * (1 + math.erf(z))
+
 
 def bracket_probs(mu, sigma):
     c = round(mu)
@@ -215,6 +219,7 @@ def bracket_probs(mu, sigma):
     rows.sort(key=lambda x: x[1], reverse=True)
     return rows
 
+
 city = st.selectbox("City", list(CITIES.keys()))
 profile = CITIES[city]
 
@@ -223,7 +228,6 @@ lon = profile["lon"]
 tz = profile["tz"]
 local_hour = datetime.now(ZoneInfo(tz)).hour
 
-# Open-Meteo default blend
 openmeteo = safe_get(
     "https://api.open-meteo.com/v1/forecast",
     {
@@ -236,7 +240,6 @@ openmeteo = safe_get(
     },
 )
 
-# GFS
 gfs = safe_get(
     "https://api.open-meteo.com/v1/forecast",
     {
@@ -249,7 +252,6 @@ gfs = safe_get(
     },
 )
 
-# ICON
 icon = safe_get(
     "https://api.open-meteo.com/v1/forecast",
     {
@@ -262,7 +264,6 @@ icon = safe_get(
     },
 )
 
-# NWS
 nws = safe_get(f"https://api.weather.gov/points/{lat},{lon}")
 nws_high = None
 
@@ -335,4 +336,4 @@ if cons is not None:
     df["Win Probability"] = df["Win Probability"].apply(lambda x: f"{x*100:.1f}%")
     st.dataframe(df, use_container_width=True)
 
-st.caption("Model v18 — ICON + dynamic confidence + station trajectory + station-of-record monitoring")
+st.caption("Model v18 â ICON + dynamic confidence + station trajectory + station-of-record monitoring")
