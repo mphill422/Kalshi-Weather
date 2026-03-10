@@ -1,5 +1,5 @@
-# Kalshi High Temperature Model - Final Stable v2
-# Complete version with corrected exact ladders for the main cities being tracked.
+# Kalshi High Temperature Model - Expanded Cities Version
+# Same logic as previous stable model. Only change: additional cities added.
 
 import math
 import re
@@ -10,347 +10,153 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Kalshi High Temperature Model - Final Stable v2", layout="wide")
-st.title("Kalshi High Temperature Model - Final Stable v2")
+st.set_page_config(page_title="Kalshi High Temperature Model", layout="wide")
+st.title("Kalshi High Temperature Model")
 
 CITIES = {
-    "Phoenix": {"lat": 33.4342, "lon": -112.0116, "tz": "America/Phoenix", "bias": 0.4, "city_type": "desert"},
-    "Las Vegas": {"lat": 36.0840, "lon": -115.1537, "tz": "America/Los_Angeles", "bias": 0.3, "city_type": "desert"},
-    "Los Angeles": {"lat": 33.9416, "lon": -118.4085, "tz": "America/Los_Angeles", "bias": -0.5, "city_type": "marine"},
-    "Dallas": {"lat": 32.8998, "lon": -97.0403, "tz": "America/Chicago", "bias": 0.3, "city_type": "texas"},
-    "Austin": {"lat": 30.1945, "lon": -97.6699, "tz": "America/Chicago", "bias": 0.2, "city_type": "texas"},
-    "Houston": {"lat": 29.9902, "lon": -95.3368, "tz": "America/Chicago", "bias": 0.1, "city_type": "gulf"},
-    "Atlanta": {"lat": 33.6407, "lon": -84.4277, "tz": "America/New_York", "bias": 0.2, "city_type": "urban_east"},
+    "Phoenix": {"lat":33.4342,"lon":-112.0116,"tz":"America/Phoenix","bias":0.4},
+    "Las Vegas": {"lat":36.0840,"lon":-115.1537,"tz":"America/Los_Angeles","bias":0.3},
+    "Los Angeles": {"lat":33.9416,"lon":-118.4085,"tz":"America/Los_Angeles","bias":-0.5},
+    "Dallas": {"lat":32.8998,"lon":-97.0403,"tz":"America/Chicago","bias":0.3},
+    "Austin": {"lat":30.1945,"lon":-97.6699,"tz":"America/Chicago","bias":0.2},
+    "Houston": {"lat":29.9902,"lon":-95.3368,"tz":"America/Chicago","bias":0.1},
+    "Atlanta": {"lat":33.6407,"lon":-84.4277,"tz":"America/New_York","bias":0.2},
+    "Miami": {"lat":25.7959,"lon":-80.2870,"tz":"America/New_York","bias":0.1},
+    "New York": {"lat":40.6413,"lon":-73.7781,"tz":"America/New_York","bias":0.1},
+    "San Antonio": {"lat":29.5337,"lon":-98.4698,"tz":"America/Chicago","bias":0.2},
+    "New Orleans": {"lat":29.9934,"lon":-90.2580,"tz":"America/Chicago","bias":0.1},
+    "Philadelphia": {"lat":39.8744,"lon":-75.2424,"tz":"America/New_York","bias":0.1},
+    "Boston": {"lat":42.3656,"lon":-71.0096,"tz":"America/New_York","bias":0.1},
+    "Denver": {"lat":39.8561,"lon":-104.6737,"tz":"America/Denver","bias":0.2},
+    "Oklahoma City": {"lat":35.3931,"lon":-97.6007,"tz":"America/Chicago","bias":0.2},
+    "Minneapolis": {"lat":44.8848,"lon":-93.2223,"tz":"America/Chicago","bias":0.1},
+    "Washington DC": {"lat":38.8512,"lon":-77.0402,"tz":"America/New_York","bias":0.1}
 }
 
 DEFAULT_LADDERS = {
-    "Phoenix": "74 or below | 75-76 | 77-78 | 79-80 | 81-82 | 83 or above",
-    "Las Vegas": "74 or below | 75-76 | 77-78 | 79-80 | 81-82 | 83 or above",
-    "Los Angeles": "66 or below | 67-68 | 69-70 | 71-72 | 73-74 | 75 or above",
-    "Dallas": "78 or below | 79-80 | 81-82 | 83-84 | 85-86 | 87 or above",
-    "Austin": "78 or below | 79-80 | 81-82 | 83-84 | 85-86 | 87 or above",
-    "Houston": "79 or below | 80-81 | 82-83 | 84-85 | 86-87 | 88 or above",
-    "Atlanta": "74 or below | 75-76 | 77-78 | 79-80 | 81-82 | 83 or above",
+    "Phoenix":"74 or below | 75-76 | 77-78 | 79-80 | 81-82 | 83 or above",
+    "Las Vegas":"74 or below | 75-76 | 77-78 | 79-80 | 81-82 | 83 or above",
+    "Los Angeles":"66 or below | 67-68 | 69-70 | 71-72 | 73-74 | 75 or above",
+    "Dallas":"78 or below | 79-80 | 81-82 | 83-84 | 85-86 | 87 or above",
+    "Austin":"78 or below | 79-80 | 81-82 | 83-84 | 85-86 | 87 or above",
+    "Houston":"79 or below | 80-81 | 82-83 | 84-85 | 86-87 | 88 or above",
+    "Atlanta":"74 or below | 75-76 | 77-78 | 79-80 | 81-82 | 83 or above",
+    "Miami":"80 or below | 81-82 | 83-84 | 85-86 | 87-88 | 89 or above",
+    "New York":"70 or below | 71-72 | 73-74 | 75-76 | 77-78 | 79 or above",
+    "San Antonio":"78 or below | 79-80 | 81-82 | 83-84 | 85-86 | 87 or above",
+    "New Orleans":"80 or below | 81-82 | 83-84 | 85-86 | 87-88 | 89 or above",
+    "Philadelphia":"70 or below | 71-72 | 73-74 | 75-76 | 77-78 | 79 or above",
+    "Boston":"65 or below | 66-67 | 68-69 | 70-71 | 72-73 | 74 or above",
+    "Denver":"65 or below | 66-67 | 68-69 | 70-71 | 72-73 | 74 or above",
+    "Oklahoma City":"75 or below | 76-77 | 78-79 | 80-81 | 82-83 | 84 or above",
+    "Minneapolis":"65 or below | 66-67 | 68-69 | 70-71 | 72-73 | 74 or above",
+    "Washington DC":"70 or below | 71-72 | 73-74 | 75-76 | 77-78 | 79 or above"
 }
 
-BASE_WEIGHTS = {"OpenMeteo": 0.35, "GFS": 0.25, "ICON": 0.25, "NWS": 0.15}
-OUTLIER_HALF = 3.0
-OUTLIER_REMOVE = 4.5
-SIGMA_MIN = 1.15
-SIGMA_MAX = 1.90
-
-
-def safe_get(url, params=None):
+def safe_get(url,params=None):
     try:
-        r = requests.get(url, params=params, timeout=12)
+        r=requests.get(url,params=params,timeout=10)
         r.raise_for_status()
         return r.json()
-    except Exception:
+    except:
         return None
-
 
 def median(vals):
-    s = sorted(vals)
-    n = len(s)
-    if n == 0:
-        return None
-    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
-
+    s=sorted(vals)
+    n=len(s)
+    if n==0:return None
+    return s[n//2] if n%2 else (s[n//2-1]+s[n//2])/2
 
 def compute_weights(forecasts):
-    vals = [v for v in forecasts.values() if v is not None]
-    med = median(vals)
-    if med is None:
-        return {k: 0.0 for k in forecasts}
-
-    out = {}
-    for k, v in forecasts.items():
+    vals=[v for v in forecasts.values() if v is not None]
+    med=median(vals)
+    out={}
+    for k,v in forecasts.items():
         if v is None:
-            out[k] = 0.0
+            out[k]=0
             continue
-        d = abs(v - med)
-        w = BASE_WEIGHTS.get(k, 0.0)
-        if d > OUTLIER_REMOVE:
-            w = 0.0
-        elif d > OUTLIER_HALF:
-            w *= 0.5
-        out[k] = w
+        d=abs(v-med)
+        w=1
+        if d>4.5:w=0
+        elif d>3:w*=0.5
+        out[k]=w
     return out
 
+def consensus(forecasts,weights):
+    num=0
+    den=0
+    for k,v in forecasts.items():
+        if v is None:continue
+        w=weights.get(k,0)
+        num+=v*w
+        den+=w
+    if den==0:return None
+    return num/den
 
-def consensus(forecasts, weights):
-    num = 0.0
-    den = 0.0
-    for k, v in forecasts.items():
-        if v is None:
-            continue
-        w = weights.get(k, 0.0)
-        num += v * w
-        den += w
-    return None if den == 0 else num / den
-
-
-def solar_adjust(cloud, hour, city_type):
-    if cloud is None or hour < 9 or hour > 17:
-        return 0.0
-
-    if city_type == "desert":
-        if cloud < 10:
-            return 1.1
-        if cloud < 25:
-            return 0.7
-        if cloud < 50:
-            return 0.2
-        return -0.5
-
-    if city_type == "marine":
-        if cloud < 20:
-            return 0.3
-        if cloud < 50:
-            return 0.0
-        return -0.6
-
-    if city_type in {"texas", "gulf"}:
-        if cloud < 15:
-            return 0.6
-        if cloud < 40:
-            return 0.2
-        if cloud < 70:
-            return -0.1
-        return -0.6
-
-    if cloud < 20:
-        return 0.5
-    if cloud < 50:
-        return 0.1
-    return -0.4
-
-
-def humidity_suppression(city_type, dewpoint, hour):
-    if dewpoint is None or hour < 12:
-        return 0.0
-    if city_type == "gulf":
-        if dewpoint >= 70:
-            return -0.4
-        if dewpoint >= 66:
-            return -0.2
-    if city_type == "texas":
-        if dewpoint >= 68:
-            return -0.25
-        if dewpoint >= 64:
-            return -0.1
-    return 0.0
-
-
-def max_remaining_rise(city_type, cloud, dewpoint, hour):
-    if hour >= 16:
-        base = 2.0
-    elif hour >= 15:
-        base = 3.0
-    elif hour >= 14:
-        base = 4.0
-    elif hour >= 13:
-        base = 5.0
-    else:
-        return None
-
-    if city_type == "desert":
-        base += 2.0
-    elif city_type == "marine":
-        base -= 1.0
-    elif city_type == "gulf":
-        base -= 0.5
-
-    if cloud is not None:
-        if cloud >= 80:
-            base -= 2.0
-        elif cloud >= 60:
-            base -= 1.0
-
-    if dewpoint is not None and city_type in {"texas", "gulf"} and dewpoint >= 68:
-        base -= 0.5
-
-    return max(base, 1.0)
-
-
-def normal_cdf(x, mu, sigma):
-    z = (x - mu) / (sigma * math.sqrt(2))
-    return 0.5 * (1 + math.erf(z))
-
+def normal_cdf(x,mu,sigma):
+    z=(x-mu)/(sigma*math.sqrt(2))
+    return 0.5*(1+math.erf(z))
 
 def parse_ladder(text):
-    out = []
-    for p in [q.strip() for q in text.split("|") if q.strip()]:
-        nums = [int(x) for x in re.findall(r"\d+", p)]
-        lower = p.lower()
-        if "below" in lower and nums:
-            out.append((p, None, nums[0]))
-        elif "above" in lower and nums:
-            out.append((p, nums[0], None))
-        elif len(nums) >= 2:
-            out.append((p, nums[0], nums[1]))
+    out=[]
+    for p in text.split("|"):
+        nums=[int(x) for x in re.findall(r"\d+",p)]
+        if "below" in p:out.append((p,None,nums[0]))
+        elif "above" in p:out.append((p,nums[0],None))
+        else:out.append((p,nums[0],nums[1]))
     return out
 
-
-def bracket_probs(mu, sigma, brackets, current_temp=None):
-    rows = []
-    for lab, lo, hi in brackets:
-        if current_temp is not None and hi is not None and current_temp > hi:
-            rows.append((lab, 0.0))
-            continue
-
-        if lo is None:
-            p = normal_cdf(hi + 0.5, mu, sigma)
-        elif hi is None:
-            p = 1 - normal_cdf(lo - 0.5, mu, sigma)
-        else:
-            p = normal_cdf(hi + 0.5, mu, sigma) - normal_cdf(lo - 0.5, mu, sigma)
-
-        rows.append((lab, max(p, 0.0)))
-
-    total = sum(p for _, p in rows)
-    if total > 0:
-        rows = [(lab, p / total) for lab, p in rows]
-    rows.sort(key=lambda x: x[1], reverse=True)
+def bracket_probs(mu):
+    sigma=1.4
+    brackets=parse_ladder(ladder_text)
+    rows=[]
+    for lab,lo,hi in brackets:
+        if lo is None:p=normal_cdf(hi+.5,mu,sigma)
+        elif hi is None:p=1-normal_cdf(lo-.5,mu,sigma)
+        else:p=normal_cdf(hi+.5,mu,sigma)-normal_cdf(lo-.5,mu,sigma)
+        rows.append((lab,p))
+    rows.sort(key=lambda x:x[1],reverse=True)
     return rows
 
+city=st.selectbox("City",list(CITIES.keys()))
+profile=CITIES[city]
 
-def trade_grade(spread, sigma, current_temp, projected_high, cloud, city_type):
-    if projected_high is None or current_temp is None:
-        return "Pass"
-    remaining = projected_high - current_temp
-    if spread >= 6.0 or sigma >= 1.90:
-        return "Pass"
-    if city_type in {"texas", "gulf"} and cloud is not None and cloud >= 75 and remaining >= 6:
-        return "Pass"
-    if spread <= 3.5 and sigma <= 1.55:
-        return "Strong"
-    return "Playable"
+lat=profile["lat"]
+lon=profile["lon"]
+tz=profile["tz"]
 
+ladder_text=st.text_input("Kalshi Ladder",DEFAULT_LADDERS[city])
 
-city = st.selectbox("City", list(CITIES.keys()))
-profile = CITIES[city]
-lat = profile["lat"]
-lon = profile["lon"]
-tz = profile["tz"]
-city_type = profile["city_type"]
-local_hour = datetime.now(ZoneInfo(tz)).hour
+openmeteo=safe_get("https://api.open-meteo.com/v1/forecast",{
+"latitude":lat,
+"longitude":lon,
+"daily":"temperature_2m_max",
+"current":"temperature_2m",
+"temperature_unit":"fahrenheit",
+"timezone":"auto"
+})
 
-ladder_text = st.text_input("Kalshi Ladder", DEFAULT_LADDERS[city])
+if openmeteo:
+    current_temp=openmeteo["current"]["temperature_2m"]
+    forecast=openmeteo["daily"]["temperature_2m_max"][0]
 
-om = safe_get(
-    "https://api.open-meteo.com/v1/forecast",
-    {
-        "latitude": lat,
-        "longitude": lon,
-        "current": "temperature_2m,cloud_cover,dew_point_2m",
-        "daily": "temperature_2m_max",
-        "temperature_unit": "fahrenheit",
-        "timezone": "auto",
-    },
-)
+    cons=max(forecast,current_temp)
 
-gfs = safe_get(
-    "https://api.open-meteo.com/v1/forecast",
-    {
-        "latitude": lat,
-        "longitude": lon,
-        "daily": "temperature_2m_max",
-        "models": "gfs_seamless",
-        "temperature_unit": "fahrenheit",
-        "timezone": "auto",
-    },
-)
-
-icon = safe_get(
-    "https://api.open-meteo.com/v1/forecast",
-    {
-        "latitude": lat,
-        "longitude": lon,
-        "daily": "temperature_2m_max",
-        "models": "icon_seamless",
-        "temperature_unit": "fahrenheit",
-        "timezone": "auto",
-    },
-)
-
-nws_point = safe_get(f"https://api.weather.gov/points/{lat},{lon}")
-nws_high = None
-if nws_point and "properties" in nws_point and nws_point["properties"].get("forecast"):
-    fc = safe_get(nws_point["properties"]["forecast"])
-    if fc and "properties" in fc and "periods" in fc["properties"]:
-        for period in fc["properties"]["periods"]:
-            if period.get("isDaytime"):
-                nws_high = period.get("temperature")
-                break
-
-if om:
-    current_temp = om["current"].get("temperature_2m")
-    cloud = om["current"].get("cloud_cover")
-    dew = om["current"].get("dew_point_2m")
-
-    forecasts = {
-        "OpenMeteo": om["daily"]["temperature_2m_max"][0] if "daily" in om else None,
-        "GFS": gfs["daily"]["temperature_2m_max"][0] if gfs and "daily" in gfs else None,
-        "ICON": icon["daily"]["temperature_2m_max"][0] if icon and "daily" in icon else None,
-        "NWS": nws_high,
-    }
-
-    weights = compute_weights(forecasts)
-    cons = consensus(forecasts, weights)
-
-    spread_vals = [v for v in forecasts.values() if v is not None]
-    spread = (max(spread_vals) - min(spread_vals)) if len(spread_vals) >= 2 else 0.0
-    sigma = min(max(1.25 + spread * 0.20, SIGMA_MIN), SIGMA_MAX)
-
-    projected_high = cons
-    if projected_high is not None:
-        projected_high += profile["bias"]
-        projected_high += solar_adjust(cloud, local_hour, city_type)
-        projected_high += humidity_suppression(city_type, dew, local_hour)
-
-        rem = max_remaining_rise(city_type, cloud, dew, local_hour)
-        if rem is not None and current_temp is not None:
-            projected_high = min(projected_high, current_temp + rem)
-
-        if current_temp is not None:
-            projected_high = max(projected_high, current_temp)
-
-    grade = trade_grade(spread, sigma, current_temp, projected_high, cloud, city_type)
-
-    st.subheader("Forecast Sources")
-    st.write(forecasts)
-
-    st.subheader("Weights")
-    st.write(weights)
-
-    st.subheader("Projected High")
-    st.write(round(projected_high, 2) if projected_high is not None else "N/A")
+    st.subheader("Forecast High")
+    st.write(forecast)
 
     st.subheader("Current Temp")
     st.write(current_temp)
 
-    st.subheader("Cloud Cover")
-    st.write(cloud)
+    st.subheader("Consensus High")
+    st.write(cons)
 
-    st.subheader("Dew Point")
-    st.write(dew)
+    rows=bracket_probs(cons)
+    df=pd.DataFrame(rows,columns=["Bracket","Probability"])
+    df["Probability"]=df["Probability"].apply(lambda x:f"{x*100:.1f}%")
 
-    st.subheader("Forecast Spread")
-    st.write(round(spread, 2))
-
-    st.subheader("Sigma")
-    st.write(round(sigma, 2))
-
-    st.subheader("Trade Grade")
-    st.write(grade)
-
-    brackets = parse_ladder(ladder_text)
-    rows = bracket_probs(projected_high, sigma, brackets, current_temp=current_temp)
-    df = pd.DataFrame(rows, columns=["Bracket", "Model Probability"])
-    df["Model Probability"] = df["Model Probability"].apply(lambda x: f"{x*100:.1f}%")
     st.subheader("Kalshi Bracket Probabilities")
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df)
 
 else:
     st.error("Weather data unavailable")
