@@ -1,10 +1,9 @@
+import streamlit as st
 import numpy as np
-from dataclasses import dataclass, asdict
+import pandas as pd
+from dataclasses import dataclass
 
-# -----------------------------
-# Kalshi Model v17 - Market Replicator
-# with Dynamic Ladder Mode
-# -----------------------------
+st.set_page_config(page_title="Kalshi Model v17", layout="wide")
 
 BRACKET_ORDER = [
     "78 or below",
@@ -17,42 +16,33 @@ BRACKET_ORDER = [
 
 @dataclass
 class LadderConfig:
-    name: str = "Default Ladder"
-    enabled: bool = True
-
-    # strategy settings
     num_core_brackets: int = 2
     include_tails: bool = False
-    core_edge_threshold: float = 0.06   # 6%
-    tail_edge_threshold: float = 0.10   # 10%
-
-    # sizing
+    core_edge_threshold: float = 0.06
+    tail_edge_threshold: float = 0.10
     stake1: float = 10.0
     stake2: float = 20.0
     stake3: float = 30.0
-
-    # exposure controls
-    max_total_risk: float = 60.0
-    allow_multiple_sides: bool = False  # usually False
-
-    # optional preference
+    max_total_risk: float = 30.0
     prefer_middle_brackets: bool = True
 
 
-def american_to_implied_prob(odds: float) -> float:
-    """
-    Convert American odds to implied probability.
-    +117 -> 0.4608
-    -133 -> 0.5708
-    """
+def american_to_implied_prob(odds):
     if odds is None:
         return np.nan
+    try:
+        odds = float(odds)
+    except Exception:
+        return np.nan
+
     if odds > 0:
         return 100.0 / (odds + 100.0)
-    return abs(odds) / (abs(odds) + 100.0)
+    elif odds < 0:
+        return abs(odds) / (abs(odds) + 100.0)
+    return np.nan
 
 
-def choose_sigma(hour_local: int) -> float:
+def choose_sigma(hour_local):
     if hour_local < 11:
         return 2.2
     elif hour_local < 15:
@@ -61,9 +51,6 @@ def choose_sigma(hour_local: int) -> float:
 
 
 def apply_intraday_adjustment(adjusted_high, current_temp, expected_temp_now, hour_local):
-    """
-    Very light touch. No constant fiddling.
-    """
     if current_temp is None or expected_temp_now is None:
         return adjusted_high
 
@@ -73,7 +60,6 @@ def apply_intraday_adjustment(adjusted_high, current_temp, expected_temp_now, ho
             adjusted_high -= 1.0
         elif lag < -2.0:
             adjusted_high += 0.7
-
     return adjusted_high
 
 
@@ -88,21 +74,12 @@ def simulate_bracket_probs(
     n_sims=10000,
     seed=42,
 ):
-    """
-    Main v17 probability engine.
-    """
     rng = np.random.default_rng(seed)
 
-    # weighted expected high
     base_high = 0.55 * src1 + 0.30 * src2 + 0.15 * src3
     adjusted_high = base_high + station_bias
-
-    # light intraday tweak
     adjusted_high = apply_intraday_adjustment(
-        adjusted_high=adjusted_high,
-        current_temp=current_temp,
-        expected_temp_now=expected_temp_now,
-        hour_local=hour_local,
+        adjusted_high, current_temp, expected_temp_now, hour_local
     )
 
     sigma = choose_sigma(hour_local)
@@ -111,12 +88,12 @@ def simulate_bracket_probs(
     sims = np.rint(sims).astype(int)
 
     probs = {
-        "78 or below": np.mean(sims <= 78),
-        "79-80": np.mean((sims >= 79) & (sims <= 80)),
-        "81-82": np.mean((sims >= 81) & (sims <= 82)),
-        "83-84": np.mean((sims >= 83) & (sims <= 84)),
-        "85-86": np.mean((sims >= 85) & (sims <= 86)),
-        "87 or above": np.mean(sims >= 87),
+        "78 or below": float(np.mean(sims <= 78)),
+        "79-80": float(np.mean((sims >= 79) & (sims <= 80))),
+        "81-82": float(np.mean((sims >= 81) & (sims <= 82))),
+        "83-84": float(np.mean((sims >= 83) & (sims <= 84))),
+        "85-86": float(np.mean((sims >= 85) & (sims <= 86))),
+        "87 or above": float(np.mean(sims >= 87)),
     }
 
     return {
@@ -128,30 +105,19 @@ def simulate_bracket_probs(
 
 
 def build_market_table(model_probs, kalshi_yes_odds):
-    """
-    kalshi_yes_odds example:
-    {
-        "78 or below": +3233,
-        "79-80": +1328,
-        "81-82": +233,
-        "83-84": +117,
-        "85-86": +354,
-        "87 or above": +3233,
-    }
-    """
     rows = []
     for bracket in BRACKET_ORDER:
         model_p = model_probs.get(bracket, np.nan)
-        yes_odds = kalshi_yes_odds.get(bracket)
-        market_p = american_to_implied_prob(yes_odds) if yes_odds is not None else np.nan
-        edge = model_p - market_p if not np.isnan(model_p) and not np.isnan(market_p) else np.nan
+        yes_odds = kalshi_yes_odds.get(bracket, np.nan)
+        market_p = american_to_implied_prob(yes_odds)
+        edge = model_p - market_p if pd.notna(market_p) else np.nan
 
         rows.append({
-            "bracket": bracket,
-            "model_prob": model_p,
-            "yes_odds": yes_odds,
-            "market_prob": market_p,
-            "edge": edge,
+            "Bracket": bracket,
+            "Model Prob %": round(model_p * 100, 1),
+            "Kalshi YES Odds": yes_odds,
+            "Market Prob %": round(market_p * 100, 1) if pd.notna(market_p) else np.nan,
+            "Edge % Pts": round(edge * 100, 1) if pd.notna(edge) else np.nan,
             "is_tail": bracket in ["78 or below", "87 or above"],
             "is_middle": bracket in ["79-80", "81-82", "83-84"],
         })
@@ -159,43 +125,32 @@ def build_market_table(model_probs, kalshi_yes_odds):
 
 
 def bracket_priority(row, prefer_middle_brackets=True):
-    """
-    Sort candidates sensibly.
-    """
-    edge = row["edge"]
+    edge = row["Edge % Pts"] / 100.0 if pd.notna(row["Edge % Pts"]) else -999
     middle_bonus = 0.01 if prefer_middle_brackets and row["is_middle"] else 0.0
     tail_penalty = -0.005 if row["is_tail"] else 0.0
     return edge + middle_bonus + tail_penalty
 
 
 def auto_generate_ladder(rows, cfg: LadderConfig):
-    """
-    Dynamic Ladder Mode:
-    Save the strategy, not exact temp picks.
-    Rebuild live from current model + current odds.
-    """
-    if not cfg.enabled:
-        return []
-
     candidates = []
     for row in rows:
+        edge = row["Edge % Pts"] / 100.0 if pd.notna(row["Edge % Pts"]) else np.nan
         threshold = cfg.tail_edge_threshold if row["is_tail"] else cfg.core_edge_threshold
-        if row["edge"] is not None and not np.isnan(row["edge"]) and row["edge"] >= threshold:
-            if not cfg.include_tails and row["is_tail"]:
+
+        if pd.notna(edge) and edge >= threshold:
+            if row["is_tail"] and not cfg.include_tails:
                 continue
             candidates.append(row)
 
-    # sort by best edge, with mild preference for middle contracts
     candidates = sorted(
         candidates,
         key=lambda r: bracket_priority(r, cfg.prefer_middle_brackets),
         reverse=True
     )
 
-    # keep top core brackets
     selected = candidates[:cfg.num_core_brackets]
-
     stakes = [cfg.stake1, cfg.stake2, cfg.stake3]
+
     ladder = []
     total_risk = 0.0
 
@@ -205,95 +160,110 @@ def auto_generate_ladder(rows, cfg: LadderConfig):
             break
 
         ladder.append({
-            "bracket": row["bracket"],
-            "side": "YES",
-            "stake": stake,
-            "model_prob": round(row["model_prob"] * 100, 1),
-            "market_prob": round(row["market_prob"] * 100, 1),
-            "edge_pct_pts": round((row["edge"]) * 100, 1),
-            "yes_odds": row["yes_odds"],
+            "Bracket": row["Bracket"],
+            "Side": "YES",
+            "Stake": stake,
+            "Model Prob %": row["Model Prob %"],
+            "Market Prob %": row["Market Prob %"],
+            "Edge % Pts": row["Edge % Pts"],
+            "Kalshi YES Odds": row["Kalshi YES Odds"],
         })
         total_risk += stake
 
     return ladder
 
 
-def summarize_changes(old_ladder, new_ladder):
-    """
-    Lets the app show 'changed since save' without breaking your saved strategy.
-    """
-    old_keys = {(x["bracket"], x["side"]) for x in old_ladder}
-    new_keys = {(x["bracket"], x["side"]) for x in new_ladder}
+st.title("Kalshi Model v17 - Market Replicator")
+st.caption("Lean version with Dynamic Ladder Mode")
 
-    added = new_keys - old_keys
-    removed = old_keys - new_keys
+with st.sidebar:
+    st.header("Forecast Inputs")
+    src1 = st.number_input("Primary forecast high", value=82.0, step=0.1)
+    src2 = st.number_input("Secondary forecast high", value=81.0, step=0.1)
+    src3 = st.number_input("Third forecast high", value=83.0, step=0.1)
+    station_bias = st.number_input("Station bias", value=-0.8, step=0.1)
+    current_temp = st.number_input("Current temp", value=76.0, step=0.1)
+    expected_temp_now = st.number_input("Expected temp by now", value=77.5, step=0.1)
+    hour_local = st.slider("Local hour", min_value=6, max_value=20, value=13)
+    n_sims = st.selectbox("Simulations", [5000, 10000, 20000], index=1)
 
-    return {
-        "added": list(added),
-        "removed": list(removed),
-        "changed": bool(added or removed),
-    }
+    st.header("Ladder Settings")
+    num_core_brackets = st.selectbox("Number of core brackets", [1, 2, 3], index=1)
+    include_tails = st.checkbox("Include tails", value=False)
+    core_edge_threshold = st.slider("Core edge threshold", 0.01, 0.20, 0.06, 0.01)
+    tail_edge_threshold = st.slider("Tail edge threshold", 0.01, 0.25, 0.10, 0.01)
+    stake1 = st.number_input("Stake 1", value=10.0, step=1.0)
+    stake2 = st.number_input("Stake 2", value=20.0, step=1.0)
+    stake3 = st.number_input("Stake 3", value=30.0, step=1.0)
+    max_total_risk = st.number_input("Max total risk", value=30.0, step=1.0)
 
+cfg = LadderConfig(
+    num_core_brackets=num_core_brackets,
+    include_tails=include_tails,
+    core_edge_threshold=core_edge_threshold,
+    tail_edge_threshold=tail_edge_threshold,
+    stake1=stake1,
+    stake2=stake2,
+    stake3=stake3,
+    max_total_risk=max_total_risk,
+)
 
-# -----------------------------
-# Example usage
-# -----------------------------
-if __name__ == "__main__":
-    # Example forecast inputs
-    src1 = 82.0
-    src2 = 81.0
-    src3 = 83.0
-    station_bias = -0.8
-    current_temp = 76.0
-    expected_temp_now = 77.5
-    hour_local = 13
+st.subheader("Kalshi YES Odds")
+c1, c2, c3 = st.columns(3)
+with c1:
+    odd_78 = st.number_input("78 or below", value=3233.0, step=1.0)
+    odd_79_80 = st.number_input("79-80", value=1328.0, step=1.0)
+with c2:
+    odd_81_82 = st.number_input("81-82", value=233.0, step=1.0)
+    odd_83_84 = st.number_input("83-84", value=117.0, step=1.0)
+with c3:
+    odd_85_86 = st.number_input("85-86", value=354.0, step=1.0)
+    odd_87 = st.number_input("87 or above", value=3233.0, step=1.0)
 
-    # Example Kalshi yes odds
-    kalshi_yes_odds = {
-        "78 or below": 3233,
-        "79-80": 1328,
-        "81-82": 233,
-        "83-84": 117,
-        "85-86": 354,
-        "87 or above": 3233,
-    }
+kalshi_yes_odds = {
+    "78 or below": odd_78,
+    "79-80": odd_79_80,
+    "81-82": odd_81_82,
+    "83-84": odd_83_84,
+    "85-86": odd_85_86,
+    "87 or above": odd_87,
+}
 
-    model = simulate_bracket_probs(
-        src1=src1,
-        src2=src2,
-        src3=src3,
-        station_bias=station_bias,
-        current_temp=current_temp,
-        expected_temp_now=expected_temp_now,
-        hour_local=hour_local,
-        n_sims=10000,
-        seed=42,
-    )
+model = simulate_bracket_probs(
+    src1=src1,
+    src2=src2,
+    src3=src3,
+    station_bias=station_bias,
+    current_temp=current_temp,
+    expected_temp_now=expected_temp_now,
+    hour_local=hour_local,
+    n_sims=n_sims,
+)
 
-    rows = build_market_table(
-        model_probs=model["bracket_probs"],
-        kalshi_yes_odds=kalshi_yes_odds,
-    )
+rows = build_market_table(model["bracket_probs"], kalshi_yes_odds)
+ladder = auto_generate_ladder(rows, cfg)
 
-    cfg = LadderConfig(
-        name="Michael Core Ladder",
-        num_core_brackets=2,
-        include_tails=False,
-        core_edge_threshold=0.06,
-        tail_edge_threshold=0.10,
-        stake1=10,
-        stake2=20,
-        stake3=30,
-        max_total_risk=30,
-        prefer_middle_brackets=True,
-    )
+m1, m2, m3 = st.columns(3)
+m1.metric("Base High", model["base_high"])
+m2.metric("Adjusted High", model["adjusted_high"])
+m3.metric("Sigma", model["sigma"])
 
-    ladder = auto_generate_ladder(rows, cfg)
+st.subheader("Bracket Table")
+df_rows = pd.DataFrame(rows).drop(columns=["is_tail", "is_middle"])
+st.dataframe(df_rows, use_container_width=True)
 
-    print("MODEL SUMMARY")
-    print(model)
-    print("\nLADDER CONFIG")
-    print(asdict(cfg))
-    print("\nAUTO LADDER")
-    for item in ladder:
-        print(item)
+st.subheader("Dynamic Ladder")
+if ladder:
+    st.dataframe(pd.DataFrame(ladder), use_container_width=True)
+else:
+    st.info("No brackets currently meet your edge threshold.")
+
+st.subheader("Saved Strategy Logic")
+st.write({
+    "num_core_brackets": cfg.num_core_brackets,
+    "include_tails": cfg.include_tails,
+    "core_edge_threshold": cfg.core_edge_threshold,
+    "tail_edge_threshold": cfg.tail_edge_threshold,
+    "stakes": [cfg.stake1, cfg.stake2, cfg.stake3],
+    "max_total_risk": cfg.max_total_risk,
+})
