@@ -1,4 +1,4 @@
-# Kalshi High Temperature Model – Stable Version
+# Kalshi High Temperature Model – Corrected Version
 
 import math
 import re
@@ -60,10 +60,10 @@ DEFAULT_LADDERS = {
     "Houston":"79 or below | 80-81 | 82-83 | 84-85 | 86-87 | 88 or above",
     "Atlanta":"74 or below | 75-76 | 77-78 | 79-80 | 81-82 | 83 or above",
     "Miami":"80 or below | 81-82 | 83-84 | 85-86 | 87-88 | 89 or above",
-    "New York":"70 or below | 71-72 | 73-74 | 75-76 | 77-78 | 79 or above",
+    "New York":"65 or below | 66-67 | 68-69 | 70-71 | 72-73 | 74 or above",
     "San Antonio":"78 or below | 79-80 | 81-82 | 83-84 | 85-86 | 87 or above",
     "New Orleans":"80 or below | 81-82 | 83-84 | 85-86 | 87-88 | 89 or above",
-    "Philadelphia":"70 or below | 71-72 | 73-74 | 75-76 | 77-78 | 79 or above",
+    "Philadelphia":"73 or below | 74-75 | 76-77 | 78-79 | 80-81 | 82 or above",
     "Boston":"65 or below | 66-67 | 68-69 | 70-71 | 72-73 | 74 or above",
     "Denver":"65 or below | 66-67 | 68-69 | 70-71 | 72-73 | 74 or above",
     "Oklahoma City":"75 or below | 76-77 | 78-79 | 80-81 | 82-83 | 84 or above",
@@ -77,6 +77,19 @@ CITY_SIGMA = {
     "New Orleans":1.8,"Phoenix":1.9,"Las Vegas":1.9,
     "Atlanta":2.1,"Dallas":2.0,"Austin":2.0,"Houston":2.0,
     "San Antonio":2.0,"Oklahoma City":2.2
+}
+
+CITY_RAMP = {
+    "New York":0.25,
+    "Philadelphia":0.25,
+    "Boston":0.25,
+    "Washington DC":0.30,
+    "Atlanta":0.35,
+    "Dallas":0.40,
+    "Austin":0.40,
+    "Houston":0.40,
+    "Phoenix":0.40,
+    "Las Vegas":0.40
 }
 
 def load_saved():
@@ -163,9 +176,18 @@ if weather:
     forecast=weather["daily"]["temperature_2m_max"][0]
 
     hourly=weather["hourly"]["temperature_2m"]
-    remaining_peak=max(hourly)
 
-    consensus=(forecast*0.6)+(remaining_peak*0.4)
+    now_hour=datetime.now().hour
+    remaining_hours=hourly[now_hour:]
+
+    if remaining_hours:
+        remaining_peak=max(remaining_hours)
+    else:
+        remaining_peak=current
+
+    ramp_weight=CITY_RAMP.get(city,0.35)
+
+    consensus=(forecast*(1-ramp_weight))+(remaining_peak*ramp_weight)
     consensus=max(current,consensus)
 
     st.subheader("Forecast High")
