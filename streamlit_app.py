@@ -1,4 +1,11 @@
-# Kalshi High Temperature Model – NWS + Open-Meteo Fixed Version
+# Kalshi High Temperature Model – Consensus Floor Fix Version
+# Changes:
+# - Permanent per-city ladder saving
+# - Auto-sorted ladders
+# - Uses NWS + Open-Meteo blended forecast input
+# - Only future hours are considered
+# - Caps how much hourly weakness can drag consensus below forecast
+# - Same UI / workflow
 
 import math
 import re
@@ -111,6 +118,26 @@ CITY_RAMP_WEIGHT = {
     "Oklahoma City": 0.45,
 }
 
+MAX_DAILY_HAIRCUT = {
+    "New York": 1.5,
+    "Philadelphia": 1.5,
+    "Boston": 1.5,
+    "Washington DC": 1.75,
+    "Los Angeles": 1.0,
+    "Denver": 1.5,
+    "Miami": 2.0,
+    "Minneapolis": 1.75,
+    "New Orleans": 2.0,
+    "Phoenix": 2.0,
+    "Las Vegas": 2.0,
+    "Atlanta": 2.25,
+    "Dallas": 2.25,
+    "Austin": 2.25,
+    "Houston": 2.25,
+    "San Antonio": 2.25,
+    "Oklahoma City": 2.5,
+}
+
 HEADERS = {
     "User-Agent": "kalshi-temp-model/1.0 (personal use)",
     "Accept": "application/geo+json, application/json",
@@ -218,9 +245,8 @@ def fetch_nws(lat, lon):
     now = datetime.now().astimezone()
 
     if hourly and hourly.get("properties", {}).get("periods"):
-        periods = hourly["properties"]["periods"]
         future_vals = []
-        for p in periods:
+        for p in hourly["properties"]["periods"]:
             temp = p.get("temperature")
             start = p.get("startTime")
             if temp is None or start is None:
@@ -235,9 +261,8 @@ def fetch_nws(lat, lon):
             out["hourly_future_peak"] = max(future_vals)
 
     if forecast and forecast.get("properties", {}).get("periods"):
-        periods = forecast["properties"]["periods"]
         highs = []
-        for p in periods:
+        for p in forecast["properties"]["periods"]:
             temp = p.get("temperature")
             is_day = p.get("isDaytime")
             start = p.get("startTime")
@@ -271,12 +296,15 @@ def compute_consensus(city, current_temp, om_daily, om_future_peak, nws_daily, n
     upper_source = max(all_candidates) if all_candidates else raw
     lower_source = min(all_candidates) if all_candidates else raw
 
-    # guards against bad spikes
     hard_cap = current_temp + 8.0
     soft_cap = upper_source + 2.0
 
     consensus = min(raw, hard_cap, soft_cap)
     consensus = max(consensus, current_temp, lower_source - 1.0)
+
+    max_haircut = MAX_DAILY_HAIRCUT.get(city, 2.0)
+    floor_from_daily = blended_daily - max_haircut
+    consensus = max(consensus, floor_from_daily)
 
     return consensus, blended_daily
 
