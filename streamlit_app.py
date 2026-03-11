@@ -1,15 +1,17 @@
-# Kalshi High Temperature Model – Revised Ladder Save Version
-# Changes:
+# Kalshi High Temperature Model – Targeted Revision
+# Changes added:
 # - Permanent per-city ladder saving (local JSON file)
 # - Auto-sorts ladder text into numeric order on save/load
 # - Adaptive sigma by city (less overconfidence in volatile cities)
-# - Keeps same workflow and same weather source
-# - Leaves unmapped settlement stations as N/A instead of guessing
+# - Adds hourly "peak ramp" logic using the same Open-Meteo source
+# - Consensus now blends daily high + remaining hourly peak instead of max(current, forecast)
+# - Same workflow / no extra weather sources added
 
 import math
 import re
 import json
 from pathlib import Path
+from datetime import datetime
 
 import pandas as pd
 import requests
@@ -86,14 +88,36 @@ CITY_SIGMA = {
     "Miami": 1.7,
     "Minneapolis": 1.7,
     "New Orleans": 1.8,
+    "Phoenix": 1.9,
+    "Las Vegas": 1.9,
     "Atlanta": 2.1,
     "Dallas": 2.0,
     "Austin": 2.0,
     "Houston": 2.0,
     "San Antonio": 2.0,
     "Oklahoma City": 2.2,
-    "Phoenix": 1.9,
-    "Las Vegas": 1.9,
+}
+
+CITY_RAMP_WEIGHT = {
+    # More stable cities rely more on the official daily forecast
+    "New York": 0.30,
+    "Philadelphia": 0.30,
+    "Washington DC": 0.35,
+    "Boston": 0.35,
+    "Los Angeles": 0.30,
+    "Denver": 0.35,
+    # More volatile cities rely more on remaining hourly peak
+    "Miami": 0.40,
+    "New Orleans": 0.45,
+    "Phoenix": 0.40,
+    "Las Vegas": 0.40,
+    "Atlanta": 0.50,
+    "Dallas": 0.55,
+    "Austin": 0.55,
+    "Houston": 0.55,
+    "San Antonio": 0.55,
+    "Oklahoma City": 0.60,
+    "Minneapolis": 0.40,
 }
 
 def load_saved():
@@ -109,7 +133,7 @@ def save_saved(data):
 
 def safe_get(url, params):
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, timeout=12)
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -171,11 +195,49 @@ def bracket_probs(mu, ladder_text, city):
             p = 1 - normal_cdf(lo - 0.5, mu, sigma)
         else:
             p = normal_cdf(hi + 0.5, mu, sigma) - normal_cdf(lo - 0.5, mu, sigma)
-
         rows.append((lab, max(0.0, min(1.0, p))))
 
     rows.sort(key=lambda x: x[1], reverse=True)
     return rows, sigma
+
+def compute_consensus(city, current_temp, daily_high, hourly_times, hourly_temps):
+    """
+    Targeted fix:
+    blend daily max with remaining hourly peak from the same source.
+    This keeps the model closer to actual intraday ramp behavior without
+    changing your source or cluttering the UI.
+    """
+    remaining_peak = daily_high
+    local_hour = None
+
+    if hourly_times and hourly_temps:
+        try:
+            # Open-Meteo timezone=auto returns local timestamps like 2026-03-11T15:00
+            hourly_dt = [datetime.fromisoformat(t) for t in hourly_times]
+            now_idx = 0
+            # best effort: use current hour from the first hourly slot >= current local clock hour
+            now_local = datetime.now()
+            future_temps = [temp for dt, temp in zip(hourly_dt, hourly_temps) if dt >= now_local]
+            if future_temps:
+                remaining_peak = max(future_temps)
+            else:
+                remaining_peak = max(hourly_temps)
+            local_hour = now_local.hour
+        except Exception:
+            remaining_peak = max(hourly_temps)
+
+    ramp_weight = CITY_RAMP_WEIGHT.get(city, 0.45)
+
+    # Baseline blend
+    blended = (1 - ramp_weight) * daily_high + ramp_weight * remaining_peak
+
+    # Late-day gentle dampener: after 3 PM local, if current is still far below daily forecast,
+    # reduce consensus slightly toward remaining peak instead of clinging to the full daily max.
+    if local_hour is not None and local_hour >= 15 and current_temp < daily_high - 2:
+        blended = 0.35 * daily_high + 0.65 * remaining_peak
+
+    # Never below current, never wildly above the stronger source
+    return max(current_temp, blended)
 
 saved = load_saved()
 
@@ -203,16 +265,21 @@ weather = safe_get(
         "latitude": lat,
         "longitude": lon,
         "daily": "temperature_2m_max",
+        "hourly": "temperature_2m",
         "current": "temperature_2m",
         "temperature_unit": "fahrenheit",
         "timezone": "auto",
+        "forecast_days": 1,
     },
 )
 
 if weather:
     current = float(weather["current"]["temperature_2m"])
     forecast = float(weather["daily"]["temperature_2m_max"][0])
-    consensus = max(current, forecast)
+    hourly_times = weather.get("hourly", {}).get("time", [])
+    hourly_temps = weather.get("hourly", {}).get("temperature_2m", [])
+
+    consensus = compute_consensus(city, current, forecast, hourly_times, hourly_temps)
 
     st.subheader("Forecast High")
     st.write(f"{forecast:.1f}")
