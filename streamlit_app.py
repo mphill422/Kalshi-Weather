@@ -1,11 +1,14 @@
-# Kalshi High Temperature Model – Stable Station Version
-# Focus: better estimate of the settlement station temperature
+# Kalshi High Temperature Model – Stable Station Version (Updated)
+# Fixes:
+# - Settlement station label now covers all cities
+# - Missing station labels show as "Pending verification" instead of N/A
+# - Full city list retained
+# - Permanent ladder saving retained
 
 import math
 import re
 import json
 from pathlib import Path
-from datetime import datetime
 
 import pandas as pd
 import requests
@@ -16,20 +19,25 @@ st.title("Kalshi High Temperature Model – Stable Station Version")
 
 SAVE_FILE = Path("saved_ladders.json")
 
+# Verified where known from prior workflow; others intentionally marked Pending verification
 STATIONS = {
+    "Phoenix": "Pending verification",
+    "Las Vegas": "Pending verification",
     "Los Angeles": "CLILAX",
-    "New York": "KNYC",
-    "Atlanta": "CLIATL",
+    "Dallas": "Pending verification",
+    "Austin": "Pending verification",
     "Houston": "CLIHOU",
+    "Atlanta": "CLIATL",
     "Miami": "CLIMIA",
+    "New York": "KNYC",
+    "San Antonio": "CLISAT",
+    "New Orleans": "CLIMSY",
     "Philadelphia": "CLIPHL",
     "Boston": "CLIBOS",
     "Denver": "CLIDEN",
+    "Oklahoma City": "CLIOKC",
     "Minneapolis": "CLIMSP",
     "Washington DC": "CLIDCA",
-    "Oklahoma City": "CLIOKC",
-    "New Orleans": "CLIMSY",
-    "San Antonio": "CLISAT",
 }
 
 CITIES = {
@@ -83,11 +91,21 @@ DEFAULT_LADDERS = {
     "Miami": "80 or below | 81-82 | 83-84 | 85-86 | 87-88 | 89 or above",
     "New York": "65 or below | 66-67 | 68-69 | 70-71 | 72-73 | 74 or above",
     "San Antonio": "78 or below | 79-80 | 81-82 | 83-84 | 85-86 | 87 or above",
+    "New Orleans": "80 or below | 81-82 | 83-84 | 85-86 | 87-88 | 89 or above",
+    "Philadelphia": "73 or below | 74-75 | 76-77 | 78-79 | 80-81 | 82 or above",
+    "Boston": "48 or below | 49-50 | 51-52 | 53-54 | 55-56 | 57 or above",
+    "Denver": "65 or below | 66-67 | 68-69 | 70-71 | 72-73 | 74 or above",
+    "Oklahoma City": "75 or below | 76-77 | 78-79 | 80-81 | 82-83 | 84 or above",
+    "Minneapolis": "65 or below | 66-67 | 68-69 | 70-71 | 72-73 | 74 or above",
+    "Washington DC": "76 or below | 77-78 | 79-80 | 81-82 | 83-84 | 85 or above",
 }
 
 def load_saved():
     if SAVE_FILE.exists():
-        return json.loads(SAVE_FILE.read_text())
+        try:
+            return json.loads(SAVE_FILE.read_text())
+        except Exception:
+            return {}
     return {}
 
 def save_saved(data):
@@ -98,96 +116,96 @@ def safe_get(url, params=None):
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         return r.json()
-    except:
+    except Exception:
         return None
 
 def normal_cdf(x, mu, sigma):
-    z = (x-mu)/(sigma*math.sqrt(2))
-    return 0.5*(1+math.erf(z))
+    z = (x - mu) / (sigma * math.sqrt(2))
+    return 0.5 * (1 + math.erf(z))
 
 def parse_ladder(text):
-    out=[]
+    out = []
     for p in text.split("|"):
-        p=p.strip()
-        nums=[int(x) for x in re.findall(r"\d+",p)]
+        p = p.strip()
+        nums = [int(x) for x in re.findall(r"\d+", p)]
+        if not nums:
+            continue
         if "below" in p.lower():
-            out.append((p,None,nums[0]))
+            out.append((p, None, nums[0]))
         elif "above" in p.lower():
-            out.append((p,nums[0],None))
-        else:
-            out.append((p,nums[0],nums[1]))
+            out.append((p, nums[0], None))
+        elif len(nums) >= 2:
+            out.append((p, nums[0], nums[1]))
     return out
 
 def bracket_probs(mu, ladder_text, city):
-    sigma=CITY_SIGMA.get(city,1.8)
-    ladder=parse_ladder(ladder_text)
-    rows=[]
-    for lab,lo,hi in ladder:
+    sigma = CITY_SIGMA.get(city, 1.8)
+    ladder = parse_ladder(ladder_text)
+    rows = []
+    for lab, lo, hi in ladder:
         if lo is None:
-            p=normal_cdf(hi+.5,mu,sigma)
+            p = normal_cdf(hi + 0.5, mu, sigma)
         elif hi is None:
-            p=1-normal_cdf(lo-.5,mu,sigma)
+            p = 1 - normal_cdf(lo - 0.5, mu, sigma)
         else:
-            p=normal_cdf(hi+.5,mu,sigma)-normal_cdf(lo-.5,mu,sigma)
-        rows.append((lab,p))
-    rows.sort(key=lambda x:x[1],reverse=True)
+            p = normal_cdf(hi + 0.5, mu, sigma) - normal_cdf(lo - 0.5, mu, sigma)
+        rows.append((lab, max(0.0, min(1.0, p))))
+    rows.sort(key=lambda x: x[1], reverse=True)
     return rows
 
-saved=load_saved()
+saved = load_saved()
 
-city=st.selectbox("City",list(CITIES.keys()))
-lat=CITIES[city]["lat"]
-lon=CITIES[city]["lon"]
+city = st.selectbox("City", list(CITIES.keys()))
+lat = CITIES[city]["lat"]
+lon = CITIES[city]["lon"]
 
-st.write("Kalshi Settlement Station:",STATIONS.get(city,"N/A"))
+st.write("Kalshi Settlement Station:", STATIONS.get(city, "Pending verification"))
 
 if city not in saved:
-    saved[city]=DEFAULT_LADDERS.get(city,"70 or below | 71-72 | 73-74 | 75-76 | 77-78 | 79 or above")
+    saved[city] = DEFAULT_LADDERS.get(city, "70 or below | 71-72 | 73-74 | 75-76 | 77-78 | 79 or above")
 
-ladder_text=st.text_input("Kalshi Ladder",saved[city])
+ladder_text = st.text_input("Kalshi Ladder", saved[city])
 
 if st.button("Save Ladder"):
-    saved[city]=ladder_text
+    saved[city] = ladder_text
     save_saved(saved)
     st.success("Saved")
 
-weather=safe_get(
+weather = safe_get(
     "https://api.open-meteo.com/v1/forecast",
     {
-        "latitude":lat,
-        "longitude":lon,
-        "daily":"temperature_2m_max",
-        "current":"temperature_2m",
-        "temperature_unit":"fahrenheit",
-        "timezone":"auto"
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "temperature_2m_max",
+        "current": "temperature_2m",
+        "temperature_unit": "fahrenheit",
+        "timezone": "auto"
     }
 )
 
 if weather:
+    current = float(weather["current"]["temperature_2m"])
+    forecast = float(weather["daily"]["temperature_2m_max"][0])
 
-    current=float(weather["current"]["temperature_2m"])
-    forecast=float(weather["daily"]["temperature_2m_max"][0])
+    # Stable station-centered estimate
+    consensus = (forecast * 0.7) + (current * 0.3)
 
-    # Station-centered estimate
-    consensus=(forecast*0.7)+(current*0.3)
-
-    # guardrail against unrealistic drift
-    if abs(consensus-forecast)>2:
-        consensus=forecast-1
+    # Guardrail against unrealistic drift
+    if abs(consensus - forecast) > 2:
+        consensus = forecast - 1
 
     st.subheader("Forecast High")
-    st.write(round(forecast,1))
+    st.write(round(forecast, 1))
 
     st.subheader("Model Consensus High")
-    st.write(round(consensus,1))
+    st.write(round(consensus, 1))
 
-    rows=bracket_probs(consensus,ladder_text,city)
+    rows = bracket_probs(consensus, ladder_text, city)
 
-    df=pd.DataFrame(rows,columns=["Bracket","Probability"])
-    df["Probability"]=df["Probability"].apply(lambda x:f"{x*100:.1f}%")
+    df = pd.DataFrame(rows, columns=["Bracket", "Probability"])
+    df["Probability"] = df["Probability"].apply(lambda x: f"{x*100:.1f}%")
 
     st.subheader("Kalshi Bracket Probabilities")
-    st.dataframe(df)
-
+    st.dataframe(df, use_container_width=True)
 else:
     st.error("Weather data unavailable")
