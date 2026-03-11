@@ -1,13 +1,14 @@
-# Kalshi High Temperature Model – Version 3
-# Includes:
+# Kalshi High Temperature Model – Version 4
+# Added:
+# - NOAA / NWS station observation feed
+# - nearest observation station lookup
+# - latest observed station temperature shown in app
+# Keeps:
 # - 6 separate ladder boxes
-# - number-only ladder entry supported
-#   * top box single number => "or below"
-#   * bottom box single number => "or above"
+# - number-only ladder entry
 # - permanent per-city ladder saving
 # - time-of-day sigma tightening
-# - desert-city tightening for Phoenix / Las Vegas
-# - full city list / station labels
+# - desert-city tightening
 
 import math
 import re
@@ -20,9 +21,14 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="Kalshi High Temperature Model", layout="wide")
-st.title("Kalshi High Temperature Model – Version 3")
+st.title("Kalshi High Temperature Model – Version 4")
 
 SAVE_FILE = Path("saved_ladders.json")
+
+HEADERS = {
+    "User-Agent": "kalshi-temp-model/1.0",
+    "Accept": "application/geo+json, application/json",
+}
 
 STATIONS = {
     "Phoenix": "Pending verification",
@@ -117,9 +123,9 @@ def load_saved():
 def save_saved(data):
     SAVE_FILE.write_text(json.dumps(data, indent=2))
 
-def safe_get(url, params=None):
+def safe_get(url, params=None, headers=None):
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, headers=headers, timeout=12)
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -177,7 +183,6 @@ def choose_sigma(city):
     sigma = BASE_SIGMA.get(city, 1.8)
     hour = datetime.now().hour
 
-    # Time-of-day tightening
     if hour < 11:
         factor = 1.00
     elif hour < 14:
@@ -189,12 +194,10 @@ def choose_sigma(city):
 
     sigma *= factor
 
-    # Desert tightening
     if city in DESERT_CITIES:
         sigma *= 0.90
 
-    # keep sensible floor/ceiling
-    sigma = max(1.15, min(2.4, sigma))
+    sigma = max(1.10, min(2.4, sigma))
     return sigma
 
 def bracket_probs(mu, ladder_text, city):
@@ -211,6 +214,35 @@ def bracket_probs(mu, ladder_text, city):
         rows.append((lab, max(0.0, min(1.0, p))))
     rows.sort(key=lambda x: x[1], reverse=True)
     return rows, sigma
+
+def c_to_f(c):
+    return (c * 9 / 5) + 32
+
+def fetch_noaa_latest_observation(lat, lon):
+    points = safe_get(f"https://api.weather.gov/points/{lat},{lon}", headers=HEADERS)
+    if not points:
+        return None, None
+
+    stations_url = points.get("properties", {}).get("observationStations")
+    if not stations_url:
+        return None, None
+
+    stations = safe_get(stations_url, headers=HEADERS)
+    if not stations or not stations.get("observationStations"):
+        return None, None
+
+    station_url = stations["observationStations"][0]
+    station_id = station_url.rstrip("/").split("/")[-1]
+
+    obs = safe_get(f"{station_url}/observations/latest", headers=HEADERS)
+    if not obs:
+        return station_id, None
+
+    temp_c = obs.get("properties", {}).get("temperature", {}).get("value")
+    if temp_c is None:
+        return station_id, None
+
+    return station_id, float(c_to_f(temp_c))
 
 saved = load_saved()
 
@@ -256,12 +288,30 @@ if weather:
     current = float(weather["current"]["temperature_2m"])
     forecast = float(weather["daily"]["temperature_2m_max"][0])
 
-    consensus = (forecast * 0.7) + (current * 0.3)
-    if abs(consensus - forecast) > 2:
-        consensus = forecast - 1
+    noaa_station_id, noaa_obs_temp = fetch_noaa_latest_observation(lat, lon)
 
     st.subheader("Forecast High")
     st.write(round(forecast, 1))
+
+    st.subheader("Current Temperature (Open-Meteo)")
+    st.write(round(current, 1))
+
+    st.subheader("Latest NOAA / NWS Station Observation")
+    if noaa_obs_temp is not None:
+        st.write(f"{round(noaa_obs_temp, 1)} °F")
+        st.caption(f"Nearest NWS observation station: {noaa_station_id}")
+    else:
+        st.write("Unavailable")
+        if noaa_station_id:
+            st.caption(f"Nearest NWS observation station: {noaa_station_id}")
+
+    if noaa_obs_temp is not None:
+        consensus = (forecast * 0.55) + (current * 0.20) + (noaa_obs_temp * 0.25)
+    else:
+        consensus = (forecast * 0.70) + (current * 0.30)
+
+    if abs(consensus - forecast) > 2:
+        consensus = forecast - 1 if consensus < forecast else forecast + 1
 
     st.subheader("Model Consensus High")
     st.write(round(consensus, 1))
