@@ -1,25 +1,29 @@
-# Kalshi High Temperature Model – Stable Station Version (Updated)
-# Fixes:
-# - Settlement station label now covers all cities
-# - Missing station labels show as "Pending verification" instead of N/A
-# - Full city list retained
-# - Permanent ladder saving retained
+# Kalshi High Temperature Model – Version 3
+# Includes:
+# - 6 separate ladder boxes
+# - number-only ladder entry supported
+#   * top box single number => "or below"
+#   * bottom box single number => "or above"
+# - permanent per-city ladder saving
+# - time-of-day sigma tightening
+# - desert-city tightening for Phoenix / Las Vegas
+# - full city list / station labels
 
 import math
 import re
 import json
 from pathlib import Path
+from datetime import datetime
 
 import pandas as pd
 import requests
 import streamlit as st
 
 st.set_page_config(page_title="Kalshi High Temperature Model", layout="wide")
-st.title("Kalshi High Temperature Model – Stable Station Version")
+st.title("Kalshi High Temperature Model – Version 3")
 
 SAVE_FILE = Path("saved_ladders.json")
 
-# Verified where known from prior workflow; others intentionally marked Pending verification
 STATIONS = {
     "Phoenix": "Pending verification",
     "Las Vegas": "Pending verification",
@@ -60,26 +64,6 @@ CITIES = {
     "Washington DC": {"lat": 38.8512, "lon": -77.0402},
 }
 
-CITY_SIGMA = {
-    "New York": 1.5,
-    "Philadelphia": 1.5,
-    "Washington DC": 1.6,
-    "Boston": 1.6,
-    "Los Angeles": 1.4,
-    "Denver": 1.6,
-    "Miami": 1.7,
-    "Minneapolis": 1.7,
-    "New Orleans": 1.8,
-    "Phoenix": 1.9,
-    "Las Vegas": 1.9,
-    "Atlanta": 2.0,
-    "Dallas": 2.0,
-    "Austin": 2.0,
-    "Houston": 2.0,
-    "San Antonio": 2.0,
-    "Oklahoma City": 2.1,
-}
-
 DEFAULT_LADDERS = {
     "Phoenix": "74 or below | 75-76 | 77-78 | 79-80 | 81-82 | 83 or above",
     "Las Vegas": "74 or below | 75-76 | 77-78 | 79-80 | 81-82 | 83 or above",
@@ -99,6 +83,28 @@ DEFAULT_LADDERS = {
     "Minneapolis": "65 or below | 66-67 | 68-69 | 70-71 | 72-73 | 74 or above",
     "Washington DC": "76 or below | 77-78 | 79-80 | 81-82 | 83-84 | 85 or above",
 }
+
+BASE_SIGMA = {
+    "New York": 1.5,
+    "Philadelphia": 1.5,
+    "Washington DC": 1.6,
+    "Boston": 1.6,
+    "Los Angeles": 1.4,
+    "Denver": 1.6,
+    "Miami": 1.7,
+    "Minneapolis": 1.7,
+    "New Orleans": 1.8,
+    "Phoenix": 1.9,
+    "Las Vegas": 1.9,
+    "Atlanta": 2.0,
+    "Dallas": 2.0,
+    "Austin": 2.0,
+    "Houston": 2.0,
+    "San Antonio": 2.0,
+    "Oklahoma City": 2.1,
+}
+
+DESERT_CITIES = {"Phoenix", "Las Vegas"}
 
 def load_saved():
     if SAVE_FILE.exists():
@@ -130,16 +136,69 @@ def parse_ladder(text):
         nums = [int(x) for x in re.findall(r"\d+", p)]
         if not nums:
             continue
-        if "below" in p.lower():
+        low = p.lower()
+        if "below" in low:
             out.append((p, None, nums[0]))
-        elif "above" in p.lower():
+        elif "above" in low:
             out.append((p, nums[0], None))
         elif len(nums) >= 2:
             out.append((p, nums[0], nums[1]))
     return out
 
+def ladder_to_boxes(text):
+    parts = [p.strip() for p in text.split("|")]
+    while len(parts) < 6:
+        parts.append("")
+    return parts[:6]
+
+def normalize_box(text, index):
+    t = text.strip()
+    if not t:
+        return ""
+    nums = [int(x) for x in re.findall(r"\d+", t)]
+    low = t.lower()
+    if "below" in low or "above" in low or "-" in t:
+        return t
+    if len(nums) == 1:
+        n = nums[0]
+        if index == 0:
+            return f"{n} or below"
+        if index == 5:
+            return f"{n} or above"
+        return str(n)
+    return t
+
+def boxes_to_ladder(parts):
+    normalized = [normalize_box(p, i) for i, p in enumerate(parts)]
+    cleaned = [p for p in normalized if p.strip()]
+    return " | ".join(cleaned)
+
+def choose_sigma(city):
+    sigma = BASE_SIGMA.get(city, 1.8)
+    hour = datetime.now().hour
+
+    # Time-of-day tightening
+    if hour < 11:
+        factor = 1.00
+    elif hour < 14:
+        factor = 0.92
+    elif hour < 16:
+        factor = 0.86
+    else:
+        factor = 0.80
+
+    sigma *= factor
+
+    # Desert tightening
+    if city in DESERT_CITIES:
+        sigma *= 0.90
+
+    # keep sensible floor/ceiling
+    sigma = max(1.15, min(2.4, sigma))
+    return sigma
+
 def bracket_probs(mu, ladder_text, city):
-    sigma = CITY_SIGMA.get(city, 1.8)
+    sigma = choose_sigma(city)
     ladder = parse_ladder(ladder_text)
     rows = []
     for lab, lo, hi in ladder:
@@ -151,7 +210,7 @@ def bracket_probs(mu, ladder_text, city):
             p = normal_cdf(hi + 0.5, mu, sigma) - normal_cdf(lo - 0.5, mu, sigma)
         rows.append((lab, max(0.0, min(1.0, p))))
     rows.sort(key=lambda x: x[1], reverse=True)
-    return rows
+    return rows, sigma
 
 saved = load_saved()
 
@@ -164,7 +223,17 @@ st.write("Kalshi Settlement Station:", STATIONS.get(city, "Pending verification"
 if city not in saved:
     saved[city] = DEFAULT_LADDERS.get(city, "70 or below | 71-72 | 73-74 | 75-76 | 77-78 | 79 or above")
 
-ladder_text = st.text_input("Kalshi Ladder", saved[city])
+box_values = ladder_to_boxes(saved[city])
+
+st.subheader("Kalshi Ladder")
+b1 = st.text_input("Box 1", value=box_values[0], key=f"{city}_b1")
+b2 = st.text_input("Box 2", value=box_values[1], key=f"{city}_b2")
+b3 = st.text_input("Box 3", value=box_values[2], key=f"{city}_b3")
+b4 = st.text_input("Box 4", value=box_values[3], key=f"{city}_b4")
+b5 = st.text_input("Box 5", value=box_values[4], key=f"{city}_b5")
+b6 = st.text_input("Box 6", value=box_values[5], key=f"{city}_b6")
+
+ladder_text = boxes_to_ladder([b1, b2, b3, b4, b5, b6])
 
 if st.button("Save Ladder"):
     saved[city] = ladder_text
@@ -187,10 +256,7 @@ if weather:
     current = float(weather["current"]["temperature_2m"])
     forecast = float(weather["daily"]["temperature_2m_max"][0])
 
-    # Stable station-centered estimate
     consensus = (forecast * 0.7) + (current * 0.3)
-
-    # Guardrail against unrealistic drift
     if abs(consensus - forecast) > 2:
         consensus = forecast - 1
 
@@ -200,7 +266,7 @@ if weather:
     st.subheader("Model Consensus High")
     st.write(round(consensus, 1))
 
-    rows = bracket_probs(consensus, ladder_text, city)
+    rows, sigma = bracket_probs(consensus, ladder_text, city)
 
     df = pd.DataFrame(rows, columns=["Bracket", "Probability"])
     df["Probability"] = df["Probability"].apply(lambda x: f"{x*100:.1f}%")
