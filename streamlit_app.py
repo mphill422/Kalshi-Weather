@@ -1,8 +1,7 @@
-# Kalshi High Temperature Model – Version 4
+# Kalshi High Temperature Model – V4.1 Exact Settlement Stations
 # Added:
-# - NOAA / NWS station observation feed
-# - nearest observation station lookup
-# - latest observed station temperature shown in app
+# - Exact settlement station codes for Phoenix, Las Vegas, Dallas, Austin
+# - NOAA observation feed now tries exact configured station first
 # Keeps:
 # - 6 separate ladder boxes
 # - number-only ladder entry
@@ -21,7 +20,7 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="Kalshi High Temperature Model", layout="wide")
-st.title("Kalshi High Temperature Model – Version 4")
+st.title("Kalshi High Temperature Model – V4.1 Exact Settlement Stations")
 
 SAVE_FILE = Path("saved_ladders.json")
 
@@ -31,11 +30,11 @@ HEADERS = {
 }
 
 STATIONS = {
-    "Phoenix": "Pending verification",
-    "Las Vegas": "Pending verification",
+    "Phoenix": "CLIPHX",
+    "Las Vegas": "CLILAS",
     "Los Angeles": "CLILAX",
-    "Dallas": "Pending verification",
-    "Austin": "Pending verification",
+    "Dallas": "CLIDFW",
+    "Austin": "CLIAUS",
     "Houston": "CLIHOU",
     "Atlanta": "CLIATL",
     "Miami": "CLIMIA",
@@ -182,7 +181,6 @@ def boxes_to_ladder(parts):
 def choose_sigma(city):
     sigma = BASE_SIGMA.get(city, 1.8)
     hour = datetime.now().hour
-
     if hour < 11:
         factor = 1.00
     elif hour < 14:
@@ -191,12 +189,9 @@ def choose_sigma(city):
         factor = 0.86
     else:
         factor = 0.80
-
     sigma *= factor
-
     if city in DESERT_CITIES:
         sigma *= 0.90
-
     sigma = max(1.10, min(2.4, sigma))
     return sigma
 
@@ -218,39 +213,39 @@ def bracket_probs(mu, ladder_text, city):
 def c_to_f(c):
     return (c * 9 / 5) + 32
 
-def fetch_noaa_latest_observation(lat, lon):
+def fetch_noaa_latest_observation(lat, lon, exact_station_id=None):
+    if exact_station_id:
+        obs = safe_get(f"https://api.weather.gov/stations/{exact_station_id}/observations/latest", headers=HEADERS)
+        if obs:
+            temp_c = obs.get("properties", {}).get("temperature", {}).get("value")
+            if temp_c is not None:
+                return exact_station_id, float(c_to_f(temp_c))
     points = safe_get(f"https://api.weather.gov/points/{lat},{lon}", headers=HEADERS)
     if not points:
-        return None, None
-
+        return exact_station_id, None
     stations_url = points.get("properties", {}).get("observationStations")
     if not stations_url:
-        return None, None
-
+        return exact_station_id, None
     stations = safe_get(stations_url, headers=HEADERS)
     if not stations or not stations.get("observationStations"):
-        return None, None
-
+        return exact_station_id, None
     station_url = stations["observationStations"][0]
     station_id = station_url.rstrip("/").split("/")[-1]
-
     obs = safe_get(f"{station_url}/observations/latest", headers=HEADERS)
     if not obs:
         return station_id, None
-
     temp_c = obs.get("properties", {}).get("temperature", {}).get("value")
     if temp_c is None:
         return station_id, None
-
     return station_id, float(c_to_f(temp_c))
 
 saved = load_saved()
-
 city = st.selectbox("City", list(CITIES.keys()))
 lat = CITIES[city]["lat"]
 lon = CITIES[city]["lon"]
+exact_station = STATIONS.get(city)
 
-st.write("Kalshi Settlement Station:", STATIONS.get(city, "Pending verification"))
+st.write("Kalshi Settlement Station:", exact_station if exact_station else "Pending verification")
 
 if city not in saved:
     saved[city] = DEFAULT_LADDERS.get(city, "70 or below | 71-72 | 73-74 | 75-76 | 77-78 | 79 or above")
@@ -287,8 +282,7 @@ weather = safe_get(
 if weather:
     current = float(weather["current"]["temperature_2m"])
     forecast = float(weather["daily"]["temperature_2m_max"][0])
-
-    noaa_station_id, noaa_obs_temp = fetch_noaa_latest_observation(lat, lon)
+    noaa_station_id, noaa_obs_temp = fetch_noaa_latest_observation(lat, lon, exact_station_id=exact_station)
 
     st.subheader("Forecast High")
     st.write(round(forecast, 1))
@@ -299,11 +293,11 @@ if weather:
     st.subheader("Latest NOAA / NWS Station Observation")
     if noaa_obs_temp is not None:
         st.write(f"{round(noaa_obs_temp, 1)} °F")
-        st.caption(f"Nearest NWS observation station: {noaa_station_id}")
+        st.caption(f"Observation station used: {noaa_station_id}")
     else:
         st.write("Unavailable")
         if noaa_station_id:
-            st.caption(f"Nearest NWS observation station: {noaa_station_id}")
+            st.caption(f"Observation station attempted: {noaa_station_id}")
 
     if noaa_obs_temp is not None:
         consensus = (forecast * 0.55) + (current * 0.20) + (noaa_obs_temp * 0.25)
@@ -317,7 +311,6 @@ if weather:
     st.write(round(consensus, 1))
 
     rows, sigma = bracket_probs(consensus, ladder_text, city)
-
     df = pd.DataFrame(rows, columns=["Bracket", "Probability"])
     df["Probability"] = df["Probability"].apply(lambda x: f"{x*100:.1f}%")
 
