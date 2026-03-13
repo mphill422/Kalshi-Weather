@@ -1,8 +1,9 @@
-# Kalshi High Temperature Model – V4.3 Clean Workflow
+# Kalshi High Temperature Model – V4.4 Trading View
 # Changes:
-# - Removed manual Kalshi YES Odds section
-# - Removed Market vs Model Edge table
-# - Keeps exact settlement stations, NOAA observations, ladder boxes, and model probabilities
+# - Keeps manual Kalshi ladder entry
+# - Adds a "Model 2-Degree Call" so the nearest 2-degree range is obvious
+# - Keeps true bracket probabilities unchanged (does NOT fake them)
+# - Widens uncertainty early in the day to avoid unrealistic 99% confidence
 
 import math
 import re
@@ -15,7 +16,7 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="Kalshi High Temperature Model", layout="wide")
-st.title("Kalshi High Temperature Model – V4.3 Clean Workflow")
+st.title("Kalshi High Temperature Model – V4.4 Trading View")
 
 SAVE_FILE = Path("saved_ladders.json")
 
@@ -85,23 +86,23 @@ DEFAULT_LADDERS = {
 }
 
 BASE_SIGMA = {
-    "New York": 1.5,
-    "Philadelphia": 1.5,
-    "Washington DC": 1.6,
-    "Boston": 1.6,
-    "Los Angeles": 1.4,
-    "Denver": 1.6,
-    "Miami": 1.7,
-    "Minneapolis": 1.7,
-    "New Orleans": 1.8,
-    "Phoenix": 1.9,
-    "Las Vegas": 1.9,
-    "Atlanta": 2.0,
-    "Dallas": 2.0,
-    "Austin": 2.0,
-    "Houston": 2.0,
-    "San Antonio": 2.0,
-    "Oklahoma City": 2.1,
+    "New York": 2.4,
+    "Philadelphia": 2.3,
+    "Washington DC": 2.3,
+    "Boston": 2.2,
+    "Los Angeles": 1.8,
+    "Denver": 2.2,
+    "Miami": 2.6,
+    "Minneapolis": 2.3,
+    "New Orleans": 2.6,
+    "Phoenix": 2.1,
+    "Las Vegas": 2.1,
+    "Atlanta": 2.6,
+    "Dallas": 2.7,
+    "Austin": 2.7,
+    "Houston": 2.8,
+    "San Antonio": 2.8,
+    "Oklahoma City": 2.7,
 }
 
 DESERT_CITIES = {"Phoenix", "Las Vegas"}
@@ -174,20 +175,20 @@ def boxes_to_ladder(parts):
     return " | ".join(cleaned)
 
 def choose_sigma(city):
-    sigma = BASE_SIGMA.get(city, 1.8)
+    sigma = BASE_SIGMA.get(city, 2.4)
     hour = datetime.now().hour
     if hour < 11:
-        factor = 1.00
+        factor = 1.10
     elif hour < 14:
-        factor = 0.92
+        factor = 1.00
     elif hour < 16:
-        factor = 0.86
+        factor = 0.92
     else:
-        factor = 0.80
+        factor = 0.85
     sigma *= factor
     if city in DESERT_CITIES:
-        sigma *= 0.90
-    return max(1.10, min(2.4, sigma))
+        sigma *= 0.92
+    return max(1.8, min(3.2, sigma))
 
 def bracket_probs(mu, ladder_text, city):
     sigma = choose_sigma(city)
@@ -202,7 +203,19 @@ def bracket_probs(mu, ladder_text, city):
             p = normal_cdf(hi + 0.5, mu, sigma) - normal_cdf(lo - 0.5, mu, sigma)
         rows.append((lab, max(0.0, min(1.0, p))))
     rows.sort(key=lambda x: x[1], reverse=True)
-    return rows
+    return rows, sigma
+
+def central_two_degree_call(mu, ladder_text):
+    ladder = parse_ladder(ladder_text)
+    interior = []
+    for lab, lo, hi in ladder:
+        if lo is not None and hi is not None:
+            center = (lo + hi) / 2
+            interior.append((lab, center))
+    if not interior:
+        return None
+    best = min(interior, key=lambda x: abs(x[1] - mu))
+    return best[0]
 
 def c_to_f(c):
     return (c * 9 / 5) + 32
@@ -305,9 +318,15 @@ if weather:
     st.subheader("Model Consensus High")
     st.write(round(consensus, 1))
 
-    rows = bracket_probs(consensus, ladder_text, city)
+    call = central_two_degree_call(consensus, ladder_text)
+    if call:
+        st.subheader("Model 2-Degree Call")
+        st.write(call)
+
+    rows, sigma = bracket_probs(consensus, ladder_text, city)
     df = pd.DataFrame(rows, columns=["Bracket", "Model Probability"])
     df["Model Probability %"] = df["Model Probability"].apply(lambda x: f"{x*100:.1f}%")
+    st.caption(f"Model sigma used: {sigma:.2f}")
     st.subheader("Kalshi Bracket Probabilities")
     st.dataframe(df[["Bracket", "Model Probability %"]], use_container_width=True)
 else:
