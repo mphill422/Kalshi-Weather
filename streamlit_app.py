@@ -1,16 +1,8 @@
-# Kalshi High Temperature Model – V4.2 Edge View
-# Added:
-# - Manual market odds inputs for each of the 6 ladder boxes
-# - Market implied probability
-# - Model probability
-# - Edge %
-# Keeps:
-# - exact settlement stations
-# - NOAA observation feed
-# - 6 separate ladder boxes
-# - permanent per-city ladder saving
-# - time-of-day sigma tightening
-# - desert-city tightening
+# Kalshi High Temperature Model – V4.3 Clean Workflow
+# Changes:
+# - Removed manual Kalshi YES Odds section
+# - Removed Market vs Model Edge table
+# - Keeps exact settlement stations, NOAA observations, ladder boxes, and model probabilities
 
 import math
 import re
@@ -23,10 +15,9 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="Kalshi High Temperature Model", layout="wide")
-st.title("Kalshi High Temperature Model – V4.2 Edge View")
+st.title("Kalshi High Temperature Model – V4.3 Clean Workflow")
 
 SAVE_FILE = Path("saved_ladders.json")
-ODDS_FILE = Path("saved_market_odds.json")
 
 HEADERS = {
     "User-Agent": "kalshi-temp-model/1.0",
@@ -211,7 +202,7 @@ def bracket_probs(mu, ladder_text, city):
             p = normal_cdf(hi + 0.5, mu, sigma) - normal_cdf(lo - 0.5, mu, sigma)
         rows.append((lab, max(0.0, min(1.0, p))))
     rows.sort(key=lambda x: x[1], reverse=True)
-    return rows, sigma
+    return rows
 
 def c_to_f(c):
     return (c * 9 / 5) + 32
@@ -242,23 +233,7 @@ def fetch_noaa_latest_observation(lat, lon, exact_station_id=None):
         return station_id, None
     return station_id, float(c_to_f(temp_c))
 
-def american_to_implied_prob(odds_text):
-    t = str(odds_text).strip().replace("−", "-")
-    if t == "":
-        return None
-    t = t.replace("+", "")
-    try:
-        odds = int(t)
-    except Exception:
-        return None
-    if odds > 0:
-        return 100 / (odds + 100)
-    if odds < 0:
-        return abs(odds) / (abs(odds) + 100)
-    return None
-
 saved_ladders = load_json(SAVE_FILE)
-saved_odds = load_json(ODDS_FILE)
 
 city = st.selectbox("City", list(CITIES.keys()))
 lat = CITIES[city]["lat"]
@@ -269,13 +244,8 @@ st.write("Kalshi Settlement Station:", exact_station)
 
 if city not in saved_ladders:
     saved_ladders[city] = DEFAULT_LADDERS.get(city, "70 or below | 71-72 | 73-74 | 75-76 | 77-78 | 79 or above")
-if city not in saved_odds:
-    saved_odds[city] = ["", "", "", "", "", ""]
 
 box_values = ladder_to_boxes(saved_ladders[city])
-odds_values = saved_odds[city]
-while len(odds_values) < 6:
-    odds_values.append("")
 
 st.subheader("Kalshi Ladder")
 b1 = st.text_input("Box 1", value=box_values[0], key=f"{city}_b1")
@@ -284,21 +254,12 @@ b3 = st.text_input("Box 3", value=box_values[2], key=f"{city}_b3")
 b4 = st.text_input("Box 4", value=box_values[3], key=f"{city}_b4")
 b5 = st.text_input("Box 5", value=box_values[4], key=f"{city}_b5")
 b6 = st.text_input("Box 6", value=box_values[5], key=f"{city}_b6")
+
 ladder_text = boxes_to_ladder([b1, b2, b3, b4, b5, b6])
 
-st.subheader("Kalshi YES Odds (manual entry)")
-o1 = st.text_input("Odds 1", value=odds_values[0], key=f"{city}_o1", placeholder="-150 or +212")
-o2 = st.text_input("Odds 2", value=odds_values[1], key=f"{city}_o2", placeholder="-150 or +212")
-o3 = st.text_input("Odds 3", value=odds_values[2], key=f"{city}_o3", placeholder="-150 or +212")
-o4 = st.text_input("Odds 4", value=odds_values[3], key=f"{city}_o4", placeholder="-150 or +212")
-o5 = st.text_input("Odds 5", value=odds_values[4], key=f"{city}_o5", placeholder="-150 or +212")
-o6 = st.text_input("Odds 6", value=odds_values[5], key=f"{city}_o6", placeholder="-150 or +212")
-
-if st.button("Save Ladder + Odds"):
+if st.button("Save Ladder"):
     saved_ladders[city] = ladder_text
-    saved_odds[city] = [o1, o2, o3, o4, o5, o6]
     save_json(SAVE_FILE, saved_ladders)
-    save_json(ODDS_FILE, saved_odds)
     st.success("Saved")
 
 weather = safe_get(
@@ -344,40 +305,10 @@ if weather:
     st.subheader("Model Consensus High")
     st.write(round(consensus, 1))
 
-    rows, sigma = bracket_probs(consensus, ladder_text, city)
-
+    rows = bracket_probs(consensus, ladder_text, city)
     df = pd.DataFrame(rows, columns=["Bracket", "Model Probability"])
-    df["Model Probability %"] = df["Model Probability"].apply(lambda x: round(x * 100, 1))
-
+    df["Model Probability %"] = df["Model Probability"].apply(lambda x: f"{x*100:.1f}%")
     st.subheader("Kalshi Bracket Probabilities")
-    show_df = df[["Bracket", "Model Probability %"]].copy()
-    show_df["Model Probability %"] = show_df["Model Probability %"].apply(lambda x: f"{x:.1f}%")
-    st.dataframe(show_df, use_container_width=True)
-
-    ladder_labels_in_order = [normalize_box(x, i) for i, x in enumerate([b1, b2, b3, b4, b5, b6])]
-    model_map = {lab: prob for lab, prob in rows}
-
-    edge_rows = []
-    for idx, (lab, odd) in enumerate(zip(ladder_labels_in_order, [o1, o2, o3, o4, o5, o6]), start=1):
-        model_prob = model_map.get(lab)
-        market_prob = american_to_implied_prob(odd)
-        edge = None
-        if model_prob is not None and market_prob is not None:
-            edge = (model_prob - market_prob) * 100
-        edge_rows.append({
-            "Box": idx,
-            "Bracket": lab,
-            "YES Odds": odd,
-            "Market Implied %": None if market_prob is None else round(market_prob * 100, 1),
-            "Model %": None if model_prob is None else round(model_prob * 100, 1),
-            "Edge %": None if edge is None else round(edge, 1),
-        })
-
-    edge_df = pd.DataFrame(edge_rows)
-    for col in ["Market Implied %", "Model %", "Edge %"]:
-        edge_df[col] = edge_df[col].apply(lambda x: "" if x is None else f"{x:.1f}%")
-
-    st.subheader("Market vs Model Edge")
-    st.dataframe(edge_df, use_container_width=True)
+    st.dataframe(df[["Bracket", "Model Probability %"]], use_container_width=True)
 else:
     st.error("Weather data unavailable")
