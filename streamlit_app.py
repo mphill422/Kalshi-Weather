@@ -1,9 +1,7 @@
-# Kalshi High Temperature Model – V4.4 Trading View
-# Changes:
-# - Keeps manual Kalshi ladder entry
-# - Adds a "Model 2-Degree Call" so the nearest 2-degree range is obvious
-# - Keeps true bracket probabilities unchanged (does NOT fake them)
-# - Widens uncertainty early in the day to avoid unrealistic 99% confidence
+# Kalshi High Temperature Model – V4.5 Targeted Fix
+# Minimal changes from V4.4:
+# 1) Late-day forecast anchor so consensus stops running too cold
+# 2) Stronger sigma tightening after 3 PM so probabilities are less flat
 
 import math
 import re
@@ -16,7 +14,7 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="Kalshi High Temperature Model", layout="wide")
-st.title("Kalshi High Temperature Model – V4.4 Trading View")
+st.title("Kalshi High Temperature Model – V4.5 Targeted Fix")
 
 SAVE_FILE = Path("saved_ladders.json")
 
@@ -178,17 +176,17 @@ def choose_sigma(city):
     sigma = BASE_SIGMA.get(city, 2.4)
     hour = datetime.now().hour
     if hour < 11:
-        factor = 1.10
+        factor = 1.05
     elif hour < 14:
-        factor = 1.00
+        factor = 0.95
     elif hour < 16:
-        factor = 0.92
+        factor = 0.78
     else:
-        factor = 0.85
+        factor = 0.62
     sigma *= factor
     if city in DESERT_CITIES:
-        sigma *= 0.92
-    return max(1.8, min(3.2, sigma))
+        sigma *= 0.95
+    return max(1.15, min(3.0, sigma))
 
 def bracket_probs(mu, ladder_text, city):
     sigma = choose_sigma(city)
@@ -246,6 +244,30 @@ def fetch_noaa_latest_observation(lat, lon, exact_station_id=None):
         return station_id, None
     return station_id, float(c_to_f(temp_c))
 
+def remaining_heat_floor(hour, forecast, current_obs):
+    gap = max(0.0, forecast - current_obs)
+    if hour < 12:
+        frac = 0.45
+    elif hour < 14:
+        frac = 0.62
+    elif hour < 16:
+        frac = 0.78
+    else:
+        frac = 0.90
+    return current_obs + frac * gap
+
+def build_consensus(forecast, current_openmeteo, noaa_obs, hour):
+    if noaa_obs is not None:
+        base = (forecast * 0.60) + (current_openmeteo * 0.12) + (noaa_obs * 0.28)
+        floor = remaining_heat_floor(hour, forecast, noaa_obs)
+    else:
+        base = (forecast * 0.72) + (current_openmeteo * 0.28)
+        floor = remaining_heat_floor(hour, forecast, current_openmeteo)
+    consensus = max(base, floor)
+    if consensus > forecast + 0.6:
+        consensus = forecast + 0.6
+    return consensus
+
 saved_ladders = load_json(SAVE_FILE)
 
 city = st.selectbox("City", list(CITIES.keys()))
@@ -291,6 +313,7 @@ if weather:
     current = float(weather["current"]["temperature_2m"])
     forecast = float(weather["daily"]["temperature_2m_max"][0])
     noaa_station_id, noaa_obs_temp = fetch_noaa_latest_observation(lat, lon, exact_station_id=exact_station)
+    hour = datetime.now().hour
 
     st.subheader("Forecast High")
     st.write(round(forecast, 1))
@@ -307,13 +330,10 @@ if weather:
         if noaa_station_id:
             st.caption(f"Observation station attempted: {noaa_station_id}")
 
-    if noaa_obs_temp is not None:
-        consensus = (forecast * 0.55) + (current * 0.20) + (noaa_obs_temp * 0.25)
-    else:
-        consensus = (forecast * 0.70) + (current * 0.30)
+    anchor_obs = noaa_obs_temp if noaa_obs_temp is not None else current
+    st.caption(f"Late-day forecast anchor floor: {remaining_heat_floor(hour, forecast, anchor_obs):.1f}")
 
-    if abs(consensus - forecast) > 2:
-        consensus = forecast - 1 if consensus < forecast else forecast + 1
+    consensus = build_consensus(forecast, current, noaa_obs_temp, hour)
 
     st.subheader("Model Consensus High")
     st.write(round(consensus, 1))
