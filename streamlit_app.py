@@ -1,8 +1,6 @@
-# Kalshi High Temperature Model – V4.3
+# Kalshi High Temperature Model - V4.3
 
-# Clean port of the Claude artifact version into Streamlit
-
-# - Lean sigma values (not inflated like V4.5)
+# - Lean sigma values (not inflated)
 
 # - V4.3 consensus formula with late-day floor
 
@@ -22,10 +20,8 @@ import streamlit as st
 from pathlib import Path
 from datetime import datetime
 
-st.set_page_config(page_title="Kalshi High Temp V4.3", layout"wide")
-st.title(“Kalshi High Temperature Model – V4.3”)
-
-# ── Constants ─────────────────────────────────────────────────────────────────
+st.set_page_config(page_title=“Kalshi High Temp V4.3”, layout=“wide”)
+st.title(“Kalshi High Temperature Model - V4.3”)
 
 SAVE_FILE = Path(“saved_ladders.json”)
 HISTORY_FILE = Path(“settlement_history.json”)
@@ -113,8 +109,6 @@ DEFAULT_LADDERS = {
 “Washington DC”: “76 or below | 77-78 | 79-80 | 81-82 | 83-84 | 85 or above”,
 }
 
-# V4.3 lean sigma — not inflated
-
 BASE_SIGMA = {
 “New York”: 1.5, “Philadelphia”: 1.5, “Washington DC”: 1.6, “Boston”: 1.6,
 “Los Angeles”: 1.4, “Denver”: 1.6, “Miami”: 1.7, “Minneapolis”: 1.7,
@@ -124,8 +118,6 @@ BASE_SIGMA = {
 }
 
 DESERT_CITIES = {“Phoenix”, “Las Vegas”}
-
-# ── Math ──────────────────────────────────────────────────────────────────────
 
 def normal_cdf(x, mu, sigma):
 return 0.5 * (1 + math.erf((x - mu) / (sigma * math.sqrt(2))))
@@ -148,14 +140,11 @@ if noaa is not None:
 base = fc * 0.55 + cur * 0.20 + noaa * 0.25
 else:
 base = fc * 0.70 + cur * 0.30
-# Cap divergence from forecast
 if abs(base - fc) > 2:
 base = fc - 1 if base < fc else fc + 1
-# Late-day floor
 obs = noaa if noaa is not None else cur
 floor = late_day_floor(fc, obs, hour)
 consensus = max(base, floor)
-# Never exceed forecast by more than 0.6°F
 if consensus > fc + 0.6:
 consensus = fc + 0.6
 return consensus
@@ -221,16 +210,14 @@ cleaned.append(t)
 elif len(nums) == 1:
 n = int(nums[0])
 if i == 0:
-cleaned.append(f”{n} or below”)
+cleaned.append(str(n) + “ or below”)
 elif i == 5:
-cleaned.append(f”{n} or above”)
+cleaned.append(str(n) + “ or above”)
 else:
 cleaned.append(str(n))
 else:
 cleaned.append(t)
 return “ | “.join(cleaned)
-
-# ── Data persistence ──────────────────────────────────────────────────────────
 
 def load_json(path):
 if path.exists():
@@ -242,8 +229,6 @@ return {}
 
 def save_json(path, data):
 path.write_text(json.dumps(data, indent=2))
-
-# ── API helpers ───────────────────────────────────────────────────────────────
 
 def safe_get(url, params=None):
 try:
@@ -276,15 +261,13 @@ return (float(fc) if fc is not None else None,
 float(cur) if cur is not None else None)
 
 def fetch_noaa(lat, lon, station_id):
-# Try exact station first
 if station_id:
-obs = safe_get(f”https://api.weather.gov/stations/{station_id}/observations/latest”)
+obs = safe_get(“https://api.weather.gov/stations/” + station_id + “/observations/latest”)
 if obs:
 temp_c = obs.get(“properties”, {}).get(“temperature”, {}).get(“value”)
 if temp_c is not None:
 return station_id, float(c_to_f(temp_c))
-# Fallback via points API
-points = safe_get(f”https://api.weather.gov/points/{lat},{lon}”)
+points = safe_get(“https://api.weather.gov/points/” + str(lat) + “,” + str(lon))
 if not points:
 return station_id, None
 stations_url = points.get(“properties”, {}).get(“observationStations”)
@@ -295,7 +278,7 @@ if not stations or not stations.get(“observationStations”):
 return station_id, None
 first = stations[“observationStations”][0]
 sid = first.rstrip(”/”).split(”/”)[-1]
-obs = safe_get(f”{first}/observations/latest”)
+obs = safe_get(first + “/observations/latest”)
 if not obs:
 return sid, None
 temp_c = obs.get(“properties”, {}).get(“temperature”, {}).get(“value”)
@@ -304,7 +287,7 @@ return sid, None
 return sid, float(c_to_f(temp_c))
 
 def fetch_kalshi_brackets(series):
-url = f”https://api.elections.kalshi.com/trade-api/v2/markets”
+url = “https://api.elections.kalshi.com/trade-api/v2/markets”
 params = {“series_ticker”: series, “status”: “open”, “limit”: 30}
 data = safe_get(url, params)
 if not data or not data.get(“markets”):
@@ -312,18 +295,18 @@ return None
 markets = data[“markets”]
 parsed = []
 for m in markets:
-s = (m.get(“subtitle”) or “”).replace(“°”, “”).strip()
+s = (m.get(“subtitle”) or “”).replace(“deg”, “”).replace(”\u00b0”, “”).strip()
 below = re.match(r”^(\d+)\s*or\s*below$”, s, re.I)
 above = re.match(r”^(\d+)\s*or\s*above$”, s, re.I)
-rng   = re.match(r”^(\d+)\s*to\s*(\d+)$”, s, re.I)
+rng = re.match(r”^(\d+)\s*to\s*(\d+)$”, s, re.I)
 if below:
-label = f”{below.group(1)} or below”
+label = below.group(1) + “ or below”
 key = int(below.group(1)) - 10000
 elif above:
-label = f”{above.group(1)} or above”
+label = above.group(1) + “ or above”
 key = int(above.group(1)) + 10000
 elif rng:
-label = f”{rng.group(1)}-{rng.group(2)}”
+label = rng.group(1) + “-” + rng.group(2)
 key = int(rng.group(1))
 else:
 continue
@@ -333,7 +316,7 @@ return None
 parsed.sort(key=lambda x: x[0])
 return [(label, yes_ask, no_ask) for _, label, yes_ask, no_ask in parsed]
 
-# ── App ───────────────────────────────────────────────────────────────────────
+# App
 
 saved_ladders = load_json(SAVE_FILE)
 history = load_json(HISTORY_FILE)
@@ -341,20 +324,18 @@ if not isinstance(history, list):
 history = []
 
 city = st.selectbox(“City”, list(CITIES.keys()))
-lat  = CITIES[city][“lat”]
-lon  = CITIES[city][“lon”]
+lat = CITIES[city][“lat”]
+lon = CITIES[city][“lon”]
 station = STATIONS[city]
-series  = SERIES[city]
+series = SERIES[city]
 
-st.caption(f”Settlement: **{STATIONS[city]}** · {SETTLEMENT_LOCATION[city]} · Series: {series}”)
-
-# ── Kalshi Ladder ─────────────────────────────────────────────────────────────
+st.caption(“Settlement: “ + STATIONS[city] + “ - “ + SETTLEMENT_LOCATION[city] + “ - Series: “ + series)
 
 st.subheader(“Kalshi Ladder”)
 
 col_fetch, col_status = st.columns([2, 3])
 with col_fetch:
-fetch_brackets = st.button(“⬇ Fetch Live Brackets from Kalshi”)
+fetch_brackets = st.button(“Fetch Live Brackets from Kalshi”)
 
 kalshi_markets = None
 if fetch_brackets:
@@ -366,7 +347,7 @@ while len(labels) < 6:
 labels.append(””)
 saved_ladders[city] = “ | “.join(labels[:6])
 save_json(SAVE_FILE, saved_ladders)
-st.success(f”✓ Loaded {len(kalshi_markets)} brackets from Kalshi”)
+st.success(“Loaded “ + str(len(kalshi_markets)) + “ brackets from Kalshi”)
 else:
 st.warning(“Could not fetch from Kalshi API. Edit brackets manually below.”)
 
@@ -380,7 +361,7 @@ cols = st.columns(6)
 new_boxes = []
 for i, col in enumerate(cols):
 with col:
-new_boxes.append(st.text_input(f”Box {i+1}”, value=box_values[i], key=f”{city}_b{i}”))
+new_boxes.append(st.text_input(“Box “ + str(i + 1), value=box_values[i], key=city + “_b” + str(i)))
 if st.button(“Save Ladder”):
 ladder_text = boxes_to_ladder(new_boxes)
 saved_ladders[city] = ladder_text
@@ -389,9 +370,7 @@ st.success(“Saved”)
 st.rerun()
 
 ladder_text = saved_ladders[city]
-st.caption(f”Current ladder: `{ladder_text}`”)
-
-# ── Weather ───────────────────────────────────────────────────────────────────
+st.caption(“Current ladder: “ + ladder_text)
 
 st.subheader(“Live Weather”)
 
@@ -403,17 +382,15 @@ hour = datetime.now().hour
 
 col1, col2, col3 = st.columns(3)
 with col1:
-st.metric(“Forecast High”, f”{forecast:.1f} °F” if forecast else “—”)
+st.metric(“Forecast High”, str(round(forecast, 1)) + “ F” if forecast else “unavailable”)
 with col2:
-st.metric(“Current Temp (Open-Meteo)”, f”{current:.1f} °F” if current else “—”)
+st.metric(“Current Temp”, str(round(current, 1)) + “ F” if current else “unavailable”)
 with col3:
 if noaa_obs is not None:
-st.metric(“NOAA Obs”, f”{noaa_obs:.1f} °F”)
-st.caption(f”Station: {noaa_station}”)
+st.metric(“NOAA Obs”, str(round(noaa_obs, 1)) + “ F”)
+st.caption(“Station: “ + noaa_station)
 else:
 st.metric(“NOAA Obs”, “Unavailable”)
-
-# ── Model ─────────────────────────────────────────────────────────────────────
 
 if forecast is not None and current is not None:
 consensus = compute_consensus(forecast, current, noaa_obs, hour)
@@ -425,55 +402,50 @@ st.subheader("Model Output")
 
 c1, c2, c3 = st.columns(3)
 with c1:
-    st.metric("Consensus High", f"{consensus:.1f} °F")
+    st.metric("Consensus High", str(round(consensus, 1)) + " F")
 with c2:
-    st.metric("2° Call", call or "—")
+    st.metric("2 Degree Call", call or "none")
 with c3:
-    st.metric("Sigma", f"{sigma:.2f}°F")
+    st.metric("Sigma", str(round(sigma, 2)) + " F")
 
-st.caption(f"Time: {hour}:00 local · Late-day floor active")
+st.caption("Time: " + str(hour) + ":00 local - Late-day floor active")
 
-# Build results table
 import pandas as pd
 df_rows = []
 for label, prob in rows:
     fair = round(prob * 100)
-    # Match with Kalshi market if available
     yes_ask = no_ask = None
     if kalshi_markets:
         match = next((m for m in kalshi_markets if m[0] == label), None)
         if match:
             yes_ask = match[1]
-            no_ask  = match[2]
+            no_ask = match[2]
     edge = (fair - yes_ask) if yes_ask is not None else None
     df_rows.append({
         "Bracket": label,
-        "Model %": f"{prob*100:.1f}%",
-        "Fair ¢": f"{fair}¢",
-        "YES ask": f"{yes_ask}¢" if yes_ask else "—",
-        "NO ask":  f"{no_ask}¢"  if no_ask  else "—",
-        "Edge":    f"+{edge}¢" if edge and edge > 0 else (f"{edge}¢" if edge is not None else "—"),
+        "Model %": str(round(prob * 100, 1)) + "%",
+        "Fair": str(fair) + "c",
+        "YES ask": str(yes_ask) + "c" if yes_ask else "none",
+        "NO ask": str(no_ask) + "c" if no_ask else "none",
+        "Edge": ("+" + str(edge) + "c") if edge and edge > 0 else (str(edge) + "c" if edge is not None else "none"),
     })
 
 df = pd.DataFrame(df_rows)
 st.dataframe(df, use_container_width=True, hide_index=True)
 
-# Mismatch warning
 parsed = parse_ladder(ladder_text)
 top_b = next((b for b in parsed if b[2] is None), None)
 bot_b = next((b for b in parsed if b[1] is None), None)
 if (top_b and consensus > top_b[1] + 5) or (bot_b and consensus < bot_b[2] - 5):
-    st.warning(f"⚠️ Ladder doesn't cover consensus of {consensus:.1f}°F — update brackets.")
+    st.warning("Ladder does not cover consensus of " + str(round(consensus, 1)) + " F - update brackets.")
 ```
 
 else:
 st.error(“Weather data unavailable. Check your internet connection.”)
 
-# ── Settlement Logger ─────────────────────────────────────────────────────────
-
 st.subheader(“Log Actual High (after settlement)”)
 with st.form(“log_form”):
-actual = st.number_input(“Actual NWS High °F”, min_value=0.0, max_value=130.0, step=0.1)
+actual = st.number_input(“Actual NWS High F”, min_value=0.0, max_value=130.0, step=0.1)
 submitted = st.form_submit_button(“Log Settlement”)
 if submitted and forecast is not None:
 entry = {
@@ -481,14 +453,12 @@ entry = {
 “city”: city,
 “actual”: actual,
 “forecast”: round(forecast, 1),
-“consensus”: round(consensus, 1) if forecast else None,
-“error”: round(actual - consensus, 1) if forecast else None,
+“consensus”: round(consensus, 1),
+“error”: round(actual - consensus, 1),
 }
 history.append(entry)
 save_json(HISTORY_FILE, history[-300:])
-st.success(f”Logged: actual={actual}°F, consensus={consensus:.1f}°F, error={entry[‘error’]}°F”)
-
-# ── History ───────────────────────────────────────────────────────────────────
+st.success(“Logged - actual=” + str(actual) + “F  consensus=” + str(round(consensus, 1)) + “F  error=” + str(entry[“error”]) + “F”)
 
 if history:
 st.subheader(“Settlement History”)
@@ -497,9 +467,12 @@ df_h = pd.DataFrame(history[-50:][::-1])
 wd = [h for h in history if h.get(“consensus”) and h.get(“actual”)]
 if wd:
 mae = sum(abs(h[“actual”] - h[“consensus”]) for h in wd) / len(wd)
-w1  = sum(1 for h in wd if abs(h[“actual”] - h[“consensus”]) <= 1) / len(wd)
+w1 = sum(1 for h in wd if abs(h[“actual”] - h[“consensus”]) <= 1) / len(wd)
 hc1, hc2, hc3 = st.columns(3)
-with hc1: st.metric(“Records”, len(history))
-with hc2: st.metric(“Model MAE”, f”{mae:.2f}°F”)
-with hc3: st.metric(“Within 1°F”, f”{w1*100:.0f}%”)
+with hc1:
+st.metric(“Records”, len(history))
+with hc2:
+st.metric(“Model MAE”, str(round(mae, 2)) + “ F”)
+with hc3:
+st.metric(“Within 1 degree”, str(round(w1 * 100, 0)) + “%”)
 st.dataframe(df_h, use_container_width=True, hide_index=True)
