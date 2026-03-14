@@ -22,7 +22,7 @@ import streamlit as st
 from pathlib import Path
 from datetime import datetime
 
-st.set_page_config(page_title=“Kalshi High Temp V4.3”, layout=“wide”)
+st.set_page_config(page_title="Kalshi High Temp V4.3", layout"wide")
 st.title(“Kalshi High Temperature Model – V4.3”)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
