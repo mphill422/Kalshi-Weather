@@ -1,17 +1,10 @@
-# Kalshi High Temperature Model - V4.14
-
-# New in V4.13:
-# - GFS 31-member ensemble forecasts from Open-Meteo
-#   Counts how many of 31 model runs agree on temperature outcome
-#   Ensemble probability blended with sigma model for final signal
-# - Kelly Criterion position sizing (15% fractional Kelly)
-#   kelly = (win_prob * odds - lose_prob) / odds
-#   Capped at 5% of bankroll and $100 per trade
-# - 8-cent minimum edge threshold
-#   Green = strong edge (bet), Yellow = weak (skip), Red = no edge (avoid)
-# - Bankroll input in sidebar powers all Kelly recommendations
-# - Ensemble confidence label per bracket
-# - All V4.12 features retained
+# Kalshi High Temperature Model - V4.15
+#
+# Changes from V4.14:
+# 1. Ensemble weight raised to 65-70% (from 30-55%)
+# 2. Removed fc+0.6 hard consensus cap (was preventing ensemble from correcting cold bias)
+# 3. Wider sigma values (base increased ~15%, less overconfident on narrow brackets)
+# 4. Rolling bias correction from settlement history (city-level mean error applied to consensus)
 
 import math, re, json, time, requests
 import streamlit as st
@@ -20,17 +13,17 @@ from pathlib import Path
 from datetime import datetime
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.14', layout='wide')
-st.title('Kalshi High Temperature Model - V4.14')
+st.set_page_config(page_title='Kalshi High Temp V4.15', layout='wide')
+st.title('Kalshi High Temperature Model - V4.15')
 
 SAVE_FILE = Path('saved_ladders.json')
 HISTORY_FILE = Path('settlement_history.json')
 LAST_SYNC_FILE = Path('last_sync.json')
 PRICE_CACHE_FILE = Path('price_cache.json')
 PRICE_CACHE_MINUTES = 10
-MIN_EDGE = 8
 
-HEADERS = {'User-Agent': 'kalshi-temp-model/4.14', 'Accept': 'application/geo+json, application/json, text/html'}
+MIN_EDGE = 8
+HEADERS = {'User-Agent': 'kalshi-temp-model/4.15', 'Accept': 'application/geo+json, application/json, text/html'}
 
 CITY_TZ = {
     'Phoenix': 'America/Phoenix',
@@ -126,18 +119,40 @@ DEFAULT_LADDERS = {
     'Washington DC': '76 or below | 77-78 | 79-80 | 81-82 | 83-84 | 85 or above',
 }
 
+# FIX 3: Wider base sigma values (~15% increase across the board)
+# Prevents overconfidence on narrow brackets, especially in transitional weather
 BASE_SIGMA = {
-    'New York': 1.5, 'Philadelphia': 1.5, 'Washington DC': 1.6, 'Boston': 1.6,
-    'Los Angeles': 1.4, 'Denver': 1.6, 'Miami': 1.7, 'Minneapolis': 1.7,
-    'New Orleans': 1.8, 'Phoenix': 1.9, 'Las Vegas': 1.9, 'Atlanta': 2.0,
-    'Dallas': 2.0, 'Austin': 2.0, 'Houston': 2.0, 'San Antonio': 2.0, 'Oklahoma City': 2.1,
+    'New York': 1.8, 'Philadelphia': 1.8, 'Washington DC': 1.9, 'Boston': 1.9,
+    'Los Angeles': 1.7, 'Denver': 1.9, 'Miami': 2.0, 'Minneapolis': 2.1,
+    'New Orleans': 2.1, 'Phoenix': 2.2, 'Las Vegas': 2.2, 'Atlanta': 2.3,
+    'Dallas': 2.3, 'Austin': 2.3, 'Houston': 2.3, 'San Antonio': 2.3, 'Oklahoma City': 2.5,
 }
 
 DESERT_CITIES = {'Phoenix', 'Las Vegas'}
 FORECAST_HEAVY_CITIES = {'Dallas', 'Austin', 'Houston', 'San Antonio', 'Oklahoma City'}
 
-# ── Kelly Criterion ───────────────────────────────────────────────────────────
+# ── FIX 4: Rolling Bias Correction ───────────────────────────────────────────
+def compute_bias_correction(history, city, n_recent=10):
+    """
+    Compute mean forecast error for a city from recent settlement history.
+    error = actual - consensus (positive = model ran cold, negative = model ran warm)
+    Returns bias correction to ADD to consensus (corrects systematic cold/warm bias).
+    Capped at +/- 3F to prevent overcorrection.
+    """
+    city_entries = [h for h in history
+                    if h.get('city') == city
+                    and h.get('actual') is not None
+                    and h.get('consensus') is not None]
+    if len(city_entries) < 3:
+        return 0.0, len(city_entries)
+    recent = city_entries[-n_recent:]
+    errors = [h['actual'] - h['consensus'] for h in recent]
+    mean_error = sum(errors) / len(errors)
+    # Cap correction at +/- 3F
+    correction = max(-3.0, min(3.0, mean_error))
+    return round(correction, 2), len(recent)
 
+# ── Kelly Criterion ───────────────────────────────────────────────────────────
 def kelly_bet(model_prob, market_price_cents, bankroll, fractional=0.15, max_pct=0.05, max_dollars=100):
     if market_price_cents is None or market_price_cents <= 0 or market_price_cents >= 100:
         return 0.0
@@ -168,7 +183,6 @@ def edge_signal(e):
     return '🔴', 'AVOID'
 
 # ── GFS 31-Member Ensemble ────────────────────────────────────────────────────
-
 def fetch_gfs_ensemble(lat, lon):
     """
     Fetch GFS ensemble hourly temps from Open-Meteo ensemble API.
@@ -196,12 +210,10 @@ def fetch_gfs_ensemble(lat, lon):
     hourly = data.get('hourly', {})
     times = hourly.get('time', [])
 
-    # Find indices for today only
     today_indices = [i for i, t in enumerate(times) if t.startswith(today)]
     if not today_indices:
         return None, None
 
-    # Each key like 'temperature_2m_member01' is one ensemble member
     member_maxes = []
     for key, vals in hourly.items():
         if key == 'time':
@@ -223,7 +235,6 @@ def fetch_gfs_ensemble(lat, lon):
     mean = round(sum(member_maxes) / len(member_maxes), 1)
     return member_maxes, mean
 
-
 def ensemble_bracket_prob(members, lo, hi):
     if not members:
         return None
@@ -242,20 +253,22 @@ def ensemble_confidence(prob):
         return '🟡 MED'
     return '⚪ LOW'
 
+# FIX 1: Ensemble weight raised to 65-70%
 def blend_probs(sigma_prob, ensemble_prob, members):
     """
     Blend sigma-model probability with ensemble probability.
-    Weight ensemble more heavily when it has more members and agreement.
+    V4.15: ensemble weight raised to 65-70% (was 30-55%).
+    The 31-member GFS ensemble is more reliable than single deterministic forecast.
     """
     if ensemble_prob is None or members is None:
         return sigma_prob
     n = len(members)
-    ensemble_weight = min(0.55, 0.30 + (n / 100.0))
+    # Scale from 0.55 at n=3 to 0.70 at n=31+
+    ensemble_weight = min(0.70, 0.55 + (n / 200.0))
     sigma_weight = 1.0 - ensemble_weight
     return round(sigma_weight * sigma_prob + ensemble_weight * ensemble_prob, 4)
 
 # ── Core Math ─────────────────────────────────────────────────────────────────
-
 def get_local_hour(city):
     tz_name = CITY_TZ.get(city, 'America/New_York')
     tz = pytz.timezone(tz_name)
@@ -325,18 +338,19 @@ def parse_ladder(text):
     return out
 
 def choose_sigma(city, obs_high=None, forecast=None):
-    s = BASE_SIGMA.get(city, 1.8)
+    s = BASE_SIGMA.get(city, 2.1)
     local_hour = get_local_hour(city)
-    s *= 1.00 if local_hour < 11 else 0.92 if local_hour < 14 else 0.86 if local_hour < 16 else 0.80
+    # FIX 3: Less aggressive time-of-day shrinkage (floor raised from 0.80 to 0.86)
+    s *= 1.00 if local_hour < 11 else 0.94 if local_hour < 14 else 0.90 if local_hour < 16 else 0.86
     if city in DESERT_CITIES:
-        s *= 0.90
+        s *= 0.92
     if obs_high is not None and forecast is not None:
         gap = abs(forecast - obs_high)
         if gap < 2:
-            s *= 0.75
+            s *= 0.80
         elif gap < 4:
-            s *= 0.85
-    return max(1.10, min(2.40, s))
+            s *= 0.90
+    return max(1.30, min(2.80, s))
 
 def late_day_floor(fc, obs, local_hour):
     gap = max(0.0, fc - obs)
@@ -346,6 +360,7 @@ def late_day_floor(fc, obs, local_hour):
 def compute_consensus(fc, cur, noaa, city, obs_high=None):
     local_hour = get_local_hour(city)
     is_fc_heavy = city in FORECAST_HEAVY_CITIES
+
     if is_fc_heavy and local_hour < 14:
         obs_val = noaa if noaa is not None else cur
         base = fc * 0.80 + obs_val * 0.20 if obs_val is not None else fc
@@ -354,17 +369,21 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
         base = fc * 0.65 + obs_val * 0.35 if obs_val is not None else fc
     else:
         base = fc * 0.55 + cur * 0.20 + noaa * 0.25 if noaa is not None else fc * 0.70 + cur * 0.30
-    if abs(base - fc) > 2:
-        base = fc - 1 if base < fc else fc + 1
+
+    # FIX 2: Removed the hard fc+0.6 cap that was preventing correction of cold bias
+    # Only apply a softer sanity guard: don't let consensus drift more than 3F from forecast
+    if abs(base - fc) > 3.0:
+        base = fc - 3.0 if base < fc else fc + 3.0
+
     obs = noaa if noaa is not None else cur
     if obs is not None:
         consensus = max(base, late_day_floor(fc, obs, local_hour))
     else:
         consensus = base
-    if consensus > fc + 0.6:
-        consensus = fc + 0.6
+
     if obs_high is not None and obs_high > consensus:
         consensus = obs_high
+
     return consensus
 
 def bracket_probs(mu, ladder_text, city, obs_high=None, forecast=None):
@@ -421,7 +440,6 @@ def boxes_to_ladder(parts):
     return ' | '.join(cleaned)
 
 # ── Data Fetchers ─────────────────────────────────────────────────────────────
-
 def fetch_obs_high_today(icao):
     url = 'https://forecast.weather.gov/data/obhistory/' + icao + '.html'
     try:
@@ -673,7 +691,6 @@ def sync_all_ladders(saved_ladders, force=False):
     return saved_ladders, {'synced': synced, 'failed': failed}
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
-
 with st.sidebar:
     st.header('Kelly Settings')
     bankroll = st.number_input('My Bankroll ($)', min_value=10.0, max_value=100000.0,
@@ -690,11 +707,13 @@ with st.sidebar:
     st.markdown('🔴 Edge <3c — **AVOID**')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**Ensemble**')
-    st.markdown('GFS 31-member forecast blended with sigma model.')
+    st.markdown('**V4.15 Changes**')
+    st.markdown('• Ensemble weight: 65-70% (↑ from 55%)')
+    st.markdown('• Consensus cap removed (fc+0.6 → fc+3.0)')
+    st.markdown('• Sigma widened ~15% (less overconfident)')
+    st.markdown('• Bias correction from settlement history')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
-
 saved_ladders = load_json(SAVE_FILE)
 history = load_json(HISTORY_FILE)
 if not isinstance(history, list):
@@ -735,6 +754,15 @@ st.caption('Local time: ' + str(local_hour) + ':00 ' + tz_name)
 if city in FORECAST_HEAVY_CITIES and local_hour < 16:
     st.caption('Forecast-heavy mode active (Texas/OKC heat lag correction)')
 
+# FIX 4: Compute and display bias correction
+bias_correction, bias_n = compute_bias_correction(history, city)
+if bias_n >= 3:
+    direction = 'warm' if bias_correction > 0 else 'cold'
+    st.info(f'📊 Bias correction active: +{bias_correction}°F applied to consensus '
+            f'(model ran {direction} by avg {abs(bias_correction)}°F over last {bias_n} days)')
+elif bias_n > 0:
+    st.caption(f'Bias correction: {bias_n} settlement(s) logged for {city} — need 3+ for correction')
+
 if city not in saved_ladders:
     saved_ladders[city] = DEFAULT_LADDERS.get(city, '')
 
@@ -742,14 +770,14 @@ kalshi_markets, fetched_at = get_cached_prices(city)
 if kalshi_markets is None:
     with st.spinner('Fetching live Kalshi prices for ' + city + '...'):
         kalshi_markets = fetch_kalshi_brackets(series, retries=3)
-    if kalshi_markets:
-        save_cached_prices(city, kalshi_markets)
-        labels = [normalize_label(m[0]) for m in kalshi_markets]
-        while len(labels) < 6:
-            labels.append('')
-        saved_ladders[city] = ' | '.join(labels[:6])
-        save_json(SAVE_FILE, saved_ladders)
-        fetched_at = time.time()
+        if kalshi_markets:
+            save_cached_prices(city, kalshi_markets)
+            labels = [normalize_label(m[0]) for m in kalshi_markets]
+            while len(labels) < 6:
+                labels.append('')
+            saved_ladders[city] = ' | '.join(labels[:6])
+            save_json(SAVE_FILE, saved_ladders)
+            fetched_at = time.time()
 
 st.subheader('Kalshi Ladder')
 if kalshi_markets:
@@ -757,7 +785,7 @@ if kalshi_markets:
     age_str = 'just now' if age_min < 1 else str(age_min) + ' min ago'
     st.success('Live prices loaded - ' + str(len(kalshi_markets)) + ' brackets (fetched ' + age_str + ')')
     for m in kalshi_markets:
-        st.caption('  ' + m[0] + ' | YES: ' + (str(m[1])+'c' if m[1] else 'no price') + ' | NO: ' + (str(m[2])+'c' if m[2] else 'no price'))
+        st.caption(' ' + m[0] + ' | YES: ' + (str(m[1])+'c' if m[1] else 'no price') + ' | NO: ' + (str(m[2])+'c' if m[2] else 'no price'))
 else:
     st.warning('Could not fetch live prices from Kalshi. Using saved ladder.')
 
@@ -782,7 +810,6 @@ ladder_text = saved_ladders[city]
 st.caption('Current ladder: ' + ladder_text)
 
 # ── Live Weather + Ensemble ───────────────────────────────────────────────────
-
 st.subheader('Live Weather')
 with st.spinner('Fetching weather, ensemble, and observed high...'):
     forecast_auto, current_auto = fetch_open_meteo(lat, lon)
@@ -812,7 +839,7 @@ with col5:
     if ensemble_mean is not None:
         n_members = len(ensemble_members) if ensemble_members else 0
         st.metric('GFS Ensemble', str(ensemble_mean)+' F', delta=str(n_members)+' members')
-        st.caption('Blended into model')
+        st.caption('Blended at 65-70% weight')
     else:
         st.metric('GFS Ensemble', 'Unavailable')
         st.caption('Sigma-only mode')
@@ -832,8 +859,9 @@ with st.expander('Override weather inputs', expanded=False):
         override_noaa = st.number_input('NOAA Obs F', min_value=0.0, max_value=130.0, value=0.0, step=0.5, key='ov_noaa')
     with ov4:
         override_obs_high = st.number_input('Obs High Override F', min_value=0.0, max_value=130.0, value=0.0, step=0.5, key='ov_obs')
-    if override_fc > 0 or override_cur > 0 or override_obs_high > 0:
-        st.info('Using manual overrides - set back to 0.0 to use auto values')
+
+if override_fc > 0 or override_cur > 0 or override_obs_high > 0:
+    st.info('Using manual overrides - set back to 0.0 to use auto values')
 
 forecast = override_fc if override_fc > 0 else forecast_auto
 current = override_cur if override_cur > 0 else current_auto
@@ -841,14 +869,17 @@ noaa_final = override_noaa if override_noaa > 0 else noaa_obs
 obs_high_final = override_obs_high if override_obs_high > 0 else obs_high_today
 
 # ── Model Output ──────────────────────────────────────────────────────────────
-
 if forecast is not None and current is not None:
-    consensus = compute_consensus(forecast, current, noaa_final, city, obs_high=obs_high_final)
+    consensus_raw = compute_consensus(forecast, current, noaa_final, city, obs_high=obs_high_final)
+
+    # FIX 4: Apply bias correction to consensus
+    consensus = round(consensus_raw + bias_correction, 1)
+
     sigma_rows, sigma = bracket_probs(consensus, ladder_text, city, obs_high=obs_high_final, forecast=forecast)
     call = two_degree_call(consensus, ladder_text, obs_high=obs_high_final)
 
     st.subheader('Model Output')
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         st.metric('Consensus High', str(round(consensus, 1))+' F')
     with c2:
@@ -859,30 +890,30 @@ if forecast is not None and current is not None:
         if obs_high_final is not None:
             st.metric('Obs Floor', str(obs_high_final)+' F',
                       delta='controlling' if obs_high_final >= consensus-0.1 else 'not binding')
+    with c5:
+        if bias_correction != 0.0:
+            st.metric('Bias Adj', ('+' if bias_correction > 0 else '') + str(bias_correction)+' F',
+                      delta='from '+str(bias_n)+' days')
 
     if ensemble_mean is not None:
-        st.caption('GFS ensemble mean: '+str(ensemble_mean)+'F with '+str(len(ensemble_members))+' members — blended into probabilities below')
-
+        st.caption('GFS ensemble mean: '+str(ensemble_mean)+'F with '+str(len(ensemble_members))+' members — blended at 65-70% weight')
     st.caption('Local time: '+str(local_hour)+':00 '+tz_name+' - Late-day floor active')
 
     import pandas as pd
-
     df_rows = []
     best_bet = None
     best_edge = -999
 
     for label, sigma_prob in sigma_rows:
-        # Get ensemble prob for this bracket
         ens_prob = None
         for lbl, lo, hi in parse_ladder(ladder_text):
             if normalize_label(lbl) == normalize_label(label):
                 ens_prob = ensemble_bracket_prob(ensemble_members, lo, hi)
                 break
 
-        # Blend sigma + ensemble
         final_prob = blend_probs(sigma_prob, ens_prob, ensemble_members)
-
         fair = round(final_prob * 100)
+
         yes_ask = no_ask = None
         if kalshi_markets:
             match = next((m for m in kalshi_markets if normalize_label(m[0]) == normalize_label(label)), None)
@@ -891,9 +922,7 @@ if forecast is not None and current is not None:
 
         e = edge_cents(final_prob, yes_ask)
         signal_icon, signal_text = edge_signal(e)
-
         kelly = kelly_bet(final_prob, yes_ask, bankroll) if yes_ask else 0.0
-
         ens_conf = ensemble_confidence(ens_prob) if ens_prob is not None else ''
 
         busted = False
@@ -903,7 +932,6 @@ if forecast is not None and current is not None:
                     busted = True
 
         edge_str = ('+'+str(e)+'c') if e and e > 0 else (str(e)+'c' if e is not None else 'none')
-
         df_rows.append({
             'Signal': signal_icon + ' ' + signal_text,
             'Bracket': label + (' BUSTED' if busted else ''),
@@ -922,11 +950,10 @@ if forecast is not None and current is not None:
 
     st.dataframe(pd.DataFrame(df_rows), use_container_width=True, hide_index=True)
 
-    # Best bet callout
     if best_bet and best_bet['edge'] >= MIN_EDGE:
         st.success('🎯 Best Bet: **' + best_bet['label'] + '** | Edge: +' + str(best_bet['edge']) + 'c | Kelly: $' + str(best_bet['kelly']))
     elif best_bet:
-        st.warning('⚠️ No bracket meets the ' + str(MIN_EDGE) + 'c minimum edge threshold. Best available: ' + best_bet['label'] + ' (+' + str(best_bet['edge']) + 'c) — consider skipping this market today.')
+        st.warning('⚠️ No bracket meets the ' + str(MIN_EDGE) + 'c minimum edge threshold. Best available: ' + best_bet['label'] + ' (+' + str(best_bet['edge']) + 'c) — consider skipping today.')
 
     parsed = parse_ladder(ladder_text)
     top_b = next((b for b in parsed if b[2] is None), None)
@@ -937,7 +964,6 @@ else:
     st.error('Weather data unavailable.')
 
 # ── Settlement Log ────────────────────────────────────────────────────────────
-
 st.subheader('Log Actual High (after settlement)')
 with st.form('log_form'):
     actual = st.number_input('Actual NWS High F', min_value=0.0, max_value=130.0, step=0.1)
@@ -948,13 +974,16 @@ with st.form('log_form'):
             'actual': actual,
             'forecast': round(forecast, 1),
             'consensus': round(consensus, 1),
+            'consensus_raw': round(consensus_raw, 1),
+            'bias_correction': bias_correction,
             'ensemble_mean': ensemble_mean,
             'obs_high': obs_high_final,
-            'error': round(actual-consensus, 1),
+            'error': round(actual - consensus, 1),
+            'error_raw': round(actual - consensus_raw, 1),
         }
         history.append(entry)
         save_json(HISTORY_FILE, history[-300:])
-        st.success('Logged - actual='+str(actual)+'F  consensus='+str(round(consensus, 1))+'F  error='+str(entry['error'])+'F')
+        st.success('Logged - actual='+str(actual)+'F consensus='+str(round(consensus, 1))+'F error='+str(entry['error'])+'F')
 
 if history:
     st.subheader('Settlement History')
@@ -963,6 +992,14 @@ if history:
     if wd:
         mae = sum(abs(h['actual']-h['consensus']) for h in wd) / len(wd)
         w1 = sum(1 for h in wd if abs(h['actual']-h['consensus']) <= 1) / len(wd)
+        # Per-city bias summary
+        city_biases = {}
+        for h in wd:
+            c = h.get('city', 'Unknown')
+            if c not in city_biases:
+                city_biases[c] = []
+            city_biases[c].append(h['actual'] - h['consensus'])
+
         hc1, hc2, hc3 = st.columns(3)
         with hc1:
             st.metric('Records', len(history))
@@ -970,4 +1007,21 @@ if history:
             st.metric('Model MAE', str(round(mae, 2))+' F')
         with hc3:
             st.metric('Within 1 degree', str(round(w1*100, 0))+'%')
+
+        # Show city-level bias table if enough data
+        cities_with_data = {c: errs for c, errs in city_biases.items() if len(errs) >= 3}
+        if cities_with_data:
+            with st.expander('City Bias Summary (mean error per city)', expanded=False):
+                bias_rows = []
+                for c, errs in sorted(cities_with_data.items()):
+                    mean_err = sum(errs) / len(errs)
+                    bias_rows.append({
+                        'City': c,
+                        'Days': len(errs),
+                        'Mean Error': str(round(mean_err, 2))+' F',
+                        'Direction': 'Model too cold ↑' if mean_err > 0.5 else 'Model too warm ↓' if mean_err < -0.5 else 'Accurate ✓',
+                        'Active Correction': ('+' if mean_err > 0 else '') + str(round(max(-3.0, min(3.0, mean_err)), 2))+' F'
+                    })
+                st.dataframe(pd.DataFrame(bias_rows), use_container_width=True, hide_index=True)
+
     st.dataframe(df_h, use_container_width=True, hide_index=True)
