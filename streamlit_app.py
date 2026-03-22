@@ -1,11 +1,11 @@
-# Kalshi High Temperature Model - V4.16
+# Kalshi High Temperature Model - V4.17
 #
-# Changes from V4.15:
-# 1. NWS gridpoints replaces Open-Meteo as PRIMARY forecast (matches Kalshi settlement source)
-# 2. Miami fetch fixed — correct KMIA airport coords, NWS /points call reliable
-# 3. Price label matching bug fixed — normalize_label applied on BOTH sides of comparison
-# 4. High uncertainty warning when |NWS_fc - ensemble_mean| > 3F — green signals suppressed
-# 5. All forecast sources shown side-by-side: NWS (primary), Open-Meteo (ref), GFS Ensemble, NOAA obs
+# Changes from V4.16:
+# 1. Open-Meteo forecast removed entirely — NWS is the only forecast source
+# 2. Ensemble weight reduced to 45-50% (was 65-70%)
+#    NWS matches settlement source so it dominates; ensemble measures spread only
+# 3. Clean 4-source display: NWS forecast | NOAA obs | Obs high floor | GFS ensemble
+# 4. All V4.16 fixes retained: Miami fix, label matching, uncertainty warning, bias correction
 
 import math, re, json, time, requests
 import streamlit as st
@@ -14,8 +14,8 @@ from pathlib import Path
 from datetime import datetime
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.16', layout='wide')
-st.title('Kalshi High Temperature Model - V4.16')
+st.set_page_config(page_title='Kalshi High Temp V4.17', layout='wide')
+st.title('Kalshi High Temperature Model - V4.17')
 
 SAVE_FILE = Path('saved_ladders.json')
 HISTORY_FILE = Path('settlement_history.json')
@@ -24,25 +24,17 @@ PRICE_CACHE_FILE = Path('price_cache.json')
 PRICE_CACHE_MINUTES = 10
 
 MIN_EDGE = 8
-HEADERS = {'User-Agent': 'kalshi-temp-model/4.16', 'Accept': 'application/geo+json, application/json, text/html'}
+HEADERS = {'User-Agent': 'kalshi-temp-model/4.17', 'Accept': 'application/geo+json, application/json, text/html'}
 
 CITY_TZ = {
-    'Phoenix': 'America/Phoenix',
-    'Las Vegas': 'America/Los_Angeles',
-    'Los Angeles': 'America/Los_Angeles',
-    'Dallas': 'America/Chicago',
-    'Austin': 'America/Chicago',
-    'Houston': 'America/Chicago',
-    'Atlanta': 'America/New_York',
-    'Miami': 'America/New_York',
-    'New York': 'America/New_York',
-    'San Antonio': 'America/Chicago',
-    'New Orleans': 'America/Chicago',
-    'Philadelphia': 'America/New_York',
-    'Boston': 'America/New_York',
-    'Denver': 'America/Denver',
-    'Oklahoma City': 'America/Chicago',
-    'Minneapolis': 'America/Chicago',
+    'Phoenix': 'America/Phoenix', 'Las Vegas': 'America/Los_Angeles',
+    'Los Angeles': 'America/Los_Angeles', 'Dallas': 'America/Chicago',
+    'Austin': 'America/Chicago', 'Houston': 'America/Chicago',
+    'Atlanta': 'America/New_York', 'Miami': 'America/New_York',
+    'New York': 'America/New_York', 'San Antonio': 'America/Chicago',
+    'New Orleans': 'America/Chicago', 'Philadelphia': 'America/New_York',
+    'Boston': 'America/New_York', 'Denver': 'America/Denver',
+    'Oklahoma City': 'America/Chicago', 'Minneapolis': 'America/Chicago',
     'Washington DC': 'America/New_York',
 }
 
@@ -88,25 +80,15 @@ SETTLEMENT_LOCATION = {
     'Washington DC': 'Reagan National Airport',
 }
 
-# FIX 2: Miami coords corrected to KMIA airport (25.7959, -80.2870)
-# All coords point to the actual NWS settlement airport station for each city
 CITIES = {
-    'Phoenix': {'lat': 33.4342, 'lon': -112.0116},
-    'Las Vegas': {'lat': 36.0840, 'lon': -115.1537},
-    'Los Angeles': {'lat': 33.9416, 'lon': -118.4085},
-    'Dallas': {'lat': 32.8998, 'lon': -97.0403},
-    'Austin': {'lat': 30.1945, 'lon': -97.6699},
-    'Houston': {'lat': 29.9902, 'lon': -95.3368},
-    'Atlanta': {'lat': 33.6407, 'lon': -84.4277},
-    'Miami': {'lat': 25.7959, 'lon': -80.2870},
-    'New York': {'lat': 40.7812, 'lon': -73.9665},
-    'San Antonio': {'lat': 29.5337, 'lon': -98.4698},
-    'New Orleans': {'lat': 29.9934, 'lon': -90.2580},
-    'Philadelphia': {'lat': 39.8744, 'lon': -75.2424},
-    'Boston': {'lat': 42.3656, 'lon': -71.0096},
-    'Denver': {'lat': 39.8561, 'lon': -104.6737},
-    'Oklahoma City': {'lat': 35.3931, 'lon': -97.6007},
-    'Minneapolis': {'lat': 44.8848, 'lon': -93.2223},
+    'Phoenix': {'lat': 33.4342, 'lon': -112.0116}, 'Las Vegas': {'lat': 36.0840, 'lon': -115.1537},
+    'Los Angeles': {'lat': 33.9416, 'lon': -118.4085}, 'Dallas': {'lat': 32.8998, 'lon': -97.0403},
+    'Austin': {'lat': 30.1945, 'lon': -97.6699}, 'Houston': {'lat': 29.9902, 'lon': -95.3368},
+    'Atlanta': {'lat': 33.6407, 'lon': -84.4277}, 'Miami': {'lat': 25.7959, 'lon': -80.2870},
+    'New York': {'lat': 40.7812, 'lon': -73.9665}, 'San Antonio': {'lat': 29.5337, 'lon': -98.4698},
+    'New Orleans': {'lat': 29.9934, 'lon': -90.2580}, 'Philadelphia': {'lat': 39.8744, 'lon': -75.2424},
+    'Boston': {'lat': 42.3656, 'lon': -71.0096}, 'Denver': {'lat': 39.8561, 'lon': -104.6737},
+    'Oklahoma City': {'lat': 35.3931, 'lon': -97.6007}, 'Minneapolis': {'lat': 44.8848, 'lon': -93.2223},
     'Washington DC': {'lat': 38.8512, 'lon': -77.0402},
 }
 
@@ -144,15 +126,11 @@ FORECAST_HEAVY_CITIES = {'Dallas', 'Austin', 'Houston', 'San Antonio', 'Oklahoma
 _NWS_GRID_CACHE = {}
 
 def fetch_nws_grid(lat, lon):
-    """Resolve NWS office/gridX/gridY from lat/lon. Cached to avoid hammering /points."""
     key = (round(lat, 4), round(lon, 4))
     if key in _NWS_GRID_CACHE:
         return _NWS_GRID_CACHE[key]
     try:
-        r = requests.get(
-            f'https://api.weather.gov/points/{lat},{lon}',
-            headers=HEADERS, timeout=12
-        )
+        r = requests.get(f'https://api.weather.gov/points/{lat},{lon}', headers=HEADERS, timeout=12)
         r.raise_for_status()
         props = r.json().get('properties', {})
         office = props.get('gridId')
@@ -167,13 +145,10 @@ def fetch_nws_grid(lat, lon):
     except Exception:
         return None
 
-# FIX 1: NWS gridpoints = primary forecast source
 def fetch_nws_forecast(lat, lon):
     """
-    Fetch today's high from NWS gridpoints — same source Kalshi uses for settlement.
+    PRIMARY forecast source — same data Kalshi settles on.
     Returns (forecast_high_F, forecast_url) or (None, None).
-    Parses daytime period (isDaytime=True) which carries the daily high.
-    Falls back to first available period for early-AM edge case.
     """
     grid = fetch_nws_grid(lat, lon)
     if not grid:
@@ -187,7 +162,6 @@ def fetch_nws_forecast(lat, lon):
         return None, None
 
     today = datetime.now().strftime('%Y-%m-%d')
-    # Prefer today's daytime period (carries the high)
     for period in periods:
         start = period.get('startTime', '')
         is_day = period.get('isDaytime', False)
@@ -196,7 +170,7 @@ def fetch_nws_forecast(lat, lon):
         if start.startswith(today) and is_day and temp is not None:
             temp_f = float(temp) if unit == 'F' else float(temp) * 9/5 + 32
             return round(temp_f, 1), fc_url
-    # Fallback: first period (early AM before daytime period available)
+    # Fallback: first available period (early AM before daytime period loads)
     for period in periods[:2]:
         temp = period.get('temperature')
         unit = period.get('temperatureUnit', 'F')
@@ -205,12 +179,35 @@ def fetch_nws_forecast(lat, lon):
             return round(temp_f, 1), fc_url
     return None, None
 
+def fetch_nws_current(lat, lon, station_id):
+    """Current obs from NOAA station."""
+    if station_id:
+        obs = safe_get('https://api.weather.gov/stations/' + station_id + '/observations/latest')
+        if obs:
+            temp_c = obs.get('properties', {}).get('temperature', {}).get('value')
+            if temp_c is not None:
+                return station_id, float(c_to_f(temp_c))
+    points = safe_get('https://api.weather.gov/points/' + str(lat) + ',' + str(lon))
+    if not points:
+        return station_id, None
+    stations_url = points.get('properties', {}).get('observationStations')
+    if not stations_url:
+        return station_id, None
+    stations = safe_get(stations_url)
+    if not stations or not stations.get('observationStations'):
+        return station_id, None
+    first = stations['observationStations'][0]
+    sid = first.rstrip('/').split('/')[-1]
+    obs = safe_get(first + '/observations/latest')
+    if not obs:
+        return sid, None
+    temp_c = obs.get('properties', {}).get('temperature', {}).get('value')
+    if temp_c is None:
+        return sid, None
+    return sid, float(c_to_f(temp_c))
+
 # ── Bias Correction ───────────────────────────────────────────────────────────
 def compute_bias_correction(history, city, n_recent=10):
-    """
-    Mean forecast error from recent settlements. Capped at +/-3F.
-    Positive = model ran cold (add to consensus). Negative = ran warm (subtract).
-    """
     city_entries = [h for h in history
                     if h.get('city') == city
                     and h.get('actual') is not None
@@ -244,7 +241,6 @@ def edge_cents(model_prob, market_price_cents):
         return None
     return round(model_prob * 100 - market_price_cents, 1)
 
-# FIX 4: high_uncertainty flag suppresses green when NWS vs ensemble gap >3F
 def edge_signal(e, high_uncertainty=False):
     if e is None:
         return '⚪', 'No price'
@@ -322,32 +318,16 @@ def ensemble_confidence(prob):
         return '🟡 MED'
     return '⚪ LOW'
 
+# V4.17: Ensemble weight reduced to 45-50%
+# NWS is the settlement source so it should dominate; ensemble measures spread/uncertainty only
 def blend_probs(sigma_prob, ensemble_prob, members):
     if ensemble_prob is None or members is None:
         return sigma_prob
     n = len(members)
-    ensemble_weight = min(0.70, 0.55 + (n / 200.0))
+    # Scale from 0.35 at n=3 to 0.50 at n=31+
+    ensemble_weight = min(0.50, 0.35 + (n / 200.0))
     sigma_weight = 1.0 - ensemble_weight
     return round(sigma_weight * sigma_prob + ensemble_weight * ensemble_prob, 4)
-
-# ── Open-Meteo (reference only in V4.16) ─────────────────────────────────────
-def fetch_open_meteo(lat, lon):
-    data = safe_get('https://api.open-meteo.com/v1/forecast', {
-        'latitude': lat, 'longitude': lon,
-        'daily': 'temperature_2m_max',
-        'current': 'temperature_2m',
-        'temperature_unit': 'fahrenheit',
-        'timezone': 'auto',
-        'forecast_days': 2,
-    })
-    if not data:
-        return None, None
-    today = datetime.now().strftime('%Y-%m-%d')
-    times = data.get('daily', {}).get('time', [])
-    idx = next((i for i, t in enumerate(times) if t.startswith(today)), 0)
-    fc = data.get('daily', {}).get('temperature_2m_max', [None])[idx]
-    cur = data.get('current', {}).get('temperature_2m')
-    return (float(fc) if fc is not None else None, float(cur) if cur is not None else None)
 
 # ── Core Math ─────────────────────────────────────────────────────────────────
 def get_local_hour(city):
@@ -450,6 +430,7 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
     else:
         base = fc * 0.55 + cur * 0.20 + noaa * 0.25 if noaa is not None else fc * 0.70 + cur * 0.30
 
+    # Soft cap: don't let consensus drift more than 3F from NWS forecast
     if abs(base - fc) > 3.0:
         base = fc - 3.0 if base < fc else fc + 3.0
 
@@ -553,33 +534,6 @@ def fetch_obs_high_today(icao):
                 pass
     return (round(max(highs), 1), url) if highs else (None, url)
 
-def fetch_noaa(lat, lon, station_id):
-    if station_id:
-        obs = safe_get('https://api.weather.gov/stations/' + station_id + '/observations/latest')
-        if obs:
-            temp_c = obs.get('properties', {}).get('temperature', {}).get('value')
-            if temp_c is not None:
-                return station_id, float(c_to_f(temp_c))
-    points = safe_get('https://api.weather.gov/points/' + str(lat) + ',' + str(lon))
-    if not points:
-        return station_id, None
-    stations_url = points.get('properties', {}).get('observationStations')
-    if not stations_url:
-        return station_id, None
-    stations = safe_get(stations_url)
-    if not stations or not stations.get('observationStations'):
-        return station_id, None
-    first = stations['observationStations'][0]
-    sid = first.rstrip('/').split('/')[-1]
-    obs = safe_get(first + '/observations/latest')
-    if not obs:
-        return sid, None
-    temp_c = obs.get('properties', {}).get('temperature', {}).get('value')
-    if temp_c is None:
-        return sid, None
-    return sid, float(c_to_f(temp_c))
-
-# FIX 3: parse_market_label unchanged; matching now uses normalize_label on BOTH sides
 def parse_market_label(m):
     for field in ['subtitle', 'yes_sub_title', 'no_sub_title']:
         s = (m.get(field) or '').replace('\u00b0', '').replace('deg', '').strip()
@@ -740,7 +694,6 @@ def sync_all_ladders(saved_ladders, force=False):
         progress.progress((i+1)/len(cities), text='Syncing ' + c + '...')
         markets = fetch_kalshi_brackets(SERIES[c], retries=3)
         if markets:
-            # FIX 3: normalize both sides when building ladder from Kalshi
             labels = [normalize_label(m[0]) for m in markets]
             while len(labels) < 6:
                 labels.append('')
@@ -770,22 +723,20 @@ with st.sidebar:
     st.markdown('🟢 Edge ≥8c — **BET**')
     st.markdown('🟡 Edge 3-7c — **SKIP**')
     st.markdown('🔴 Edge <3c — **AVOID**')
-    st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F gap')
+    st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V4.16 Changes**')
-    st.markdown('• NWS gridpoints = primary forecast (matches Kalshi settlement)')
-    st.markdown('• Open-Meteo shown as reference only')
-    st.markdown('• Miami coords fixed to KMIA airport')
-    st.markdown('• Price label matching normalized both sides')
-    st.markdown('• ⚠️ High uncertainty warning suppresses green when gap >3F')
-    st.markdown('• All sources shown side-by-side')
+    st.markdown('**V4.17 Changes**')
+    st.markdown('• NWS = only forecast source (matches Kalshi settlement)')
+    st.markdown('• Open-Meteo removed entirely')
+    st.markdown('• Ensemble weight 45-50% (was 65-70%)')
+    st.markdown('• NWS dominates — ensemble measures spread only')
+    st.markdown('• ⚠️ Gap >3F suppresses green signals')
     st.markdown('---')
-    st.markdown('**V4.15 Retained**')
-    st.markdown('• Ensemble weight: 65-70%')
-    st.markdown('• Consensus cap: fc+3.0 (was fc+0.6)')
-    st.markdown('• Sigma widened ~15%')
-    st.markdown('• Bias correction from settlement history')
+    st.markdown('**Retained from V4.15/16**')
+    st.markdown('• Miami label fix')
+    st.markdown('• Wider sigma, fc+3.0 cap')
+    st.markdown('• Bias correction from history')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -800,13 +751,13 @@ if last_sync_data.get('date') != today_str:
     saved_ladders, results = sync_all_ladders(saved_ladders)
     if results:
         n = len(results.get('synced', []))
-        st.success('Morning sync complete — ' + str(n) + '/' + str(len(SERIES)) + ' city ladders loaded from Kalshi')
+        st.success('Morning sync complete - ' + str(n) + '/' + str(len(SERIES)) + ' city ladders loaded from Kalshi')
         if results.get('failed'):
-            st.warning('Could not fetch: ' + ', '.join(results['failed']) + ' — using saved ladders')
+            st.warning('Could not fetch: ' + ', '.join(results['failed']) + ' - using saved ladders')
 else:
     col_info, col_btn = st.columns([5, 1])
     with col_info:
-        st.caption('Ladders auto-synced from Kalshi today (' + today_str + ') — ' +
+        st.caption('Ladders auto-synced from Kalshi today (' + today_str + ') - ' +
                    str(len(last_sync_data.get('synced', []))) + ' cities loaded')
     with col_btn:
         if st.button('Refresh All'):
@@ -824,7 +775,7 @@ obs_url = 'https://forecast.weather.gov/data/obhistory/' + obs_icao + '.html'
 local_hour = get_local_hour(city)
 tz_name = CITY_TZ.get(city, 'America/New_York')
 
-st.caption('Settlement: ' + station + ' — ' + SETTLEMENT_LOCATION[city] + ' — Series: ' + series)
+st.caption('Settlement: ' + station + ' - ' + SETTLEMENT_LOCATION[city] + ' - Series: ' + series)
 st.caption('Local time: ' + str(local_hour) + ':00 ' + tz_name)
 if city in FORECAST_HEAVY_CITIES and local_hour < 16:
     st.caption('⚡ Forecast-heavy mode active (Texas/OKC heat lag correction)')
@@ -847,7 +798,6 @@ if kalshi_markets is None:
         kalshi_markets = fetch_kalshi_brackets(series, retries=3)
         if kalshi_markets:
             save_cached_prices(city, kalshi_markets)
-            # FIX 3: normalize both sides
             labels = [normalize_label(m[0]) for m in kalshi_markets]
             while len(labels) < 6:
                 labels.append('')
@@ -859,7 +809,7 @@ st.subheader('Kalshi Ladder')
 if kalshi_markets:
     age_min = round((time.time() - fetched_at) / 60) if fetched_at else 0
     age_str = 'just now' if age_min < 1 else str(age_min) + ' min ago'
-    st.success('Live prices loaded — ' + str(len(kalshi_markets)) + ' brackets (fetched ' + age_str + ')')
+    st.success('Live prices loaded - ' + str(len(kalshi_markets)) + ' brackets (fetched ' + age_str + ')')
     for m in kalshi_markets:
         st.caption(' ' + m[0] + ' | YES: ' + (str(m[1])+'c' if m[1] else 'no price') +
                    ' | NO: ' + (str(m[2])+'c' if m[2] else 'no price'))
@@ -886,78 +836,67 @@ with st.expander('Edit Brackets', expanded=False):
 ladder_text = saved_ladders[city]
 st.caption('Current ladder: ' + ladder_text)
 
-# ── FIX 5: All Forecast Sources Side by Side ──────────────────────────────────
-st.subheader('Forecast Sources')
-with st.spinner('Fetching all weather sources...'):
-    nws_forecast, nws_fc_url = fetch_nws_forecast(lat, lon)  # FIX 1: primary
-    om_forecast, current_auto = fetch_open_meteo(lat, lon)   # reference
-    noaa_station, noaa_obs = fetch_noaa(lat, lon, station)
+# ── Live Weather — Clean 4-Source Display ────────────────────────────────────
+st.subheader('Live Weather')
+with st.spinner('Fetching weather data...'):
+    nws_forecast, nws_fc_url = fetch_nws_forecast(lat, lon)
+    noaa_station, noaa_obs = fetch_nws_current(lat, lon, station)
     obs_high_today, obs_high_url = fetch_obs_high_today(obs_icao)
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
 
-# FIX 4: Compute high uncertainty flag
+# High uncertainty flag
 high_uncertainty = False
+source_gap = None
 if nws_forecast is not None and ensemble_mean is not None:
     source_gap = abs(nws_forecast - ensemble_mean)
     high_uncertainty = source_gap > 3.0
-else:
-    source_gap = None
 
-# FIX 5: side-by-side source display
-col1, col2, col3, col4, col5 = st.columns(5)
+# 4-source display
+col1, col2, col3, col4 = st.columns(4)
 with col1:
-    nws_label = '🎯 NWS (Primary)'
     if nws_forecast:
-        st.metric(nws_label, str(nws_forecast)+' F')
-        st.caption('[NWS forecast](' + (nws_fc_url or '#') + ')')
+        st.metric('🎯 NWS Forecast', str(nws_forecast)+' F')
+        st.caption('Primary — settlement source')
     else:
-        st.metric(nws_label, 'Unavailable')
-        st.caption('NWS /points failed')
+        st.metric('🎯 NWS Forecast', 'Unavailable')
+        st.caption('⚠️ NWS /points failed')
 with col2:
-    st.metric('📊 Open-Meteo (Ref)', str(round(om_forecast, 1))+' F' if om_forecast else 'Unavailable')
-    if om_forecast and nws_forecast:
-        diff = round(om_forecast - nws_forecast, 1)
-        sign = '+' if diff >= 0 else ''
-        st.caption(f'vs NWS: {sign}{diff}F')
-    else:
-        st.caption('Reference only')
-with col3:
     if noaa_obs is not None:
-        st.metric('🌡 NOAA Obs', str(round(noaa_obs, 1))+' F')
+        st.metric('🌡 Current Temp', str(round(noaa_obs, 1))+' F')
         st.caption('Station: ' + noaa_station)
     else:
-        st.metric('🌡 NOAA Obs', 'Unavailable')
-with col4:
+        st.metric('🌡 Current Temp', 'Unavailable')
+with col3:
     if obs_high_today is not None:
         st.metric('📈 Obs High Today', str(obs_high_today)+' F', delta='floor active')
         st.caption('[NWS table](' + obs_url + ')')
     else:
         st.metric('📈 Obs High Today', 'Unavailable')
         st.caption('[NWS table](' + obs_url + ')')
-with col5:
+with col4:
     if ensemble_mean is not None:
         n_members = len(ensemble_members) if ensemble_members else 0
-        ens_delta = None
-        if nws_forecast is not None:
-            ens_delta = str(round(ensemble_mean - nws_forecast, 1)) + 'F vs NWS'
+        gap_str = ((' | gap: +' if ensemble_mean >= (nws_forecast or 0) else ' | gap: ') +
+                   str(round(source_gap, 1))+'F vs NWS') if source_gap is not None else str(n_members)+' members'
         st.metric('🔮 GFS Ensemble', str(ensemble_mean)+' F',
-                  delta=(str(n_members)+' members') if not ens_delta else ens_delta)
-        st.caption('Weight: 65-70%')
+                  delta=str(n_members)+' members')
+        st.caption('Weight: 45-50% | uncertainty measure')
     else:
         st.metric('🔮 GFS Ensemble', 'Unavailable')
         st.caption('Sigma-only mode')
 
-# FIX 4: High uncertainty banner
-if high_uncertainty and source_gap is not None:
+# Uncertainty and bust warnings
+if nws_forecast is None:
+    st.error('⚠️ NWS forecast unavailable — cannot run model. Try refreshing or use manual override.')
+elif high_uncertainty and source_gap is not None:
     st.warning(
-        f'⚠️ HIGH UNCERTAINTY: NWS forecast ({nws_forecast}F) vs GFS ensemble ({ensemble_mean}F) '
+        f'⚠️ HIGH UNCERTAINTY: NWS ({nws_forecast}F) vs GFS ensemble ({ensemble_mean}F) '
         f'gap = {round(source_gap, 1)}F — exceeds 3F threshold. '
-        f'Green signals suppressed. Consider skipping today or sizing down.'
+        f'Green signals suppressed. Consider waiting or sizing down.'
     )
 elif source_gap is not None and source_gap > 1.5:
     st.info(f'ℹ️ Source gap: NWS vs Ensemble = {round(source_gap, 1)}F — moderate divergence, watch closely.')
 
-# Bust check
 if obs_high_today is not None:
     for label, lo, hi in parse_ladder(ladder_text):
         if hi is not None and obs_high_today > hi + 0.4:
@@ -967,7 +906,7 @@ if obs_high_today is not None:
 with st.expander('Override weather inputs', expanded=False):
     ov1, ov2, ov3, ov4 = st.columns(4)
     with ov1:
-        override_fc = st.number_input('Forecast High F (override)', min_value=0.0, max_value=130.0, value=0.0, step=0.5, key='ov_fc')
+        override_fc = st.number_input('Forecast High F', min_value=0.0, max_value=130.0, value=0.0, step=0.5, key='ov_fc')
     with ov2:
         override_cur = st.number_input('Current Temp F', min_value=0.0, max_value=130.0, value=0.0, step=0.5, key='ov_cur')
     with ov3:
@@ -976,11 +915,10 @@ with st.expander('Override weather inputs', expanded=False):
         override_obs_high = st.number_input('Obs High Override F', min_value=0.0, max_value=130.0, value=0.0, step=0.5, key='ov_obs')
 
 if override_fc > 0 or override_cur > 0 or override_obs_high > 0:
-    st.info('Using manual overrides — set back to 0.0 to use auto values')
+    st.info('Using manual overrides - set back to 0.0 to use auto values')
 
-# Resolve final inputs — NWS is primary, Open-Meteo current as fallback for current temp
-forecast = override_fc if override_fc > 0 else nws_forecast if nws_forecast else om_forecast
-current = override_cur if override_cur > 0 else current_auto
+forecast = override_fc if override_fc > 0 else nws_forecast
+current = override_cur if override_cur > 0 else noaa_obs
 noaa_final = override_noaa if override_noaa > 0 else noaa_obs
 obs_high_final = override_obs_high if override_obs_high > 0 else obs_high_today
 
@@ -995,9 +933,8 @@ if forecast is not None and current is not None:
     st.subheader('Model Output')
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        fc_source = 'NWS' if nws_forecast and override_fc == 0 else 'Override' if override_fc > 0 else 'Open-Meteo'
         st.metric('Consensus High', str(round(consensus, 1))+' F')
-        st.caption('Forecast source: ' + fc_source)
+        st.caption('Source: NWS' + (' + override' if override_fc > 0 else ''))
     with c2:
         st.metric('2 Degree Call', call or 'none')
     with c3:
@@ -1012,10 +949,10 @@ if forecast is not None and current is not None:
                       delta='from '+str(bias_n)+' days')
 
     if ensemble_mean is not None:
-        st.caption('GFS ensemble mean: '+str(ensemble_mean)+'F — '+str(len(ensemble_members))+
-                   ' members — blended at 65-70% weight')
+        st.caption('GFS ensemble: '+str(ensemble_mean)+'F | '+str(len(ensemble_members))+
+                   ' members | weight 45-50%')
     if high_uncertainty:
-        st.caption('⚠️ High uncertainty mode active — green signals suppressed')
+        st.caption('⚠️ High uncertainty mode — green signals suppressed')
 
     import pandas as pd
     df_rows = []
@@ -1023,7 +960,6 @@ if forecast is not None and current is not None:
     best_edge = -999
 
     for label, sigma_prob in sigma_rows:
-        # FIX 3: normalize label on BOTH sides when looking up ensemble and Kalshi price
         norm_label = normalize_label(label)
 
         ens_prob = None
@@ -1037,13 +973,11 @@ if forecast is not None and current is not None:
 
         yes_ask = no_ask = None
         if kalshi_markets:
-            # FIX 3: normalize both sides of the match
             match = next((m for m in kalshi_markets if normalize_label(m[0]) == norm_label), None)
             if match:
                 yes_ask, no_ask = match[1], match[2]
 
         e = edge_cents(final_prob, yes_ask)
-        # FIX 4: pass high_uncertainty to suppress green
         signal_icon, signal_text = edge_signal(e, high_uncertainty=high_uncertainty)
         kelly = kelly_bet(final_prob, yes_ask, bankroll) if yes_ask else 0.0
         ens_conf = ensemble_confidence(ens_prob) if ens_prob is not None else ''
@@ -1064,13 +998,13 @@ if forecast is not None and current is not None:
             'NO ask': str(no_ask)+'c' if no_ask is not None else 'none',
             'Edge': edge_str,
             'Kelly Bet': ('$'+str(kelly)) if kelly > 0 else '-',
-            'Ens Conf': ens_conf,
+            'Ensemble': ens_conf,
         })
 
         if e is not None and e > best_edge and not busted:
             best_edge = e
-            best_bet = {'label': label, 'edge': e, 'kelly': kelly, 'signal': signal_icon,
-                        'uncertain': high_uncertainty}
+            best_bet = {'label': label, 'edge': e, 'kelly': kelly,
+                        'signal': signal_icon, 'uncertain': high_uncertainty}
 
     st.dataframe(pd.DataFrame(df_rows), use_container_width=True, hide_index=True)
 
@@ -1079,10 +1013,10 @@ if forecast is not None and current is not None:
                    str(best_bet['edge']) + 'c | Kelly: $' + str(best_bet['kelly']))
     elif best_bet and best_bet['edge'] >= MIN_EDGE and best_bet['uncertain']:
         st.warning('⚠️ Best edge: **' + best_bet['label'] + '** (+' + str(best_bet['edge']) +
-                   'c) but HIGH UNCERTAINTY active — sources disagree >3F. Consider skipping.')
+                   'c) but HIGH UNCERTAINTY — NWS vs ensemble gap >3F. Consider skipping.')
     elif best_bet:
-        st.warning('⚠️ No bracket meets the ' + str(MIN_EDGE) + 'c minimum edge threshold. ' +
-                   'Best available: ' + best_bet['label'] + ' (+' + str(best_bet['edge']) + 'c) — consider skipping today.')
+        st.warning('⚠️ No bracket meets the ' + str(MIN_EDGE) + 'c minimum. Best: ' +
+                   best_bet['label'] + ' (+' + str(best_bet['edge']) + 'c) — consider skipping today.')
 
     parsed = parse_ladder(ladder_text)
     top_b = next((b for b in parsed if b[2] is None), None)
@@ -1092,7 +1026,7 @@ if forecast is not None and current is not None:
 
 else:
     if forecast is None:
-        st.error('NWS forecast unavailable and Open-Meteo fallback also failed. Check network.')
+        st.error('NWS forecast unavailable. Use manual override or try refreshing.')
     else:
         st.error('Current temperature unavailable — cannot compute consensus.')
 
@@ -1106,9 +1040,8 @@ with st.form('log_form'):
             'city': city,
             'actual': actual,
             'forecast': round(forecast, 1),
-            'forecast_source': 'NWS' if nws_forecast and override_fc == 0 else 'override/OM',
+            'forecast_source': 'NWS' if override_fc == 0 else 'override',
             'nws_forecast': nws_forecast,
-            'om_forecast': round(om_forecast, 1) if om_forecast else None,
             'consensus': round(consensus, 1),
             'consensus_raw': round(consensus_raw, 1),
             'bias_correction': bias_correction,
@@ -1121,46 +1054,9 @@ with st.form('log_form'):
         }
         history.append(entry)
         save_json(HISTORY_FILE, history[-300:])
-        st.success('Logged — actual='+str(actual)+'F consensus='+str(round(consensus, 1))+
+        st.success('Logged - actual='+str(actual)+'F consensus='+str(round(consensus, 1))+
                    'F error='+str(entry['error'])+'F')
 
-# ── Settlement History ────────────────────────────────────────────────────────
-if history:
-    import pandas as pd
-    st.subheader('Settlement History')
-    df_h = pd.DataFrame(history[-50:][::-1])
-    wd = [h for h in history if h.get('consensus') and h.get('actual')]
-    if wd:
-        mae = sum(abs(h['actual']-h['consensus']) for h in wd) / len(wd)
-        w1 = sum(1 for h in wd if abs(h['actual']-h['consensus']) <= 1) / len(wd)
-        city_biases = {}
-        for h in wd:
-            c = h.get('city', 'Unknown')
-            if c not in city_biases:
-                city_biases[c] = []
-            city_biases[c].append(h['actual'] - h['consensus'])
-
-        hc1, hc2, hc3 = st.columns(3)
-        with hc1:
-            st.metric('Records', len(history))
-        with hc2:
-            st.metric('Model MAE', str(round(mae, 2))+' F')
-        with hc3:
-            st.metric('Within 1 degree', str(round(w1*100, 0))+'%')
-
-        cities_with_data = {c: errs for c, errs in city_biases.items() if len(errs) >= 3}
-        if cities_with_data:
-            with st.expander('City Bias Summary (mean error per city)', expanded=False):
-                bias_rows = []
-                for c, errs in sorted(cities_with_data.items()):
-                    mean_err = sum(errs) / len(errs)
-                    bias_rows.append({
-                        'City': c,
-                        'Days': len(errs),
-                        'Mean Error': str(round(mean_err, 2))+' F',
-                        'Direction': 'Model too cold ↑' if mean_err > 0.5 else 'Model too warm ↓' if mean_err < -0.5 else 'Accurate ✓',
-                        'Active Correction': ('+' if mean_err > 0 else '')+str(round(max(-3.0, min(3.0, mean_err)), 2))+' F'
-                    })
-                st.dataframe(pd.DataFrame(bias_rows), use_container_width=True, hide_index=True)
-
-    st.dataframe(df_h, use_container_width=True, hide_index=True)
+# Settlement history display removed in V4.17 — resets on every deploy.
+# Persistent storage (Google Sheets) planned for future version.
+# Bias correction still runs from in-session logged data.
