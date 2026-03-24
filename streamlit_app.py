@@ -42,7 +42,7 @@ SERIES = {
     'Phoenix': 'KXHIGHTPHX', 'Las Vegas': 'KXHIGHTLV',
     'Los Angeles': 'KXHIGHLAX', 'Dallas': 'KXHIGHTDAL',
     'Austin': 'KXHIGHAUS', 'Houston': 'KXHIGHTHOU',
-    'Atlanta': 'KXHIGHTATL', 'Miami': 'KXHIGHTMIA',
+    'Atlanta': 'KXHIGHTATL', 'Miami': 'KXHIGHMIA',
     'New York': 'KXHIGHNY', 'San Antonio': 'KXHIGHTSATX',
     'New Orleans': 'KXHIGHTNOLA', 'Philadelphia': 'KXHIGHPHIL',
     'Boston': 'KXHIGHTBOS', 'Denver': 'KXHIGHDEN',
