@@ -1,11 +1,10 @@
-# Kalshi High Temperature Model - V4.18
+# Kalshi High Temperature Model - V4.19
 #
-# Changes from V4.16:
-# 1. Open-Meteo forecast removed entirely — NWS is the only forecast source
-# 2. Ensemble weight reduced to 45-50% (was 65-70%)
-#    NWS matches settlement source so it dominates; ensemble measures spread only
-# 3. Clean 4-source display: NWS forecast | NOAA obs | Obs high floor | GFS ensemble
-# 4. All V4.16 fixes retained: Miami fix, label matching, uncertainty warning, bias correction
+# Changes from V4.18:
+# 1. City switch bug fixed — session state forces clean reload when city changes
+#    Prevents Miami (and other cities) from loading wrong settlement/ladder data
+# 2. Price cache cleared on city switch — ensures fresh Kalshi fetch per city
+# All V4.18 logic retained
 
 import math, re, json, time, requests
 import streamlit as st
@@ -14,8 +13,8 @@ from pathlib import Path
 from datetime import datetime
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.18', layout='wide')
-st.title('Kalshi High Temperature Model - V4.18')
+st.set_page_config(page_title='Kalshi High Temp V4.19', layout='wide')
+st.title('Kalshi High Temperature Model - V4.19')
 
 SAVE_FILE = Path('saved_ladders.json')
 HISTORY_FILE = Path('settlement_history.json')
@@ -24,7 +23,7 @@ PRICE_CACHE_FILE = Path('price_cache.json')
 PRICE_CACHE_MINUTES = 10
 
 MIN_EDGE = 8
-HEADERS = {'User-Agent': 'kalshi-temp-model/4.18', 'Accept': 'application/geo+json, application/json, text/html'}
+HEADERS = {'User-Agent': 'kalshi-temp-model/4.19', 'Accept': 'application/geo+json, application/json, text/html'}
 
 CITY_TZ = {
     'Phoenix': 'America/Phoenix', 'Las Vegas': 'America/Los_Angeles',
@@ -146,10 +145,7 @@ def fetch_nws_grid(lat, lon):
         return None
 
 def fetch_nws_forecast(lat, lon):
-    """
-    PRIMARY forecast source — same data Kalshi settles on.
-    Returns (forecast_high_F, forecast_url) or (None, None).
-    """
+    """PRIMARY forecast source — same data Kalshi settles on."""
     grid = fetch_nws_grid(lat, lon)
     if not grid:
         return None, None
@@ -160,7 +156,6 @@ def fetch_nws_forecast(lat, lon):
         periods = r.json().get('properties', {}).get('periods', [])
     except Exception:
         return None, None
-
     today = datetime.now().strftime('%Y-%m-%d')
     for period in periods:
         start = period.get('startTime', '')
@@ -170,7 +165,6 @@ def fetch_nws_forecast(lat, lon):
         if start.startswith(today) and is_day and temp is not None:
             temp_f = float(temp) if unit == 'F' else float(temp) * 9/5 + 32
             return round(temp_f, 1), fc_url
-    # Fallback: first available period (early AM before daytime period loads)
     for period in periods[:2]:
         temp = period.get('temperature')
         unit = period.get('temperatureUnit', 'F')
@@ -273,14 +267,12 @@ def fetch_gfs_ensemble(lat, lon):
         data = r.json()
     except Exception:
         return None, None
-
     today = datetime.now().strftime('%Y-%m-%d')
     hourly = data.get('hourly', {})
     times = hourly.get('time', [])
     today_indices = [i for i, t in enumerate(times) if t.startswith(today)]
     if not today_indices:
         return None, None
-
     member_maxes = []
     for key, vals in hourly.items():
         if key == 'time' or 'temperature_2m' not in key:
@@ -293,10 +285,8 @@ def fetch_gfs_ensemble(lat, lon):
                 member_maxes.append(round(max(float(v) for v in today_vals), 1))
             except Exception:
                 pass
-
     if len(member_maxes) < 3:
         return None, None
-
     mean = round(sum(member_maxes) / len(member_maxes), 1)
     return member_maxes, mean
 
@@ -318,13 +308,10 @@ def ensemble_confidence(prob):
         return '🟡 MED'
     return '⚪ LOW'
 
-# V4.17: Ensemble weight reduced to 45-50%
-# NWS is the settlement source so it should dominate; ensemble measures spread/uncertainty only
 def blend_probs(sigma_prob, ensemble_prob, members):
     if ensemble_prob is None or members is None:
         return sigma_prob
     n = len(members)
-    # Scale from 0.35 at n=3 to 0.50 at n=31+
     ensemble_weight = min(0.50, 0.35 + (n / 200.0))
     sigma_weight = 1.0 - ensemble_weight
     return round(sigma_weight * sigma_prob + ensemble_weight * ensemble_prob, 4)
@@ -420,7 +407,6 @@ def late_day_floor(fc, obs, local_hour):
 def compute_consensus(fc, cur, noaa, city, obs_high=None):
     local_hour = get_local_hour(city)
     is_fc_heavy = city in FORECAST_HEAVY_CITIES
-
     if is_fc_heavy and local_hour < 14:
         obs_val = noaa if noaa is not None else cur
         base = fc * 0.80 + obs_val * 0.20 if obs_val is not None else fc
@@ -429,20 +415,15 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
         base = fc * 0.65 + obs_val * 0.35 if obs_val is not None else fc
     else:
         base = fc * 0.55 + cur * 0.20 + noaa * 0.25 if noaa is not None else fc * 0.70 + cur * 0.30
-
-    # Soft cap: don't let consensus drift more than 3F from NWS forecast
     if abs(base - fc) > 3.0:
         base = fc - 3.0 if base < fc else fc + 3.0
-
     obs = noaa if noaa is not None else cur
     if obs is not None:
         consensus = max(base, late_day_floor(fc, obs, local_hour))
     else:
         consensus = base
-
     if obs_high is not None and obs_high > consensus:
         consensus = obs_high
-
     return consensus
 
 def bracket_probs(mu, ladder_text, city, obs_high=None, forecast=None):
@@ -634,42 +615,27 @@ def fetch_kalshi_brackets(series, retries=3):
     url = 'https://api.elections.kalshi.com/trade-api/v2/markets'
     event_ticker = get_event_ticker(series)
     today_date = datetime.now().strftime('%Y-%m-%d')
-    today_upper = datetime.now().strftime('%y%b%d').upper()   # e.g. 26MAR23
-    today_upper2 = datetime.now().strftime('%d%b%y').upper()  # e.g. 23MAR26
-    today_upper3 = datetime.now().strftime('%d%b%Y').upper()  # e.g. 23MAR2026
-
-    # Try 1: exact event ticker
+    today_upper = datetime.now().strftime('%y%b%d').upper()
+    today_upper2 = datetime.now().strftime('%d%b%y').upper()
+    today_upper3 = datetime.now().strftime('%d%b%Y').upper()
     data = safe_get_with_retry(url, {'event_ticker': event_ticker, 'limit': 30}, retries=retries, delay=2.0)
-
-    # Try 2: series ticker with open status
     if not data or not data.get('markets'):
         data = safe_get_with_retry(url, {'series_ticker': series, 'status': 'open', 'limit': 30}, retries=retries, delay=2.0)
-
-    # Try 3: series ticker without status filter
     if not data or not data.get('markets'):
         data = safe_get_with_retry(url, {'series_ticker': series, 'limit': 30}, retries=retries, delay=2.0)
-
     if not data or not data.get('markets'):
         return None
-
     all_markets = data['markets']
-
-    # Filter to today using all known date formats
     markets = [m for m in all_markets if
                today_upper in (m.get('ticker') or '').upper() or
                today_upper2 in (m.get('ticker') or '').upper() or
                today_upper3 in (m.get('ticker') or '').upper() or
                today_upper2 in (m.get('event_ticker') or '').upper() or
                today_upper3 in (m.get('event_ticker') or '').upper()]
-
-    # Fallback: filter by close_time date
     if not markets:
         markets = [m for m in all_markets if (m.get('close_time') or '').startswith(today_date)]
-
-    # Last resort: use all returned markets
     if not markets:
         markets = all_markets
-
     parsed = []
     for m in markets:
         label, key = parse_market_label(m)
@@ -740,23 +706,22 @@ with st.sidebar:
     st.markdown('**Max per trade:** min(5% bankroll, $100)')
     st.markdown('---')
     st.markdown('**Signal Key**')
-    st.markdown('🟢 Edge ≥8c — **BET**')
+    st.markdown('🟢 Edge >=8c — **BET**')
     st.markdown('🟡 Edge 3-7c — **SKIP**')
     st.markdown('🔴 Edge <3c — **AVOID**')
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V4.18 Changes**')
-    st.markdown('• NWS = only forecast source (matches Kalshi settlement)')
-    st.markdown('• Open-Meteo removed entirely')
-    st.markdown('• Ensemble weight 45-50% (was 65-70%)')
-    st.markdown('• NWS dominates — ensemble measures spread only')
-    st.markdown('• ⚠️ Gap >3F suppresses green signals')
+    st.markdown('**V4.19 Changes**')
+    st.markdown('- City switch bug fixed — clean reload on city change')
+    st.markdown('- Miami and all cities now load correct data')
+    st.markdown('- Price cache cleared on city switch')
     st.markdown('---')
-    st.markdown('**Retained from V4.15-17**')
-    st.markdown('• Miami label fix')
-    st.markdown('• Wider sigma, fc+3.0 cap')
-    st.markdown('• Bias correction from history')
+    st.markdown('**Retained from V4.18**')
+    st.markdown('- NWS only forecast source')
+    st.markdown('- Ensemble weight 45-50%')
+    st.markdown('- Sanity check layer')
+    st.markdown('- Uncertainty warning >3F gap')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -787,27 +752,40 @@ else:
                 st.warning('Could not fetch: ' + ', '.join(results['failed']))
             st.rerun()
 
-city = st.selectbox('City', list(CITIES.keys()), index=list(CITIES.keys()).index('New York'))
+# ── FIX: City switch forces clean reload via session state ────────────────────
+city_list = list(CITIES.keys())
+default_idx = city_list.index('New York')
+city = st.selectbox('City', city_list, index=default_idx)
+
+if 'last_city' not in st.session_state:
+    st.session_state.last_city = city
+
+if st.session_state.last_city != city:
+    st.session_state.last_city = city
+    clear_city_cache(city)
+    st.rerun()
+
+# All city-specific variables derived AFTER city is confirmed clean
 lat, lon = CITIES[city]['lat'], CITIES[city]['lon']
-station, series = STATIONS[city], SERIES[city]
-obs_icao = OBHISTORY_STATIONS.get(city, 'KNYC')
+station = STATIONS[city]
+series = SERIES[city]
+obs_icao = OBHISTORY_STATIONS[city]
 obs_url = 'https://forecast.weather.gov/data/obhistory/' + obs_icao + '.html'
 local_hour = get_local_hour(city)
-tz_name = CITY_TZ.get(city, 'America/New_York')
+tz_name = CITY_TZ[city]
 
 st.caption('Settlement: ' + station + ' - ' + SETTLEMENT_LOCATION[city] + ' - Series: ' + series)
 st.caption('Local time: ' + str(local_hour) + ':00 ' + tz_name)
 if city in FORECAST_HEAVY_CITIES and local_hour < 16:
-    st.caption('⚡ Forecast-heavy mode active (Texas/OKC heat lag correction)')
+    st.caption('Forecast-heavy mode active (Texas/OKC heat lag correction)')
 
-# Bias correction
 bias_correction, bias_n = compute_bias_correction(history, city)
 if bias_n >= 3:
     direction = 'warm' if bias_correction > 0 else 'cold'
-    st.info(f'📊 Bias correction active: +{bias_correction}°F applied to consensus '
-            f'(model ran {direction} by avg {abs(bias_correction)}°F over last {bias_n} days)')
+    st.info(f'Bias correction active: +{bias_correction}F applied to consensus '
+            f'(model ran {direction} by avg {abs(bias_correction)}F over last {bias_n} days)')
 elif bias_n > 0:
-    st.caption(f'Bias correction: {bias_n} settlement(s) logged for {city} — need 3+ for correction')
+    st.caption(f'Bias correction: {bias_n} settlement(s) logged for {city} - need 3+ for correction')
 
 if city not in saved_ladders:
     saved_ladders[city] = DEFAULT_LADDERS.get(city, '')
@@ -856,7 +834,7 @@ with st.expander('Edit Brackets', expanded=False):
 ladder_text = saved_ladders[city]
 st.caption('Current ladder: ' + ladder_text)
 
-# ── Live Weather — Clean 4-Source Display ────────────────────────────────────
+# ── Live Weather — Clean 4-Source Display ─────────────────────────────────────
 st.subheader('Live Weather')
 with st.spinner('Fetching weather data...'):
     nws_forecast, nws_fc_url = fetch_nws_forecast(lat, lon)
@@ -864,10 +842,9 @@ with st.spinner('Fetching weather data...'):
     obs_high_raw, obs_high_url = fetch_obs_high_today(obs_icao)
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
 
-# ── SANITY CHECK LAYER ────────────────────────────────────────────────────────
+# ── Sanity Check Layer ────────────────────────────────────────────────────────
 sanity_warnings = []
 
-# 1. Obs high sanity
 obs_high_today = obs_high_raw
 obs_high_suspect = False
 if obs_high_raw is not None:
@@ -875,105 +852,98 @@ if obs_high_raw is not None:
         obs_high_today = None
         obs_high_suspect = True
         sanity_warnings.append(
-            f'🚨 Obs high ({obs_high_raw}F) is {round(obs_high_raw - noaa_obs, 1)}F above current temp '
-            f'({round(noaa_obs, 1)}F) — likely wrong-day data. Discarded.'
+            f'Obs high ({obs_high_raw}F) is {round(obs_high_raw - noaa_obs, 1)}F above current temp '
+            f'({round(noaa_obs, 1)}F) - likely wrong-day data. Discarded.'
         )
     elif nws_forecast is not None and obs_high_raw > nws_forecast + 12.0:
         obs_high_today = None
         obs_high_suspect = True
         sanity_warnings.append(
-            f'🚨 Obs high ({obs_high_raw}F) is {round(obs_high_raw - nws_forecast, 1)}F above NWS forecast '
-            f'({nws_forecast}F) — implausible. Discarded.'
+            f'Obs high ({obs_high_raw}F) is {round(obs_high_raw - nws_forecast, 1)}F above NWS forecast '
+            f'({nws_forecast}F) - implausible. Discarded.'
         )
 
-# 2. NWS forecast staleness
 nws_stale = False
 if nws_forecast is not None and noaa_obs is not None:
     if noaa_obs > nws_forecast + 5.0:
         nws_stale = True
         sanity_warnings.append(
-            f'⚠️ NWS forecast ({nws_forecast}F) is {round(noaa_obs - nws_forecast, 1)}F below current temp '
-            f'({round(noaa_obs, 1)}F) — forecast may be stale. Consider manual override.'
+            f'NWS forecast ({nws_forecast}F) is {round(noaa_obs - nws_forecast, 1)}F below current temp '
+            f'({round(noaa_obs, 1)}F) - forecast may be stale. Consider manual override.'
         )
 
-# 3. Ensemble sanity
 ensemble_suspect = False
 if ensemble_mean is not None and nws_forecast is not None:
     if abs(ensemble_mean - nws_forecast) > 10.0:
         ensemble_suspect = True
         sanity_warnings.append(
-            f'⚠️ GFS ensemble ({ensemble_mean}F) differs from NWS by '
-            f'{round(abs(ensemble_mean - nws_forecast), 1)}F — discarded. Sigma-only mode.'
+            f'GFS ensemble ({ensemble_mean}F) differs from NWS by '
+            f'{round(abs(ensemble_mean - nws_forecast), 1)}F - discarded. Sigma-only mode.'
         )
         ensemble_members = None
         ensemble_mean = None
 
-# High uncertainty flag
 high_uncertainty = False
 source_gap = None
 if nws_forecast is not None and ensemble_mean is not None:
     source_gap = abs(nws_forecast - ensemble_mean)
     high_uncertainty = source_gap > 3.0
 
-# 4-source display
 col1, col2, col3, col4 = st.columns(4)
 with col1:
     if nws_forecast:
-        st.metric('🎯 NWS Forecast', str(nws_forecast)+' F')
-        st.caption('Primary — settlement source' + (' ⚠️stale' if nws_stale else ''))
+        st.metric('NWS Forecast', str(nws_forecast)+' F')
+        st.caption('Primary - settlement source' + (' (stale?)' if nws_stale else ''))
     else:
-        st.metric('🎯 NWS Forecast', 'Unavailable')
-        st.caption('⚠️ NWS /points failed')
+        st.metric('NWS Forecast', 'Unavailable')
+        st.caption('NWS /points failed')
 with col2:
     if noaa_obs is not None:
-        st.metric('🌡 Current Temp', str(round(noaa_obs, 1))+' F')
+        st.metric('Current Temp', str(round(noaa_obs, 1))+' F')
         st.caption('Station: ' + noaa_station)
     else:
-        st.metric('🌡 Current Temp', 'Unavailable')
+        st.metric('Current Temp', 'Unavailable')
 with col3:
     if obs_high_today is not None:
-        st.metric('📈 Obs High Today', str(obs_high_today)+' F', delta='floor active')
+        st.metric('Obs High Today', str(obs_high_today)+' F', delta='floor active')
         st.caption('[NWS table](' + obs_url + ')')
     elif obs_high_suspect:
-        st.metric('📈 Obs High Today', str(obs_high_raw)+'F ⚠️')
-        st.caption('Discarded — failed sanity check')
+        st.metric('Obs High Today', str(obs_high_raw)+'F')
+        st.caption('Discarded - failed sanity check')
     else:
-        st.metric('📈 Obs High Today', 'Unavailable')
+        st.metric('Obs High Today', 'Unavailable')
         st.caption('[NWS table](' + obs_url + ')')
 with col4:
     if ensemble_mean is not None:
         n_members = len(ensemble_members) if ensemble_members else 0
-        st.metric('🔮 GFS Ensemble', str(ensemble_mean)+' F', delta=str(n_members)+' members')
+        st.metric('GFS Ensemble', str(ensemble_mean)+' F', delta=str(n_members)+' members')
         st.caption('Weight: 45-50% | uncertainty measure')
     elif ensemble_suspect:
-        st.metric('🔮 GFS Ensemble', 'Discarded ⚠️')
-        st.caption('Failed sanity check — sigma only')
+        st.metric('GFS Ensemble', 'Discarded')
+        st.caption('Failed sanity check - sigma only')
     else:
-        st.metric('🔮 GFS Ensemble', 'Unavailable')
+        st.metric('GFS Ensemble', 'Unavailable')
         st.caption('Sigma-only mode')
 
-# Show sanity warnings prominently
 for w in sanity_warnings:
     st.error(w)
 
-# Uncertainty and bust warnings
 if nws_forecast is None:
-    st.error('⚠️ NWS forecast unavailable — cannot run model. Try refreshing or use manual override.')
+    st.error('NWS forecast unavailable - cannot run model. Try refreshing or use manual override.')
 elif high_uncertainty and source_gap is not None:
     st.warning(
-        f'⚠️ HIGH UNCERTAINTY: NWS ({nws_forecast}F) vs GFS ensemble ({ensemble_mean}F) '
-        f'gap = {round(source_gap, 1)}F — exceeds 3F threshold. '
+        f'HIGH UNCERTAINTY: NWS ({nws_forecast}F) vs GFS ensemble ({ensemble_mean}F) '
+        f'gap = {round(source_gap, 1)}F - exceeds 3F threshold. '
         f'Green signals suppressed. Consider waiting or sizing down.'
     )
 elif source_gap is not None and source_gap > 1.5:
-    st.info(f'ℹ️ Source gap: NWS vs Ensemble = {round(source_gap, 1)}F — moderate divergence, watch closely.')
+    st.info(f'Source gap: NWS vs Ensemble = {round(source_gap, 1)}F - moderate divergence, watch closely.')
 
 if obs_high_today is not None:
     for label, lo, hi in parse_ladder(ladder_text):
         if hi is not None and obs_high_today > hi + 0.4:
-            st.warning('🚫 BUST: ' + label + ' eliminated — obs high ' + str(obs_high_today) + 'F exceeds ' + str(hi) + 'F')
+            st.warning('BUST: ' + label + ' eliminated - obs high ' + str(obs_high_today) + 'F exceeds ' + str(hi) + 'F')
 
-# Manual overrides
 with st.expander('Override weather inputs', expanded=False):
     ov1, ov2, ov3, ov4 = st.columns(4)
     with ov1:
@@ -997,7 +967,6 @@ obs_high_final = override_obs_high if override_obs_high > 0 else obs_high_today
 if forecast is not None and current is not None:
     consensus_raw = compute_consensus(forecast, current, noaa_final, city, obs_high=obs_high_final)
     consensus = round(consensus_raw + bias_correction, 1)
-
     sigma_rows, sigma = bracket_probs(consensus, ladder_text, city, obs_high=obs_high_final, forecast=forecast)
     call = two_degree_call(consensus, ladder_text, obs_high=obs_high_final)
 
@@ -1023,7 +992,7 @@ if forecast is not None and current is not None:
         st.caption('GFS ensemble: '+str(ensemble_mean)+'F | '+str(len(ensemble_members))+
                    ' members | weight 45-50%')
     if high_uncertainty:
-        st.caption('⚠️ High uncertainty mode — green signals suppressed')
+        st.caption('High uncertainty mode - green signals suppressed')
 
     import pandas as pd
     df_rows = []
@@ -1032,37 +1001,31 @@ if forecast is not None and current is not None:
 
     for label, sigma_prob in sigma_rows:
         norm_label = normalize_label(label)
-
         ens_prob = None
         for lbl, lo, hi in parse_ladder(ladder_text):
             if normalize_label(lbl) == norm_label:
                 ens_prob = ensemble_bracket_prob(ensemble_members, lo, hi)
                 break
-
         final_prob = blend_probs(sigma_prob, ens_prob, ensemble_members)
         fair = round(final_prob * 100)
-
         yes_ask = no_ask = None
         if kalshi_markets:
             match = next((m for m in kalshi_markets if normalize_label(m[0]) == norm_label), None)
             if match:
                 yes_ask, no_ask = match[1], match[2]
-
         e = edge_cents(final_prob, yes_ask)
         signal_icon, signal_text = edge_signal(e, high_uncertainty=high_uncertainty)
         kelly = kelly_bet(final_prob, yes_ask, bankroll) if yes_ask else 0.0
         ens_conf = ensemble_confidence(ens_prob) if ens_prob is not None else ''
-
         busted = False
         if obs_high_final is not None:
             for lbl, lo, hi in parse_ladder(ladder_text):
                 if normalize_label(lbl) == norm_label and hi is not None and obs_high_final > hi + 0.4:
                     busted = True
-
         edge_str = ('+'+str(e)+'c') if e and e > 0 else (str(e)+'c' if e is not None else 'none')
         df_rows.append({
             'Signal': signal_icon + ' ' + signal_text,
-            'Bracket': label + (' 🚫BUSTED' if busted else ''),
+            'Bracket': label + (' BUSTED' if busted else ''),
             'Model %': str(round(final_prob*100, 1))+'%',
             'Fair': str(fair)+'c',
             'YES ask': str(yes_ask)+'c' if yes_ask is not None else 'none',
@@ -1071,7 +1034,6 @@ if forecast is not None and current is not None:
             'Kelly Bet': ('$'+str(kelly)) if kelly > 0 else '-',
             'Ensemble': ens_conf,
         })
-
         if e is not None and e > best_edge and not busted:
             best_edge = e
             best_bet = {'label': label, 'edge': e, 'kelly': kelly,
@@ -1080,26 +1042,26 @@ if forecast is not None and current is not None:
     st.dataframe(pd.DataFrame(df_rows), use_container_width=True, hide_index=True)
 
     if best_bet and best_bet['edge'] >= MIN_EDGE and not best_bet['uncertain']:
-        st.success('🎯 Best Bet: **' + best_bet['label'] + '** | Edge: +' +
+        st.success('Best Bet: **' + best_bet['label'] + '** | Edge: +' +
                    str(best_bet['edge']) + 'c | Kelly: $' + str(best_bet['kelly']))
     elif best_bet and best_bet['edge'] >= MIN_EDGE and best_bet['uncertain']:
-        st.warning('⚠️ Best edge: **' + best_bet['label'] + '** (+' + str(best_bet['edge']) +
-                   'c) but HIGH UNCERTAINTY — NWS vs ensemble gap >3F. Consider skipping.')
+        st.warning('Best edge: **' + best_bet['label'] + '** (+' + str(best_bet['edge']) +
+                   'c) but HIGH UNCERTAINTY - NWS vs ensemble gap >3F. Consider skipping.')
     elif best_bet:
-        st.warning('⚠️ No bracket meets the ' + str(MIN_EDGE) + 'c minimum. Best: ' +
-                   best_bet['label'] + ' (+' + str(best_bet['edge']) + 'c) — consider skipping today.')
+        st.warning('No bracket meets the ' + str(MIN_EDGE) + 'c minimum. Best: ' +
+                   best_bet['label'] + ' (+' + str(best_bet['edge']) + 'c) - consider skipping today.')
 
     parsed = parse_ladder(ladder_text)
     top_b = next((b for b in parsed if b[2] is None), None)
     bot_b = next((b for b in parsed if b[1] is None), None)
     if (top_b and consensus > top_b[1]+5) or (bot_b and bot_b[2] is not None and consensus < bot_b[2]-5):
-        st.warning('Ladder does not cover consensus of '+str(round(consensus, 1))+'F — update brackets.')
+        st.warning('Ladder does not cover consensus of '+str(round(consensus, 1))+'F - update brackets.')
 
 else:
     if forecast is None:
         st.error('NWS forecast unavailable. Use manual override or try refreshing.')
     else:
-        st.error('Current temperature unavailable — cannot compute consensus.')
+        st.error('Current temperature unavailable - cannot compute consensus.')
 
 # ── Settlement Log ────────────────────────────────────────────────────────────
 st.subheader('Log Actual High (after settlement)')
@@ -1128,6 +1090,6 @@ with st.form('log_form'):
         st.success('Logged - actual='+str(actual)+'F consensus='+str(round(consensus, 1))+
                    'F error='+str(entry['error'])+'F')
 
-# Settlement history display removed in V4.17 — resets on every deploy.
-# Persistent storage (Google Sheets) planned for future version.
+# Settlement history display removed — resets on every deploy.
+# Persistent storage planned for future version.
 # Bias correction still runs from in-session logged data.
