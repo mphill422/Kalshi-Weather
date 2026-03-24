@@ -634,22 +634,42 @@ def fetch_kalshi_brackets(series, retries=3):
     url = 'https://api.elections.kalshi.com/trade-api/v2/markets'
     event_ticker = get_event_ticker(series)
     today_date = datetime.now().strftime('%Y-%m-%d')
-    today_upper = datetime.now().strftime('%y%b%d').upper()
-    today_upper2 = datetime.now().strftime('%d%b%y').upper()
+    today_upper = datetime.now().strftime('%y%b%d').upper()   # e.g. 26MAR23
+    today_upper2 = datetime.now().strftime('%d%b%y').upper()  # e.g. 23MAR26
+    today_upper3 = datetime.now().strftime('%d%b%Y').upper()  # e.g. 23MAR2026
+
+    # Try 1: exact event ticker
     data = safe_get_with_retry(url, {'event_ticker': event_ticker, 'limit': 30}, retries=retries, delay=2.0)
+
+    # Try 2: series ticker with open status
     if not data or not data.get('markets'):
         data = safe_get_with_retry(url, {'series_ticker': series, 'status': 'open', 'limit': 30}, retries=retries, delay=2.0)
+
+    # Try 3: series ticker without status filter
+    if not data or not data.get('markets'):
+        data = safe_get_with_retry(url, {'series_ticker': series, 'limit': 30}, retries=retries, delay=2.0)
+
     if not data or not data.get('markets'):
         return None
+
     all_markets = data['markets']
+
+    # Filter to today using all known date formats
     markets = [m for m in all_markets if
                today_upper in (m.get('ticker') or '').upper() or
                today_upper2 in (m.get('ticker') or '').upper() or
-               today_upper2 in (m.get('event_ticker') or '').upper()]
+               today_upper3 in (m.get('ticker') or '').upper() or
+               today_upper2 in (m.get('event_ticker') or '').upper() or
+               today_upper3 in (m.get('event_ticker') or '').upper()]
+
+    # Fallback: filter by close_time date
     if not markets:
         markets = [m for m in all_markets if (m.get('close_time') or '').startswith(today_date)]
+
+    # Last resort: use all returned markets
     if not markets:
         markets = all_markets
+
     parsed = []
     for m in markets:
         label, key = parse_market_label(m)
