@@ -1,29 +1,31 @@
-# Kalshi High Temperature Model - V4.19
+# Kalshi High Temperature Model - V4.20
 #
-# Changes from V4.18:
-# 1. City switch bug fixed — session state forces clean reload when city changes
-#    Prevents Miami (and other cities) from loading wrong settlement/ladder data
-# 2. Price cache cleared on city switch — ensures fresh Kalshi fetch per city
-# All V4.18 logic retained
+# Changes from V4.19:
+# 1. Supabase persistent settlement storage — survives all deploys forever
+# 2. Auto-save today's prediction on every model run (no action needed)
+# 3. Auto-settle yesterday — fetches actual high from NWS on app open automatically
+# 4. Bias correction now works — reads from Supabase history, always active after 3+ days
+# 5. Calibration panel added — shows model accuracy per city over time
+# 6. Manual settlement form removed — fully automatic
+# 7. Improved Kalshi label matching — numeric key comparison, no more silent mismatches
 
 import math, re, json, time, requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.19', layout='wide')
-st.title('Kalshi High Temperature Model - V4.19')
+st.set_page_config(page_title='Kalshi High Temp V4.20', layout='wide')
+st.title('Kalshi High Temperature Model - V4.20')
 
 SAVE_FILE = Path('saved_ladders.json')
-HISTORY_FILE = Path('settlement_history.json')
 LAST_SYNC_FILE = Path('last_sync.json')
 PRICE_CACHE_FILE = Path('price_cache.json')
 PRICE_CACHE_MINUTES = 10
 
 MIN_EDGE = 8
-HEADERS = {'User-Agent': 'kalshi-temp-model/4.19', 'Accept': 'application/geo+json, application/json, text/html'}
+HEADERS = {'User-Agent': 'kalshi-temp-model/4.20', 'Accept': 'application/geo+json, application/json, text/html'}
 
 CITY_TZ = {
     'Phoenix': 'America/Phoenix', 'Las Vegas': 'America/Los_Angeles',
@@ -121,6 +123,169 @@ BASE_SIGMA = {
 DESERT_CITIES = {'Phoenix', 'Las Vegas'}
 FORECAST_HEAVY_CITIES = {'Dallas', 'Austin', 'Houston', 'San Antonio', 'Oklahoma City'}
 
+# ── Supabase Client ───────────────────────────────────────────────────────────
+def get_sb_headers():
+    key = st.secrets['supabase']['key']
+    return {
+        'apikey': key,
+        'Authorization': 'Bearer ' + key,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=representation',
+    }
+
+def sb_url(table):
+    return st.secrets['supabase']['url'] + '/rest/v1/' + table
+
+def sb_insert(row):
+    try:
+        r = requests.post(sb_url('settlements'), headers=get_sb_headers(), json=row, timeout=10)
+        return r.status_code in (200, 201)
+    except Exception:
+        return False
+
+def sb_fetch_all():
+    try:
+        r = requests.get(sb_url('settlements'), headers=get_sb_headers(),
+                         params={'order': 'date.asc', 'limit': '1000'}, timeout=10)
+        return r.json() if r.status_code == 200 else []
+    except Exception:
+        return []
+
+def sb_fetch_city(city):
+    try:
+        r = requests.get(sb_url('settlements'), headers=get_sb_headers(),
+                         params={'city': 'eq.' + city, 'order': 'date.asc', 'limit': '200'}, timeout=10)
+        return r.json() if r.status_code == 200 else []
+    except Exception:
+        return []
+
+def sb_fetch_unsettled():
+    """Rows where actual is null — pending auto-settlement."""
+    try:
+        r = requests.get(sb_url('settlements'), headers=get_sb_headers(),
+                         params={'actual': 'is.null', 'order': 'date.asc'}, timeout=10)
+        return r.json() if r.status_code == 200 else []
+    except Exception:
+        return []
+
+def sb_update_actual(row_id, actual, error):
+    try:
+        r = requests.patch(
+            sb_url('settlements') + '?id=eq.' + str(row_id),
+            headers=get_sb_headers(),
+            json={'actual': actual, 'error': round(error, 2)},
+            timeout=10
+        )
+        return r.status_code in (200, 204)
+    except Exception:
+        return False
+
+def sb_fetch_today(city):
+    today = datetime.now().strftime('%Y-%m-%d')
+    try:
+        r = requests.get(sb_url('settlements'), headers=get_sb_headers(),
+                         params={'date': 'eq.' + today, 'city': 'eq.' + city}, timeout=10)
+        rows = r.json() if r.status_code == 200 else []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+def sb_upsert_prediction(city, consensus, forecast, ensemble_mean, source_gap, high_uncertainty, obs_high, bias_correction):
+    today = datetime.now().strftime('%Y-%m-%d')
+    existing = sb_fetch_today(city)
+    row = {
+        'date': today,
+        'city': city,
+        'consensus': round(consensus, 2),
+        'forecast': round(forecast, 2) if forecast else None,
+        'ensemble_mean': round(ensemble_mean, 2) if ensemble_mean else None,
+        'source_gap': round(source_gap, 2) if source_gap else None,
+        'high_uncertainty': bool(high_uncertainty),
+        'obs_high': round(obs_high, 2) if obs_high else None,
+        'bias_correction': round(bias_correction, 2),
+        'actual': None,
+        'error': None,
+    }
+    if existing:
+        try:
+            r = requests.patch(
+                sb_url('settlements') + '?id=eq.' + str(existing['id']),
+                headers=get_sb_headers(),
+                json={k: v for k, v in row.items() if k not in ('date', 'city')},
+                timeout=10
+            )
+            return r.status_code in (200, 204)
+        except Exception:
+            return False
+    else:
+        return sb_insert(row)
+
+# ── Auto-Settlement ───────────────────────────────────────────────────────────
+def fetch_obs_high_for_date(icao, target_date_str):
+    """Fetch the obs high from NWS obhistory table for a specific date."""
+    url = 'https://forecast.weather.gov/data/obhistory/' + icao + '.html'
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=12)
+        r.raise_for_status()
+    except Exception:
+        return None
+    soup = BeautifulSoup(r.text, 'html.parser')
+    tables = soup.find_all('table')
+    table = max(tables, key=lambda t: len(t.find_all('tr')), default=None) if tables else None
+    if not table:
+        return None
+    target_day = str(datetime.strptime(target_date_str, '%Y-%m-%d').day)
+    highs = []
+    for row in table.find_all('tr'):
+        cols = [td.get_text(strip=True) for td in row.find_all('td')]
+        if not cols or len(cols) < 9 or cols[0] != target_day:
+            continue
+        try:
+            t = float(cols[8])
+            if 0 < t < 130:
+                highs.append(t)
+        except Exception:
+            pass
+    return round(max(highs), 1) if highs else None
+
+@st.cache_data(ttl=3600)
+def run_auto_settlement():
+    """Called once per hour. Finds unsettled rows and fills in actuals from NWS."""
+    unsettled = sb_fetch_unsettled()
+    if not unsettled:
+        return 0, []
+    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    settled = []
+    for row in unsettled:
+        row_date = row.get('date', '')
+        if row_date >= datetime.now().strftime('%Y-%m-%d'):
+            continue  # Don't try to settle today
+        city = row.get('city')
+        icao = OBHISTORY_STATIONS.get(city)
+        if not icao:
+            continue
+        actual = fetch_obs_high_for_date(icao, row_date)
+        if actual is None:
+            continue
+        consensus = row.get('consensus')
+        error = round(actual - consensus, 2) if consensus is not None else None
+        ok = sb_update_actual(row['id'], actual, error)
+        if ok:
+            settled.append({'city': city, 'date': row_date, 'actual': actual, 'error': error})
+    return len(settled), settled
+
+# ── Bias Correction ───────────────────────────────────────────────────────────
+def compute_bias_correction_db(city, n_recent=10):
+    rows = sb_fetch_city(city)
+    complete = [r for r in rows if r.get('actual') is not None and r.get('consensus') is not None]
+    if len(complete) < 3:
+        return 0.0, len(complete)
+    recent = complete[-n_recent:]
+    errors = [r['actual'] - r['consensus'] for r in recent]
+    mean_error = sum(errors) / len(errors)
+    correction = max(-3.0, min(3.0, mean_error))
+    return round(correction, 2), len(recent)
+
 # ── NWS Grid Cache ────────────────────────────────────────────────────────────
 _NWS_GRID_CACHE = {}
 
@@ -145,7 +310,6 @@ def fetch_nws_grid(lat, lon):
         return None
 
 def fetch_nws_forecast(lat, lon):
-    """PRIMARY forecast source — same data Kalshi settles on."""
     grid = fetch_nws_grid(lat, lon)
     if not grid:
         return None, None
@@ -174,7 +338,6 @@ def fetch_nws_forecast(lat, lon):
     return None, None
 
 def fetch_nws_current(lat, lon, station_id):
-    """Current obs from NOAA station."""
     if station_id:
         obs = safe_get('https://api.weather.gov/stations/' + station_id + '/observations/latest')
         if obs:
@@ -199,20 +362,6 @@ def fetch_nws_current(lat, lon, station_id):
     if temp_c is None:
         return sid, None
     return sid, float(c_to_f(temp_c))
-
-# ── Bias Correction ───────────────────────────────────────────────────────────
-def compute_bias_correction(history, city, n_recent=10):
-    city_entries = [h for h in history
-                    if h.get('city') == city
-                    and h.get('actual') is not None
-                    and h.get('consensus') is not None]
-    if len(city_entries) < 3:
-        return 0.0, len(city_entries)
-    recent = city_entries[-n_recent:]
-    errors = [h['actual'] - h['consensus'] for h in recent]
-    mean_error = sum(errors) / len(errors)
-    correction = max(-3.0, min(3.0, mean_error))
-    return round(correction, 2), len(recent)
 
 # ── Kelly Criterion ───────────────────────────────────────────────────────────
 def kelly_bet(model_prob, market_price_cents, bankroll, fractional=0.15, max_pct=0.05, max_dollars=100):
@@ -250,7 +399,7 @@ def edge_signal(e, high_uncertainty=False):
         return '🟡', 'SKIP'
     return '🔴', 'AVOID'
 
-# ── GFS 31-Member Ensemble ────────────────────────────────────────────────────
+# ── GFS Ensemble ──────────────────────────────────────────────────────────────
 def fetch_gfs_ensemble(lat, lon):
     url = 'https://ensemble-api.open-meteo.com/v1/ensemble'
     params = {
@@ -364,10 +513,32 @@ def normal_cdf(x, mu, sigma):
 def normalize_label(label):
     label = label.strip()
     label = re.sub(r'(\d+)\s+to\s+(\d+)', lambda m: m.group(1)+'-'+m.group(2), label, flags=re.I)
-    label = re.sub(r'(\d+)\s*-\s*(\d+)', lambda m: m.group(1)+'-'+m.group(2), label)
+    label = re.sub(r'(\d+)\s*[\-\u2013\u2014]\s*(\d+)', lambda m: m.group(1)+'-'+m.group(2), label)
     label = re.sub(r'\s+or\s+below', ' or below', label, flags=re.I)
     label = re.sub(r'\s+or\s+above', ' or above', label, flags=re.I)
-    return label.replace('\u00b0', '').replace('deg', '').strip()
+    label = label.replace('\u00b0', '').replace('deg', '').replace('+', ' or above')
+    return label.strip()
+
+def label_to_numeric_key(label):
+    """Convert label to (lo, hi) for numeric matching — avoids string fragility."""
+    label = normalize_label(label)
+    nums = [int(x) for x in re.findall(r'\d+', label)]
+    low = label.lower()
+    if not nums:
+        return None, None
+    if 'below' in low:
+        return None, nums[0]
+    if 'above' in low:
+        return nums[0], None
+    if len(nums) >= 2:
+        return nums[0], nums[1]
+    return None, None
+
+def labels_match(label_a, label_b):
+    """Numeric key comparison — immune to formatting differences."""
+    lo_a, hi_a = label_to_numeric_key(label_a)
+    lo_b, hi_b = label_to_numeric_key(label_b)
+    return lo_a == lo_b and hi_a == hi_b
 
 def parse_ladder(text):
     out = []
@@ -488,10 +659,8 @@ def fetch_obs_high_today(icao):
     except Exception:
         return None, url
     soup = BeautifulSoup(r.text, 'html.parser')
-    table = soup.find('table', {'class': 'observations'})
-    if not table:
-        tables = soup.find_all('table')
-        table = max(tables, key=lambda t: len(t.find_all('tr')), default=None) if tables else None
+    tables = soup.find_all('table')
+    table = max(tables, key=lambda t: len(t.find_all('tr')), default=None) if tables else None
     if not table:
         return None, url
     today_day = str(datetime.now().day)
@@ -506,13 +675,6 @@ def fetch_obs_high_today(icao):
                 highs.append(t)
         except Exception:
             pass
-        if len(cols) > 10:
-            try:
-                t6 = float(cols[10])
-                if 0 < t6 < 130:
-                    highs.append(t6)
-            except Exception:
-                pass
     return (round(max(highs), 1), url) if highs else (None, url)
 
 def parse_market_label(m):
@@ -712,25 +874,28 @@ with st.sidebar:
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V4.19 Changes**')
-    st.markdown('- City switch bug fixed — clean reload on city change')
-    st.markdown('- Miami and all cities now load correct data')
-    st.markdown('- Price cache cleared on city switch')
-    st.markdown('---')
-    st.markdown('**Retained from V4.18**')
-    st.markdown('- NWS only forecast source')
-    st.markdown('- Ensemble weight 45-50%')
-    st.markdown('- Sanity check layer')
-    st.markdown('- Uncertainty warning >3F gap')
+    st.markdown('**V4.20 Changes**')
+    st.markdown('- Supabase persistent settlement storage')
+    st.markdown('- Auto-settle yesterday on app open')
+    st.markdown('- Auto-save predictions — no manual input')
+    st.markdown('- Bias correction always active (reads DB)')
+    st.markdown('- Numeric label matching for Kalshi prices')
+    st.markdown('- Calibration panel added')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
-history = load_json(HISTORY_FILE)
-if not isinstance(history, list):
-    history = []
-
 today_str = datetime.now().strftime('%Y-%m-%d')
 last_sync_data = load_json(LAST_SYNC_FILE)
+
+# ── Auto-Settlement (runs silently on load) ───────────────────────────────────
+if 'auto_settled' not in st.session_state:
+    with st.spinner('Checking for unsettled predictions...'):
+        n_settled, settled_rows = run_auto_settlement()
+    st.session_state.auto_settled = True
+    if n_settled > 0:
+        for s in settled_rows:
+            direction = '✅' if abs(s['error']) <= 1.5 else '⚠️'
+            st.success(f"{direction} Auto-settled {s['city']} ({s['date']}): actual={s['actual']}F | error={s['error']:+.1f}F")
 
 if last_sync_data.get('date') != today_str:
     saved_ladders, results = sync_all_ladders(saved_ladders)
@@ -752,7 +917,7 @@ else:
                 st.warning('Could not fetch: ' + ', '.join(results['failed']))
             st.rerun()
 
-# ── FIX: City switch forces clean reload via session state ────────────────────
+# ── City Selection ────────────────────────────────────────────────────────────
 city_list = list(CITIES.keys())
 default_idx = city_list.index('New York')
 city = st.selectbox('City', city_list, index=default_idx)
@@ -765,7 +930,6 @@ if st.session_state.last_city != city:
     clear_city_cache(city)
     st.rerun()
 
-# All city-specific variables derived AFTER city is confirmed clean
 lat, lon = CITIES[city]['lat'], CITIES[city]['lon']
 station = STATIONS[city]
 series = SERIES[city]
@@ -779,17 +943,21 @@ st.caption('Local time: ' + str(local_hour) + ':00 ' + tz_name)
 if city in FORECAST_HEAVY_CITIES and local_hour < 16:
     st.caption('Forecast-heavy mode active (Texas/OKC heat lag correction)')
 
-bias_correction, bias_n = compute_bias_correction(history, city)
+# ── Bias Correction (from Supabase) ──────────────────────────────────────────
+bias_correction, bias_n = compute_bias_correction_db(city)
 if bias_n >= 3:
     direction = 'warm' if bias_correction > 0 else 'cold'
     st.info(f'Bias correction active: +{bias_correction}F applied to consensus '
             f'(model ran {direction} by avg {abs(bias_correction)}F over last {bias_n} days)')
 elif bias_n > 0:
-    st.caption(f'Bias correction: {bias_n} settlement(s) logged for {city} - need 3+ for correction')
+    st.caption(f'Bias correction: {bias_n} settlement(s) logged for {city} — need 3+ for correction')
+else:
+    st.caption(f'Bias correction: no history yet for {city} — will activate after 3 settled days')
 
 if city not in saved_ladders:
     saved_ladders[city] = DEFAULT_LADDERS.get(city, '')
 
+# ── Kalshi Prices ─────────────────────────────────────────────────────────────
 kalshi_markets, fetched_at = get_cached_prices(city)
 if kalshi_markets is None:
     with st.spinner('Fetching live Kalshi prices for ' + city + '...'):
@@ -834,7 +1002,7 @@ with st.expander('Edit Brackets', expanded=False):
 ladder_text = saved_ladders[city]
 st.caption('Current ladder: ' + ladder_text)
 
-# ── Live Weather — Clean 4-Source Display ─────────────────────────────────────
+# ── Live Weather ──────────────────────────────────────────────────────────────
 st.subheader('Live Weather')
 with st.spinner('Fetching weather data...'):
     nws_forecast, nws_fc_url = fetch_nws_forecast(lat, lon)
@@ -842,26 +1010,24 @@ with st.spinner('Fetching weather data...'):
     obs_high_raw, obs_high_url = fetch_obs_high_today(obs_icao)
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
 
-# ── Sanity Check Layer ────────────────────────────────────────────────────────
+# ── Sanity Checks ─────────────────────────────────────────────────────────────
 sanity_warnings = []
-
 obs_high_today = obs_high_raw
 obs_high_suspect = False
+
 if obs_high_raw is not None:
     if noaa_obs is not None and obs_high_raw > noaa_obs + 15.0:
         obs_high_today = None
         obs_high_suspect = True
         sanity_warnings.append(
             f'Obs high ({obs_high_raw}F) is {round(obs_high_raw - noaa_obs, 1)}F above current temp '
-            f'({round(noaa_obs, 1)}F) - likely wrong-day data. Discarded.'
-        )
+            f'({round(noaa_obs, 1)}F) - likely wrong-day data. Discarded.')
     elif nws_forecast is not None and obs_high_raw > nws_forecast + 12.0:
         obs_high_today = None
         obs_high_suspect = True
         sanity_warnings.append(
             f'Obs high ({obs_high_raw}F) is {round(obs_high_raw - nws_forecast, 1)}F above NWS forecast '
-            f'({nws_forecast}F) - implausible. Discarded.'
-        )
+            f'({nws_forecast}F) - implausible. Discarded.')
 
 nws_stale = False
 if nws_forecast is not None and noaa_obs is not None:
@@ -869,8 +1035,7 @@ if nws_forecast is not None and noaa_obs is not None:
         nws_stale = True
         sanity_warnings.append(
             f'NWS forecast ({nws_forecast}F) is {round(noaa_obs - nws_forecast, 1)}F below current temp '
-            f'({round(noaa_obs, 1)}F) - forecast may be stale. Consider manual override.'
-        )
+            f'({round(noaa_obs, 1)}F) - forecast may be stale.')
 
 ensemble_suspect = False
 if ensemble_mean is not None and nws_forecast is not None:
@@ -878,8 +1043,7 @@ if ensemble_mean is not None and nws_forecast is not None:
         ensemble_suspect = True
         sanity_warnings.append(
             f'GFS ensemble ({ensemble_mean}F) differs from NWS by '
-            f'{round(abs(ensemble_mean - nws_forecast), 1)}F - discarded. Sigma-only mode.'
-        )
+            f'{round(abs(ensemble_mean - nws_forecast), 1)}F - discarded.')
         ensemble_members = None
         ensemble_mean = None
 
@@ -896,7 +1060,6 @@ with col1:
         st.caption('Primary - settlement source' + (' (stale?)' if nws_stale else ''))
     else:
         st.metric('NWS Forecast', 'Unavailable')
-        st.caption('NWS /points failed')
 with col2:
     if noaa_obs is not None:
         st.metric('Current Temp', str(round(noaa_obs, 1))+' F')
@@ -917,27 +1080,22 @@ with col4:
     if ensemble_mean is not None:
         n_members = len(ensemble_members) if ensemble_members else 0
         st.metric('GFS Ensemble', str(ensemble_mean)+' F', delta=str(n_members)+' members')
-        st.caption('Weight: 45-50% | uncertainty measure')
+        st.caption('Weight: 45-50%')
     elif ensemble_suspect:
         st.metric('GFS Ensemble', 'Discarded')
-        st.caption('Failed sanity check - sigma only')
+        st.caption('Failed sanity check')
     else:
         st.metric('GFS Ensemble', 'Unavailable')
-        st.caption('Sigma-only mode')
 
 for w in sanity_warnings:
     st.error(w)
 
 if nws_forecast is None:
-    st.error('NWS forecast unavailable - cannot run model. Try refreshing or use manual override.')
+    st.error('NWS forecast unavailable - cannot run model.')
 elif high_uncertainty and source_gap is not None:
-    st.warning(
-        f'HIGH UNCERTAINTY: NWS ({nws_forecast}F) vs GFS ensemble ({ensemble_mean}F) '
-        f'gap = {round(source_gap, 1)}F - exceeds 3F threshold. '
-        f'Green signals suppressed. Consider waiting or sizing down.'
-    )
+    st.warning(f'HIGH UNCERTAINTY: NWS ({nws_forecast}F) vs GFS ({ensemble_mean}F) gap = {round(source_gap, 1)}F. Green signals suppressed.')
 elif source_gap is not None and source_gap > 1.5:
-    st.info(f'Source gap: NWS vs Ensemble = {round(source_gap, 1)}F - moderate divergence, watch closely.')
+    st.info(f'Source gap: NWS vs Ensemble = {round(source_gap, 1)}F - moderate divergence.')
 
 if obs_high_today is not None:
     for label, lo, hi in parse_ladder(ladder_text):
@@ -970,11 +1128,25 @@ if forecast is not None and current is not None:
     sigma_rows, sigma = bracket_probs(consensus, ladder_text, city, obs_high=obs_high_final, forecast=forecast)
     call = two_degree_call(consensus, ladder_text, obs_high=obs_high_final)
 
+    # ── Auto-save prediction to Supabase ─────────────────────────────────────
+    save_ok = sb_upsert_prediction(
+        city=city,
+        consensus=consensus,
+        forecast=forecast,
+        ensemble_mean=ensemble_mean,
+        source_gap=source_gap,
+        high_uncertainty=high_uncertainty,
+        obs_high=obs_high_final,
+        bias_correction=bias_correction,
+    )
+    if not save_ok:
+        st.caption('⚠️ Could not save prediction to database')
+
     st.subheader('Model Output')
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         st.metric('Consensus High', str(round(consensus, 1))+' F')
-        st.caption('Source: NWS' + (' + override' if override_fc > 0 else ''))
+        st.caption('Saved to DB ✓' if save_ok else 'DB save failed')
     with c2:
         st.metric('2 Degree Call', call or 'none')
     with c3:
@@ -1000,17 +1172,17 @@ if forecast is not None and current is not None:
     best_edge = -999
 
     for label, sigma_prob in sigma_rows:
-        norm_label = normalize_label(label)
         ens_prob = None
         for lbl, lo, hi in parse_ladder(ladder_text):
-            if normalize_label(lbl) == norm_label:
+            if labels_match(lbl, label):
                 ens_prob = ensemble_bracket_prob(ensemble_members, lo, hi)
                 break
         final_prob = blend_probs(sigma_prob, ens_prob, ensemble_members)
         fair = round(final_prob * 100)
         yes_ask = no_ask = None
         if kalshi_markets:
-            match = next((m for m in kalshi_markets if normalize_label(m[0]) == norm_label), None)
+            # Numeric key matching — immune to string formatting differences
+            match = next((m for m in kalshi_markets if labels_match(m[0], label)), None)
             if match:
                 yes_ask, no_ask = match[1], match[2]
         e = edge_cents(final_prob, yes_ask)
@@ -1020,7 +1192,7 @@ if forecast is not None and current is not None:
         busted = False
         if obs_high_final is not None:
             for lbl, lo, hi in parse_ladder(ladder_text):
-                if normalize_label(lbl) == norm_label and hi is not None and obs_high_final > hi + 0.4:
+                if labels_match(lbl, label) and hi is not None and obs_high_final > hi + 0.4:
                     busted = True
         edge_str = ('+'+str(e)+'c') if e and e > 0 else (str(e)+'c' if e is not None else 'none')
         df_rows.append({
@@ -1046,10 +1218,10 @@ if forecast is not None and current is not None:
                    str(best_bet['edge']) + 'c | Kelly: $' + str(best_bet['kelly']))
     elif best_bet and best_bet['edge'] >= MIN_EDGE and best_bet['uncertain']:
         st.warning('Best edge: **' + best_bet['label'] + '** (+' + str(best_bet['edge']) +
-                   'c) but HIGH UNCERTAINTY - NWS vs ensemble gap >3F. Consider skipping.')
+                   'c) but HIGH UNCERTAINTY - consider skipping.')
     elif best_bet:
         st.warning('No bracket meets the ' + str(MIN_EDGE) + 'c minimum. Best: ' +
-                   best_bet['label'] + ' (+' + str(best_bet['edge']) + 'c) - consider skipping today.')
+                   best_bet['label'] + ' (+' + str(best_bet['edge']) + 'c)')
 
     parsed = parse_ladder(ladder_text)
     top_b = next((b for b in parsed if b[2] is None), None)
@@ -1063,33 +1235,45 @@ else:
     else:
         st.error('Current temperature unavailable - cannot compute consensus.')
 
-# ── Settlement Log ────────────────────────────────────────────────────────────
-st.subheader('Log Actual High (after settlement)')
-with st.form('log_form'):
-    actual = st.number_input('Actual NWS High F', min_value=0.0, max_value=130.0, step=0.1)
-    if st.form_submit_button('Log Settlement') and forecast is not None:
-        entry = {
-            'date': datetime.now().strftime('%Y-%m-%d'),
-            'city': city,
-            'actual': actual,
-            'forecast': round(forecast, 1),
-            'forecast_source': 'NWS' if override_fc == 0 else 'override',
-            'nws_forecast': nws_forecast,
-            'consensus': round(consensus, 1),
-            'consensus_raw': round(consensus_raw, 1),
-            'bias_correction': bias_correction,
-            'ensemble_mean': ensemble_mean,
-            'source_gap': round(source_gap, 1) if source_gap is not None else None,
-            'high_uncertainty': high_uncertainty,
-            'obs_high': obs_high_final,
-            'error': round(actual - consensus, 1),
-            'error_raw': round(actual - consensus_raw, 1),
-        }
-        history.append(entry)
-        save_json(HISTORY_FILE, history[-300:])
-        st.success('Logged - actual='+str(actual)+'F consensus='+str(round(consensus, 1))+
-                   'F error='+str(entry['error'])+'F')
+# ── Calibration Panel ─────────────────────────────────────────────────────────
+st.markdown('---')
+st.subheader('Calibration & Settlement History')
 
-# Settlement history display removed — resets on every deploy.
-# Persistent storage planned for future version.
-# Bias correction still runs from in-session logged data.
+with st.expander('View history for ' + city, expanded=False):
+    rows = sb_fetch_city(city)
+    complete = [r for r in rows if r.get('actual') is not None]
+    pending = [r for r in rows if r.get('actual') is None]
+
+    if complete:
+        import pandas as pd
+        errors = [r['error'] for r in complete if r.get('error') is not None]
+        mae = round(sum(abs(e) for e in errors) / len(errors), 2) if errors else None
+        avg_err = round(sum(errors) / len(errors), 2) if errors else None
+        within_2 = round(100 * sum(1 for e in errors if abs(e) <= 2.0) / len(errors)) if errors else None
+
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric('Settled Days', len(complete))
+        with m2:
+            st.metric('MAE', str(mae)+'F' if mae else 'n/a')
+        with m3:
+            st.metric('Avg Error', ('+' if avg_err and avg_err > 0 else '')+str(avg_err)+'F' if avg_err else 'n/a',
+                      delta='warm bias' if avg_err and avg_err < -0.5 else 'cold bias' if avg_err and avg_err > 0.5 else 'calibrated')
+        with m4:
+            st.metric('Within ±2F', str(within_2)+'%' if within_2 else 'n/a')
+
+        hist_df = pd.DataFrame([{
+            'Date': r['date'],
+            'Consensus': r.get('consensus'),
+            'Actual': r.get('actual'),
+            'Error': ('+' if r['error'] > 0 else '') + str(r['error']) + 'F' if r.get('error') is not None else '',
+            'Ensemble': r.get('ensemble_mean'),
+            'Uncertain': '⚠️' if r.get('high_uncertainty') else '',
+        } for r in sorted(complete, key=lambda x: x['date'], reverse=True)])
+        st.dataframe(hist_df, use_container_width=True, hide_index=True)
+    else:
+        st.info('No settled history yet for ' + city + '. Predictions auto-save daily and settle the next morning.')
+
+    if pending:
+        st.caption(str(len(pending)) + ' prediction(s) pending settlement: ' +
+                   ', '.join(r['date'] for r in pending))
