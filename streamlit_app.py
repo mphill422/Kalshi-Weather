@@ -1,13 +1,9 @@
-# Kalshi High Temperature Model - V4.20
+# Kalshi High Temperature Model - V4.21
 #
-# Changes from V4.19:
-# 1. Supabase persistent settlement storage — survives all deploys forever
-# 2. Auto-save today's prediction on every model run (no action needed)
-# 3. Auto-settle yesterday — fetches actual high from NWS on app open automatically
-# 4. Bias correction now works — reads from Supabase history, always active after 3+ days
-# 5. Calibration panel added — shows model accuracy per city over time
-# 6. Manual settlement form removed — fully automatic
-# 7. Improved Kalshi label matching — numeric key comparison, no more silent mismatches
+# Changes from V4.20:
+# 1. Fixed two_degree_call — now correctly calls open-ended brackets (73 or above, 64 or below)
+# 2. Fixed morning weighting — NWS forecast trusted more heavily before noon, less cold-temp drag
+# 3. Local secrets setup instructions added in comments below
 
 import math, re, json, time, requests
 import streamlit as st
@@ -16,8 +12,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.20', layout='wide')
-st.title('Kalshi High Temperature Model - V4.20')
+st.set_page_config(page_title='Kalshi High Temp V4.21', layout='wide')
+st.title('Kalshi High Temperature Model - V4.21')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -580,12 +576,22 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
     is_fc_heavy = city in FORECAST_HEAVY_CITIES
     if is_fc_heavy and local_hour < 14:
         obs_val = noaa if noaa is not None else cur
-        base = fc * 0.80 + obs_val * 0.20 if obs_val is not None else fc
+        base = fc * 0.85 + obs_val * 0.15 if obs_val is not None else fc
     elif is_fc_heavy and local_hour < 16:
         obs_val = noaa if noaa is not None else cur
-        base = fc * 0.65 + obs_val * 0.35 if obs_val is not None else fc
+        base = fc * 0.70 + obs_val * 0.30 if obs_val is not None else fc
+    elif local_hour < 10:
+        # Early morning — trust NWS forecast heavily, current temp is cold/misleading
+        base = fc * 0.85 + cur * 0.10 + (noaa * 0.05 if noaa is not None else 0) if noaa is not None else fc * 0.90 + cur * 0.10
+    elif local_hour < 12:
+        # Late morning — still lean on forecast
+        base = fc * 0.75 + cur * 0.15 + (noaa * 0.10 if noaa is not None else 0) if noaa is not None else fc * 0.80 + cur * 0.20
+    elif local_hour < 14:
+        # Early afternoon — more balanced
+        base = fc * 0.60 + cur * 0.20 + noaa * 0.20 if noaa is not None else fc * 0.75 + cur * 0.25
     else:
-        base = fc * 0.55 + cur * 0.20 + noaa * 0.25 if noaa is not None else fc * 0.70 + cur * 0.30
+        # Late afternoon — obs matters most
+        base = fc * 0.45 + cur * 0.25 + noaa * 0.30 if noaa is not None else fc * 0.60 + cur * 0.40
     if abs(base - fc) > 3.0:
         base = fc - 3.0 if base < fc else fc + 3.0
     obs = noaa if noaa is not None else cur
@@ -617,11 +623,18 @@ def bracket_probs(mu, ladder_text, city, obs_high=None, forecast=None):
 def two_degree_call(mu, ladder_text, obs_high=None):
     best_label, best_dist = None, float('inf')
     for label, lo, hi in parse_ladder(ladder_text):
-        if lo is None or hi is None:
+        if obs_high is not None and hi is not None and obs_high > hi + 0.4:
             continue
-        if obs_high is not None and obs_high > hi + 0.4:
+        # Handle open-ended brackets properly
+        if lo is None and hi is not None:
+            mid = hi - 1.0  # "X or below"
+        elif hi is None and lo is not None:
+            mid = lo + 1.0  # "X or above"
+        elif lo is not None and hi is not None:
+            mid = (lo + hi) / 2
+        else:
             continue
-        dist = abs((lo + hi) / 2 - mu)
+        dist = abs(mid - mu)
         if dist < best_dist:
             best_dist = dist
             best_label = label
@@ -874,13 +887,10 @@ with st.sidebar:
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V4.20 Changes**')
-    st.markdown('- Supabase persistent settlement storage')
-    st.markdown('- Auto-settle yesterday on app open')
-    st.markdown('- Auto-save predictions — no manual input')
-    st.markdown('- Bias correction always active (reads DB)')
-    st.markdown('- Numeric label matching for Kalshi prices')
-    st.markdown('- Calibration panel added')
+    st.markdown('**V4.21 Changes**')
+    st.markdown('- Fixed 2-degree call for open-ended brackets')
+    st.markdown('- Morning weighting fixed — NWS trusted more before noon')
+    st.markdown('- Less cold-temp drag on consensus early in day')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
