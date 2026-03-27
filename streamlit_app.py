@@ -1,9 +1,8 @@
-# Kalshi High Temperature Model - V4.21
+# Kalshi High Temperature Model - V4.22
 #
-# Changes from V4.20:
-# 1. Fixed two_degree_call — now correctly calls open-ended brackets (73 or above, 64 or below)
-# 2. Fixed morning weighting — NWS forecast trusted more heavily before noon, less cold-temp drag
-# 3. Local secrets setup instructions added in comments below
+# Changes from V4.21:
+# 1. Supabase fallback — works locally without secrets file
+# 2. DB will now save predictions even on localhost
 
 import math, re, json, time, requests
 import streamlit as st
@@ -12,8 +11,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.21', layout='wide')
-st.title('Kalshi High Temperature Model - V4.21')
+st.set_page_config(page_title='Kalshi High Temp V4.22', layout='wide')
+st.title('Kalshi High Temperature Model - V4.22')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -120,8 +119,14 @@ DESERT_CITIES = {'Phoenix', 'Las Vegas'}
 FORECAST_HEAVY_CITIES = {'Dallas', 'Austin', 'Houston', 'San Antonio', 'Oklahoma City'}
 
 # ── Supabase Client ───────────────────────────────────────────────────────────
+_SB_URL = 'https://oirnfhhuyjuotkrlymxd.supabase.co'
+_SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9pcm5maGh1eWp1b3Rrcmx5bXhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDIzMDYyMjAsImV4cCI6MjA1NzgyNjIyMH0.3Mp81UjdxkpAYq_cuaOa-0Vqo1LkMgxawOM1gWF6TJ0'
+
 def get_sb_headers():
-    key = st.secrets['supabase']['key']
+    try:
+        key = st.secrets['supabase']['key']
+    except Exception:
+        key = _SB_KEY
     return {
         'apikey': key,
         'Authorization': 'Bearer ' + key,
@@ -130,7 +135,11 @@ def get_sb_headers():
     }
 
 def sb_url(table):
-    return st.secrets['supabase']['url'] + '/rest/v1/' + table
+    try:
+        url = st.secrets['supabase']['url']
+    except Exception:
+        url = _SB_URL
+    return url + '/rest/v1/' + table
 
 def sb_insert(row):
     try:
@@ -887,10 +896,11 @@ with st.sidebar:
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V4.21 Changes**')
+    st.markdown('**V4.22 Changes**')
+    st.markdown('- Supabase fallback — no secrets file needed locally')
+    st.markdown('- DB saves predictions automatically everywhere')
     st.markdown('- Fixed 2-degree call for open-ended brackets')
-    st.markdown('- Morning weighting fixed — NWS trusted more before noon')
-    st.markdown('- Less cold-temp drag on consensus early in day')
+    st.markdown('- Morning weighting fixed')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
