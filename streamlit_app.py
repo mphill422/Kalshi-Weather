@@ -1,8 +1,10 @@
-# Kalshi High Temperature Model - V4.22
+# Kalshi High Temperature Model - V4.23
 #
-# Changes from V4.21:
-# 1. Supabase fallback — works locally without secrets file
-# 2. DB will now save predictions even on localhost
+# Changes from V4.22:
+# 1. Raised high uncertainty threshold from 3.0F to 5.0F — signals no longer suppressed on normal divergence
+# 2. Desert cities (Phoenix, Las Vegas) get even higher threshold of 6.0F
+# 3. Moderate divergence info message raised to 2.5F
+# 4. NWS stale detection improved — when NWS is 10F+ below current temp, model trusts current temp more
 
 import math, re, json, time, requests
 import streamlit as st
@@ -11,8 +13,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.22', layout='wide')
-st.title('Kalshi High Temperature Model - V4.22')
+st.set_page_config(page_title='Kalshi High Temp V4.23', layout='wide')
+st.title('Kalshi High Temperature Model - V4.23')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -896,11 +898,11 @@ with st.sidebar:
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V4.22 Changes**')
-    st.markdown('- Supabase fallback — no secrets file needed locally')
-    st.markdown('- DB saves predictions automatically everywhere')
-    st.markdown('- Fixed 2-degree call for open-ended brackets')
-    st.markdown('- Morning weighting fixed')
+    st.markdown('**V4.23 Changes**')
+    st.markdown('- Uncertainty threshold raised to 5.0F (6.0F for desert cities)')
+    st.markdown('- Green BET signals now show on normal morning divergence')
+    st.markdown('- Moderate divergence info raised to 2.5F')
+    st.markdown('- Supabase fallback hardcoded')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1071,7 +1073,8 @@ high_uncertainty = False
 source_gap = None
 if nws_forecast is not None and ensemble_mean is not None:
     source_gap = abs(nws_forecast - ensemble_mean)
-    high_uncertainty = source_gap > 3.0
+    uncertainty_threshold = 6.0 if city in DESERT_CITIES else 5.0
+    high_uncertainty = source_gap > uncertainty_threshold
 
 col1, col2, col3, col4 = st.columns(4)
 with col1:
@@ -1114,7 +1117,7 @@ if nws_forecast is None:
     st.error('NWS forecast unavailable - cannot run model.')
 elif high_uncertainty and source_gap is not None:
     st.warning(f'HIGH UNCERTAINTY: NWS ({nws_forecast}F) vs GFS ({ensemble_mean}F) gap = {round(source_gap, 1)}F. Green signals suppressed.')
-elif source_gap is not None and source_gap > 1.5:
+elif source_gap is not None and source_gap > 2.5:
     st.info(f'Source gap: NWS vs Ensemble = {round(source_gap, 1)}F - moderate divergence.')
 
 if obs_high_today is not None:
