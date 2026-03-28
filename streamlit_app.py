@@ -1,10 +1,9 @@
-# Kalshi High Temperature Model - V4.24
+# Kalshi High Temperature Model - V4.25
 #
-# Changes from V4.23:
-# 1. Morning weighting overhauled — NWS forecast now 90-95% weight before 10am
-# 2. Texas/OKC cities get 95% NWS weight before 10am — eliminates cold morning bias
-# 3. Consensus cap raised from 3F to 4F deviation from NWS
-# 4. All cities trust NWS much more heavily before noon
+# Changes from V4.24:
+# 1. GFS ensemble weight reduced from 45-50% to 15-25% — GFS runs cold in spring
+# 2. NWS-based sigma probability now dominates at 75-85% weight
+# 3. GFS still used as sanity check but no longer drags consensus down
 
 import math, re, json, time, requests
 import streamlit as st
@@ -13,8 +12,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.24', layout='wide')
-st.title('Kalshi High Temperature Model - V4.24')
+st.set_page_config(page_title='Kalshi High Temp V4.25', layout='wide')
+st.title('Kalshi High Temperature Model - V4.25')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -468,7 +467,8 @@ def blend_probs(sigma_prob, ensemble_prob, members):
     if ensemble_prob is None or members is None:
         return sigma_prob
     n = len(members)
-    ensemble_weight = min(0.50, 0.35 + (n / 200.0))
+    # GFS runs cold in spring — cap ensemble weight at 25%, NWS-based sigma dominates
+    ensemble_weight = min(0.25, 0.15 + (n / 400.0))
     sigma_weight = 1.0 - ensemble_weight
     return round(sigma_weight * sigma_prob + ensemble_weight * ensemble_prob, 4)
 
@@ -901,11 +901,10 @@ with st.sidebar:
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V4.24 Changes**')
-    st.markdown('- NWS forecast 95% weight before 10am for Texas/OKC')
-    st.markdown('- NWS forecast 90% weight before 10am for all other cities')
-    st.markdown('- Eliminates cold morning bias that caused Dallas +11.9F error')
-    st.markdown('- Consensus cap raised to 4F deviation from NWS')
+    st.markdown('**V4.25 Changes**')
+    st.markdown('- GFS ensemble weight cut to 15-25% (was 45-50%)')
+    st.markdown('- NWS sigma probability now 75-85% of final blend')
+    st.markdown('- Fixes GFS cold bias in spring mornings')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
