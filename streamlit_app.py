@@ -1,9 +1,11 @@
-# Kalshi High Temperature Model - V4.25
+# Kalshi High Temperature Model - V4.26
 #
-# Changes from V4.24:
-# 1. GFS ensemble weight reduced from 45-50% to 15-25% — GFS runs cold in spring
-# 2. NWS-based sigma probability now dominates at 75-85% weight
-# 3. GFS still used as sanity check but no longer drags consensus down
+# Changes from V4.25:
+# 1. City-specific GFS ensemble weights based on observed spring bias
+# 2. Phoenix/Vegas: 10% GFS weight (runs cold in desert heat)
+# 3. LA: 12% GFS weight (runs warm for coastal)
+# 4. Dallas/Boston/NYC: 25% GFS weight (reliable)
+# 5. NWS sigma now drives 75-90% of probabilities depending on city
 
 import math, re, json, time, requests
 import streamlit as st
@@ -12,8 +14,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.25', layout='wide')
-st.title('Kalshi High Temperature Model - V4.25')
+st.set_page_config(page_title='Kalshi High Temp V4.26', layout='wide')
+st.title('Kalshi High Temperature Model - V4.26')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -463,12 +465,24 @@ def ensemble_confidence(prob):
         return '🟡 MED'
     return '⚪ LOW'
 
-def blend_probs(sigma_prob, ensemble_prob, members):
+# GFS ensemble weight by city — based on observed spring bias patterns
+# Desert cities (Phoenix, Vegas): GFS runs cold, trust less
+# Coastal cities (LA): GFS runs warm, trust less
+# Stable cities (Dallas, Boston, NYC, etc): GFS reliable, trust more
+GFS_CITY_WEIGHT = {
+    'Phoenix': 0.10, 'Las Vegas': 0.10,
+    'Los Angeles': 0.12,
+    'Miami': 0.18, 'Houston': 0.18, 'New Orleans': 0.18,
+    'Dallas': 0.25, 'Austin': 0.25, 'San Antonio': 0.25, 'Oklahoma City': 0.25,
+    'Atlanta': 0.22, 'Washington DC': 0.22,
+    'New York': 0.25, 'Philadelphia': 0.25, 'Boston': 0.25,
+    'Denver': 0.22, 'Minneapolis': 0.22,
+}
+
+def blend_probs(sigma_prob, ensemble_prob, members, city=''):
     if ensemble_prob is None or members is None:
         return sigma_prob
-    n = len(members)
-    # GFS runs cold in spring — cap ensemble weight at 25%, NWS-based sigma dominates
-    ensemble_weight = min(0.25, 0.15 + (n / 400.0))
+    ensemble_weight = GFS_CITY_WEIGHT.get(city, 0.20)
     sigma_weight = 1.0 - ensemble_weight
     return round(sigma_weight * sigma_prob + ensemble_weight * ensemble_prob, 4)
 
@@ -901,10 +915,11 @@ with st.sidebar:
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V4.25 Changes**')
-    st.markdown('- GFS ensemble weight cut to 15-25% (was 45-50%)')
-    st.markdown('- NWS sigma probability now 75-85% of final blend')
-    st.markdown('- Fixes GFS cold bias in spring mornings')
+    st.markdown('**V4.26 Changes**')
+    st.markdown('- City-specific GFS weights (10-25% by city)')
+    st.markdown('- Phoenix/Vegas: 10% GFS (cold bias in desert)')
+    st.markdown('- LA: 12% GFS (warm bias coastal)')
+    st.markdown('- Dallas/NYC/Boston: 25% GFS (reliable)')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1202,7 +1217,7 @@ if forecast is not None and current is not None:
             if labels_match(lbl, label):
                 ens_prob = ensemble_bracket_prob(ensemble_members, lo, hi)
                 break
-        final_prob = blend_probs(sigma_prob, ens_prob, ensemble_members)
+        final_prob = blend_probs(sigma_prob, ens_prob, ensemble_members, city)
         fair = round(final_prob * 100)
         yes_ask = no_ask = None
         if kalshi_markets:
