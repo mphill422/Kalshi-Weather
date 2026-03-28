@@ -1,10 +1,10 @@
-# Kalshi High Temperature Model - V4.23
+# Kalshi High Temperature Model - V4.24
 #
-# Changes from V4.22:
-# 1. Raised high uncertainty threshold from 3.0F to 5.0F — signals no longer suppressed on normal divergence
-# 2. Desert cities (Phoenix, Las Vegas) get even higher threshold of 6.0F
-# 3. Moderate divergence info message raised to 2.5F
-# 4. NWS stale detection improved — when NWS is 10F+ below current temp, model trusts current temp more
+# Changes from V4.23:
+# 1. Morning weighting overhauled — NWS forecast now 90-95% weight before 10am
+# 2. Texas/OKC cities get 95% NWS weight before 10am — eliminates cold morning bias
+# 3. Consensus cap raised from 3F to 4F deviation from NWS
+# 4. All cities trust NWS much more heavily before noon
 
 import math, re, json, time, requests
 import streamlit as st
@@ -13,8 +13,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.23', layout='wide')
-st.title('Kalshi High Temperature Model - V4.23')
+st.set_page_config(page_title='Kalshi High Temp V4.24', layout='wide')
+st.title('Kalshi High Temperature Model - V4.24')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -585,26 +585,29 @@ def late_day_floor(fc, obs, local_hour):
 def compute_consensus(fc, cur, noaa, city, obs_high=None):
     local_hour = get_local_hour(city)
     is_fc_heavy = city in FORECAST_HEAVY_CITIES
-    if is_fc_heavy and local_hour < 14:
+    if is_fc_heavy and local_hour < 10:
+        # Texas/OKC early morning — NWS forecast is ground truth, current temp irrelevant
+        base = fc * 0.95 + (noaa if noaa is not None else cur) * 0.05 if (noaa is not None or cur is not None) else fc
+    elif is_fc_heavy and local_hour < 14:
         obs_val = noaa if noaa is not None else cur
-        base = fc * 0.85 + obs_val * 0.15 if obs_val is not None else fc
+        base = fc * 0.90 + obs_val * 0.10 if obs_val is not None else fc
     elif is_fc_heavy and local_hour < 16:
         obs_val = noaa if noaa is not None else cur
-        base = fc * 0.70 + obs_val * 0.30 if obs_val is not None else fc
+        base = fc * 0.75 + obs_val * 0.25 if obs_val is not None else fc
     elif local_hour < 10:
-        # Early morning — trust NWS forecast heavily, current temp is cold/misleading
-        base = fc * 0.85 + cur * 0.10 + (noaa * 0.05 if noaa is not None else 0) if noaa is not None else fc * 0.90 + cur * 0.10
+        # Early morning all other cities — trust NWS heavily
+        base = fc * 0.90 + cur * 0.07 + (noaa * 0.03 if noaa is not None else 0) if noaa is not None else fc * 0.93 + cur * 0.07
     elif local_hour < 12:
-        # Late morning — still lean on forecast
-        base = fc * 0.75 + cur * 0.15 + (noaa * 0.10 if noaa is not None else 0) if noaa is not None else fc * 0.80 + cur * 0.20
+        # Late morning — lean heavily on forecast
+        base = fc * 0.80 + cur * 0.12 + (noaa * 0.08 if noaa is not None else 0) if noaa is not None else fc * 0.85 + cur * 0.15
     elif local_hour < 14:
         # Early afternoon — more balanced
-        base = fc * 0.60 + cur * 0.20 + noaa * 0.20 if noaa is not None else fc * 0.75 + cur * 0.25
+        base = fc * 0.65 + cur * 0.18 + noaa * 0.17 if noaa is not None else fc * 0.78 + cur * 0.22
     else:
         # Late afternoon — obs matters most
         base = fc * 0.45 + cur * 0.25 + noaa * 0.30 if noaa is not None else fc * 0.60 + cur * 0.40
-    if abs(base - fc) > 3.0:
-        base = fc - 3.0 if base < fc else fc + 3.0
+    if abs(base - fc) > 4.0:
+        base = fc - 4.0 if base < fc else fc + 4.0
     obs = noaa if noaa is not None else cur
     if obs is not None:
         consensus = max(base, late_day_floor(fc, obs, local_hour))
@@ -898,11 +901,11 @@ with st.sidebar:
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V4.23 Changes**')
-    st.markdown('- Uncertainty threshold raised to 5.0F (6.0F for desert cities)')
-    st.markdown('- Green BET signals now show on normal morning divergence')
-    st.markdown('- Moderate divergence info raised to 2.5F')
-    st.markdown('- Supabase fallback hardcoded')
+    st.markdown('**V4.24 Changes**')
+    st.markdown('- NWS forecast 95% weight before 10am for Texas/OKC')
+    st.markdown('- NWS forecast 90% weight before 10am for all other cities')
+    st.markdown('- Eliminates cold morning bias that caused Dallas +11.9F error')
+    st.markdown('- Consensus cap raised to 4F deviation from NWS')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
