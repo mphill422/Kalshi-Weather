@@ -1,11 +1,9 @@
-# Kalshi High Temperature Model - V4.26
+# Kalshi High Temperature Model - V4.27
 #
-# Changes from V4.25:
-# 1. City-specific GFS ensemble weights based on observed spring bias
-# 2. Phoenix/Vegas: 10% GFS weight (runs cold in desert heat)
-# 3. LA: 12% GFS weight (runs warm for coastal)
-# 4. Dallas/Boston/NYC: 25% GFS weight (reliable)
-# 5. NWS sigma now drives 75-90% of probabilities depending on city
+# Changes from V4.26:
+# 1. Fixed UTC midnight timezone bug — all dates now use US Eastern time
+# 2. Cloud server was saving predictions as next day after 8pm EST
+# 3. All datetime.now() calls replaced with Eastern timezone aware versions
 
 import math, re, json, time, requests
 import streamlit as st
@@ -14,8 +12,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.26', layout='wide')
-st.title('Kalshi High Temperature Model - V4.26')
+st.set_page_config(page_title='Kalshi High Temp V4.27', layout='wide')
+st.title('Kalshi High Temperature Model - V4.27')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -189,7 +187,7 @@ def sb_update_actual(row_id, actual, error):
         return False
 
 def sb_fetch_today(city):
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = get_eastern_date()
     try:
         r = requests.get(sb_url('settlements'), headers=get_sb_headers(),
                          params={'date': 'eq.' + today, 'city': 'eq.' + city}, timeout=10)
@@ -199,7 +197,7 @@ def sb_fetch_today(city):
         return None
 
 def sb_upsert_prediction(city, consensus, forecast, ensemble_mean, source_gap, high_uncertainty, obs_high, bias_correction):
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = get_eastern_date()
     existing = sb_fetch_today(city)
     row = {
         'date': today,
@@ -266,7 +264,7 @@ def run_auto_settlement():
     settled = []
     for row in unsettled:
         row_date = row.get('date', '')
-        if row_date >= datetime.now().strftime('%Y-%m-%d'):
+        if row_date >= get_eastern_date():
             continue  # Don't try to settle today
         city = row.get('city')
         icao = OBHISTORY_STATIONS.get(city)
@@ -328,7 +326,7 @@ def fetch_nws_forecast(lat, lon):
         periods = r.json().get('properties', {}).get('periods', [])
     except Exception:
         return None, None
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = get_eastern_date()
     for period in periods:
         start = period.get('startTime', '')
         is_day = period.get('isDaytime', False)
@@ -424,7 +422,7 @@ def fetch_gfs_ensemble(lat, lon):
         data = r.json()
     except Exception:
         return None, None
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = get_eastern_date()
     hourly = data.get('hourly', {})
     times = hourly.get('time', [])
     today_indices = [i for i, t in enumerate(times) if t.startswith(today)]
@@ -487,13 +485,26 @@ def blend_probs(sigma_prob, ensemble_prob, members, city=''):
     return round(sigma_weight * sigma_prob + ensemble_weight * ensemble_prob, 4)
 
 # ── Core Math ─────────────────────────────────────────────────────────────────
+def get_eastern_date():
+    """Always returns today's date in US Eastern time — fixes UTC midnight bug on cloud."""
+    eastern = pytz.timezone('America/New_York')
+    return datetime.now(eastern).strftime('%Y-%m-%d')
+
+def get_eastern_datetime():
+    """Returns current datetime in US Eastern time."""
+    eastern = pytz.timezone('America/New_York')
+    return datetime.now(eastern)
+
 def get_local_hour(city):
+    tz_name = CITY_TZ.get(city, 'America/New_York')
+    tz = pytz.timezone(tz_name)
+    return datetime.now(tz).hour
     tz_name = CITY_TZ.get(city, 'America/New_York')
     tz = pytz.timezone(tz_name)
     return datetime.now(tz).hour
 
 def get_event_ticker(series):
-    return series + '-' + datetime.now().strftime('%d%b%y').upper()
+    return series + '-' + get_eastern_datetime().strftime('%d%b%y').upper()
 
 def load_json(path):
     if path.exists():
@@ -817,10 +828,10 @@ def get_price_cents(m):
 def fetch_kalshi_brackets(series, retries=3):
     url = 'https://api.elections.kalshi.com/trade-api/v2/markets'
     event_ticker = get_event_ticker(series)
-    today_date = datetime.now().strftime('%Y-%m-%d')
-    today_upper = datetime.now().strftime('%y%b%d').upper()
-    today_upper2 = datetime.now().strftime('%d%b%y').upper()
-    today_upper3 = datetime.now().strftime('%d%b%Y').upper()
+    today_date = get_eastern_date()
+    today_upper = get_eastern_datetime().strftime('%y%b%d').upper()
+    today_upper2 = get_eastern_datetime().strftime('%d%b%y').upper()
+    today_upper3 = get_eastern_datetime().strftime('%d%b%Y').upper()
     data = safe_get_with_retry(url, {'event_ticker': event_ticker, 'limit': 30}, retries=retries, delay=2.0)
     if not data or not data.get('markets'):
         data = safe_get_with_retry(url, {'series_ticker': series, 'status': 'open', 'limit': 30}, retries=retries, delay=2.0)
@@ -872,7 +883,7 @@ def clear_city_cache(city):
     save_json(PRICE_CACHE_FILE, cache)
 
 def sync_all_ladders(saved_ladders, force=False):
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = get_eastern_date()
     last_sync = load_json(LAST_SYNC_FILE)
     if not force and last_sync.get('date') == today:
         return saved_ladders, None
@@ -915,15 +926,14 @@ with st.sidebar:
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V4.26 Changes**')
-    st.markdown('- City-specific GFS weights (10-25% by city)')
-    st.markdown('- Phoenix/Vegas: 10% GFS (cold bias in desert)')
-    st.markdown('- LA: 12% GFS (warm bias coastal)')
-    st.markdown('- Dallas/NYC/Boston: 25% GFS (reliable)')
+    st.markdown('**V4.27 Changes**')
+    st.markdown('- Fixed UTC midnight bug — dates now use Eastern time')
+    st.markdown('- Predictions no longer save as next day after 8pm EST')
+    st.markdown('- City-specific GFS weights from V4.26 retained')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
-today_str = datetime.now().strftime('%Y-%m-%d')
+today_str = get_eastern_date()
 last_sync_data = load_json(LAST_SYNC_FILE)
 
 # ── Auto-Settlement (runs silently on load) ───────────────────────────────────
