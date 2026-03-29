@@ -1,12 +1,12 @@
-# Kalshi High Temperature Model - V4.28
+# Kalshi High Temperature Model - V4.29
 #
-# Changes from V4.27:
-# 1. Auto-save all 17 cities on morning load — no manual city-switching needed
-# 2. Batch prediction runner piggybacks on morning ladder sync
-# 3. GFS ensemble gap tracker added — logs NWS vs GFS delta per city to DB
-# 4. Consensus now anchored tighter to NWS when GFS gap is small (<3F)
-# 5. GFS sanity band tightened from 10F to 8F before discard
-# 6. All V4.27 fixes retained (Eastern timezone, city-specific GFS weights)
+# Changes from V4.28:
+# 1. All Cities panel is now self-healing — detects missing cities and fills them in automatically
+# 2. No manual intervention needed — panel saves any city not yet in DB for today on render
+# 3. Weather fetches are cached per-city so re-renders don't repeat API calls
+# 4. Morning batch save removed from startup — All Cities panel handles it naturally
+# 5. Cities processed one at a time with status indicators so nothing times out
+# 6. All V4.28 fixes retained (GFS 6am-9pm window, 8F sanity band, Eastern obs high)
 
 import math, re, json, time, requests
 import streamlit as st
@@ -15,8 +15,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.28', layout='wide')
-st.title('Kalshi High Temperature Model - V4.28')
+st.set_page_config(page_title='Kalshi High Temp V4.29', layout='wide')
+st.title('Kalshi High Temperature Model - V4.29')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -909,6 +909,85 @@ def sync_all_ladders(saved_ladders, force=False):
     progress.empty()
     return saved_ladders, {'synced': synced, 'failed': failed}
 
+# ── Cached per-city weather fetch — prevents repeat API calls on re-render ───
+@st.cache_data(ttl=1800)
+def fetch_city_weather(city):
+    """
+    Fetch NWS forecast, current obs, obs high, and GFS ensemble for one city.
+    Cached for 30 minutes so the All Cities panel can re-render without re-hitting APIs.
+    Returns dict with all weather values or None fields on failure.
+    """
+    coords = CITIES[city]
+    lat, lon = coords['lat'], coords['lon']
+    station = STATIONS[city]
+    obs_icao = OBHISTORY_STATIONS[city]
+
+    nws_fc, _ = fetch_nws_forecast(lat, lon)
+    _, current_temp = fetch_nws_current(lat, lon, station)
+    obs_high_raw, _ = fetch_obs_high_today(obs_icao)
+    ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
+
+    # Sanity checks
+    obs_high_final = obs_high_raw
+    if obs_high_raw is not None and current_temp is not None:
+        if obs_high_raw > current_temp + 15.0:
+            obs_high_final = None
+    if obs_high_raw is not None and nws_fc is not None:
+        if obs_high_raw > nws_fc + 12.0:
+            obs_high_final = None
+    if ensemble_mean is not None and nws_fc is not None:
+        if abs(ensemble_mean - nws_fc) > 8.0:
+            ensemble_members = None
+            ensemble_mean = None
+
+    source_gap = None
+    high_uncertainty = False
+    if nws_fc is not None and ensemble_mean is not None:
+        source_gap = abs(nws_fc - ensemble_mean)
+        uncertainty_threshold = 6.0 if city in DESERT_CITIES else 5.0
+        high_uncertainty = source_gap > uncertainty_threshold
+
+    return {
+        'nws_fc': nws_fc,
+        'current_temp': current_temp,
+        'obs_high': obs_high_final,
+        'ensemble_members': ensemble_members,
+        'ensemble_mean': ensemble_mean,
+        'source_gap': source_gap,
+        'high_uncertainty': high_uncertainty,
+    }
+
+def save_city_prediction(city, weather, saved_ladders):
+    """
+    Given a pre-fetched weather dict, compute consensus and upsert to Supabase.
+    Returns (consensus, save_ok).
+    """
+    nws_fc = weather['nws_fc']
+    if nws_fc is None:
+        return None, False
+    current_temp = weather['current_temp']
+    obs_high = weather['obs_high']
+    ensemble_mean = weather['ensemble_mean']
+    source_gap = weather['source_gap']
+    high_uncertainty = weather['high_uncertainty']
+
+    cur = current_temp if current_temp is not None else nws_fc
+    consensus_raw = compute_consensus(nws_fc, cur, current_temp, city, obs_high=obs_high)
+    bias_correction, _ = compute_bias_correction_db(city)
+    consensus = round(consensus_raw + bias_correction, 1)
+
+    save_ok = sb_upsert_prediction(
+        city=city,
+        consensus=consensus,
+        forecast=nws_fc,
+        ensemble_mean=ensemble_mean,
+        source_gap=source_gap,
+        high_uncertainty=high_uncertainty,
+        obs_high=obs_high,
+        bias_correction=bias_correction,
+    )
+    return consensus, save_ok
+
 # ── Batch Prediction Save — all 17 cities on morning load ────────────────────
 def batch_save_all_predictions(saved_ladders):
     """
@@ -1022,12 +1101,12 @@ with st.sidebar:
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V4.28 Changes**')
-    st.markdown('- All 17 cities auto-saved to DB each morning')
-    st.markdown('- GFS hourly window filtered to 6am-9pm (eliminates overnight lows)')
-    st.markdown('- GFS sanity band tightened from 10F to 8F')
-    st.markdown('- `fetch_obs_high_today` now Eastern-timezone aware')
-    st.markdown('- City-specific GFS weights from V4.26/V4.27 retained')
+    st.markdown('**V4.29 Changes**')
+    st.markdown('- All Cities panel self-heals — fills missing cities automatically')
+    st.markdown('- No manual steps needed for full 17-city coverage')
+    st.markdown('- Weather fetches cached per-city to prevent timeouts')
+    st.markdown('- GFS 6am-9pm window filter retained from V4.28')
+    st.markdown('- GFS sanity band 8F retained from V4.28')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1044,22 +1123,15 @@ if 'auto_settled' not in st.session_state:
             direction = '✅' if abs(s['error']) <= 1.5 else '⚠️'
             st.success(f"{direction} Auto-settled {s['city']} ({s['date']}): actual={s['actual']}F | error={s['error']:+.1f}F")
 
-# ── Morning Sync + Batch Prediction Save ─────────────────────────────────────
+# ── Morning Sync ──────────────────────────────────────────────────────────────
 if last_sync_data.get('date') != today_str:
-    # Step 1: sync ladders from Kalshi
+    # Sync ladders from Kalshi — predictions now saved by All Cities panel
     saved_ladders, results = sync_all_ladders(saved_ladders)
     if results:
         n = len(results.get('synced', []))
         st.success('Morning sync complete — ' + str(n) + '/' + str(len(SERIES)) + ' city ladders loaded from Kalshi')
         if results.get('failed'):
             st.warning('Could not fetch: ' + ', '.join(results['failed']) + ' — using saved ladders')
-
-    # Step 2: batch-save predictions for all 17 cities
-    if 'batch_saved' not in st.session_state:
-        with st.spinner('Saving daily predictions for all 17 cities...'):
-            n_saved, n_skipped = batch_save_all_predictions(saved_ladders)
-        st.session_state.batch_saved = True
-        st.success(f'Daily predictions saved: {n_saved} new, {n_skipped} already on file')
 else:
     col_info, col_btn = st.columns([5, 1])
     with col_info:
@@ -1439,13 +1511,48 @@ with st.expander('View history for ' + city, expanded=False):
         st.caption(str(len(pending)) + ' prediction(s) pending settlement: ' +
                    ', '.join(r['date'] for r in pending))
 
-# ── All Cities Summary Panel ──────────────────────────────────────────────────
+# ── All Cities Summary Panel — self-healing ───────────────────────────────────
 st.markdown('---')
-with st.expander('All Cities — Today\'s Predictions', expanded=False):
+with st.expander('All Cities — Today\'s Predictions', expanded=True):
+    import pandas as pd
+
+    # Fetch what's already in DB for today
     all_rows = sb_fetch_all()
     today_rows = [r for r in all_rows if r.get('date') == today_str]
+    saved_cities = {r['city'] for r in today_rows}
+    missing_cities = [c for c in CITIES.keys() if c not in saved_cities]
+
+    # Fill in any missing cities right now, one at a time
+    if missing_cities:
+        fill_status = st.empty()
+        newly_saved = []
+        for c in missing_cities:
+            fill_status.caption(f'Fetching {c}...')
+            try:
+                weather = fetch_city_weather(c)
+                consensus, save_ok = save_city_prediction(c, weather, saved_ladders)
+                if save_ok and consensus is not None:
+                    bias_correction, _ = compute_bias_correction_db(c)
+                    today_rows.append({
+                        'city': c,
+                        'date': today_str,
+                        'consensus': consensus,
+                        'forecast': weather['nws_fc'],
+                        'ensemble_mean': weather['ensemble_mean'],
+                        'source_gap': weather['source_gap'],
+                        'high_uncertainty': weather['high_uncertainty'],
+                        'bias_correction': bias_correction,
+                    })
+                    newly_saved.append(c)
+            except Exception:
+                pass
+            time.sleep(0.4)
+        fill_status.empty()
+        if newly_saved:
+            st.caption(f'✅ Filled in {len(newly_saved)} missing cities: {", ".join(newly_saved)}')
+
+    # Render the full table
     if today_rows:
-        import pandas as pd
         summary_df = pd.DataFrame([{
             'City': r['city'],
             'Consensus': str(r.get('consensus', ''))+'F',
@@ -1456,6 +1563,8 @@ with st.expander('All Cities — Today\'s Predictions', expanded=False):
             'Bias Adj': ('+' if (r.get('bias_correction') or 0) >= 0 else '')+str(r.get('bias_correction', 0))+'F',
         } for r in sorted(today_rows, key=lambda x: x['city'])])
         st.dataframe(summary_df, use_container_width=True, hide_index=True)
-        st.caption(f'{len(today_rows)}/17 cities saved for {today_str}')
+        n_saved_total = len(today_rows)
+        status_icon = '✅' if n_saved_total == 17 else '⏳'
+        st.caption(f'{status_icon} {n_saved_total}/17 cities saved for {today_str}')
     else:
-        st.info('No predictions saved yet today. Will populate automatically on next morning load.')
+        st.info('Loading predictions for all cities — this panel fills itself in automatically.')
