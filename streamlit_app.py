@@ -1,12 +1,12 @@
-# Kalshi High Temperature Model - V4.29
+# Kalshi High Temperature Model - V4.30
 #
-# Changes from V4.28:
-# 1. All Cities panel is now self-healing — detects missing cities and fills them in automatically
-# 2. No manual intervention needed — panel saves any city not yet in DB for today on render
-# 3. Weather fetches are cached per-city so re-renders don't repeat API calls
-# 4. Morning batch save removed from startup — All Cities panel handles it naturally
-# 5. Cities processed one at a time with status indicators so nothing times out
-# 6. All V4.28 fixes retained (GFS 6am-9pm window, 8F sanity band, Eastern obs high)
+# Changes from V4.29:
+# 1. NO bet signals added to bracket table
+# 2. Three NO signal types: BUSTED brackets, low-probability overbought YES, high-confidence model NO
+# 3. Best NO Bet banner added below main table
+# 4. Kelly sizing for NO bets uses inverse probability (1 - model_prob)
+# 5. NO edge calculated as: (1 - model_prob)*100 - no_ask
+# 6. All V4.29 infrastructure retained
 
 import math, re, json, time, requests
 import streamlit as st
@@ -15,8 +15,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.29', layout='wide')
-st.title('Kalshi High Temperature Model - V4.29')
+st.set_page_config(page_title='Kalshi High Temp V4.30', layout='wide')
+st.title('Kalshi High Temperature Model - V4.30')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -422,7 +422,50 @@ def edge_signal(e, high_uncertainty=False):
         return '🟡', 'SKIP'
     return '🔴', 'AVOID'
 
-# ── GFS Ensemble ──────────────────────────────────────────────────────────────
+def no_edge_cents(model_prob, no_ask_cents):
+    """Edge on buying NO = (1 - model_prob)*100 - no_ask_cents"""
+    if no_ask_cents is None:
+        return None
+    return round((1.0 - model_prob) * 100 - no_ask_cents, 1)
+
+def no_signal(no_edge, busted=False, model_prob=None, no_ask=None, high_uncertainty=False):
+    """
+    Generate NO signal based on three conditions:
+    1. BUSTED — obs high already eliminated this bracket → BET NO at any price under 5c
+    2. Low model probability + cheap NO ask → BET NO
+    3. High uncertainty — suppress green signals
+    """
+    if busted:
+        if no_ask is not None and no_ask <= 5:
+            return '🟢', 'BET NO (busted)'
+        return '🟡', 'CONSIDER NO (busted)'
+    if no_edge is None:
+        return None, None
+    if high_uncertainty:
+        if no_edge >= MIN_EDGE:
+            return '🟡', 'SKIP NO (uncertain)'
+        return None, None
+    if no_edge >= MIN_EDGE:
+        return '🟢', 'BET NO'
+    if no_edge >= 3:
+        return '🟡', 'SKIP NO'
+    return None, None
+
+def kelly_bet_no(model_prob, no_ask_cents, bankroll, fractional=0.15, max_pct=0.05, max_dollars=100):
+    """Kelly sizing for NO bets — uses (1 - model_prob) as the win probability."""
+    if no_ask_cents is None or no_ask_cents <= 0 or no_ask_cents >= 100:
+        return 0.0
+    p = 1.0 - model_prob  # probability NO wins
+    q = 1.0 - p
+    price = no_ask_cents / 100.0
+    odds = (1.0 - price) / price
+    kelly_full = (p * odds - q) / odds
+    if kelly_full <= 0:
+        return 0.0
+    kelly_frac = kelly_full * fractional
+    raw = kelly_frac * bankroll
+    capped = min(raw, max_pct * bankroll, max_dollars)
+    return round(max(0.0, capped), 2)
 def fetch_gfs_ensemble(lat, lon):
     url = 'https://ensemble-api.open-meteo.com/v1/ensemble'
     params = {
@@ -1101,12 +1144,12 @@ with st.sidebar:
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V4.29 Changes**')
-    st.markdown('- All Cities panel self-heals — fills missing cities automatically')
-    st.markdown('- No manual steps needed for full 17-city coverage')
-    st.markdown('- Weather fetches cached per-city to prevent timeouts')
-    st.markdown('- GFS 6am-9pm window filter retained from V4.28')
-    st.markdown('- GFS sanity band 8F retained from V4.28')
+    st.markdown('**V4.30 Changes**')
+    st.markdown('- NO bet signals added to bracket table')
+    st.markdown('- Busted brackets auto-generate BET NO signal')
+    st.markdown('- Overbought YES brackets flagged as BET NO')
+    st.markdown('- Best NO Bet banner added below table')
+    st.markdown('- Kelly sizing works for both YES and NO bets')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1404,6 +1447,8 @@ if forecast is not None and current is not None:
     df_rows = []
     best_bet = None
     best_edge = -999
+    best_no_bet = None
+    best_no_edge = -999
 
     for label, sigma_prob in sigma_rows:
         ens_prob = None
@@ -1418,43 +1463,89 @@ if forecast is not None and current is not None:
             match = next((m for m in kalshi_markets if labels_match(m[0], label)), None)
             if match:
                 yes_ask, no_ask = match[1], match[2]
+
+        # YES signal
         e = edge_cents(final_prob, yes_ask)
         signal_icon, signal_text = edge_signal(e, high_uncertainty=high_uncertainty)
         kelly = kelly_bet(final_prob, yes_ask, bankroll) if yes_ask else 0.0
-        ens_conf = ensemble_confidence(ens_prob) if ens_prob is not None else ''
+
+        # NO signal
         busted = False
         if obs_high_final is not None:
             for lbl, lo, hi in parse_ladder(ladder_text):
                 if labels_match(lbl, label) and hi is not None and obs_high_final > hi + 0.4:
                     busted = True
+        no_e = no_edge_cents(final_prob, no_ask)
+        no_icon, no_text = no_signal(no_e, busted=busted, model_prob=final_prob,
+                                     no_ask=no_ask, high_uncertainty=high_uncertainty)
+        kelly_no = kelly_bet_no(final_prob, no_ask, bankroll) if no_ask and (no_icon or busted) else 0.0
+
+        ens_conf = ensemble_confidence(ens_prob) if ens_prob is not None else ''
         edge_str = ('+'+str(e)+'c') if e and e > 0 else (str(e)+'c' if e is not None else 'none')
+        no_edge_str = ('+'+str(no_e)+'c') if no_e and no_e > 0 else (str(no_e)+'c' if no_e is not None else 'none')
+
+        # Combined signal display
+        yes_signal_str = signal_icon + ' ' + signal_text if signal_text else ''
+        no_signal_str = (no_icon + ' ' + no_text) if no_icon and no_text else '—'
+
         df_rows.append({
-            'Signal': signal_icon + ' ' + signal_text,
+            'YES Signal': yes_signal_str,
             'Bracket': label + (' BUSTED' if busted else ''),
             'Model %': str(round(final_prob*100, 1))+'%',
             'Fair': str(fair)+'c',
             'YES ask': str(yes_ask)+'c' if yes_ask is not None else 'none',
+            'YES Edge': edge_str,
+            'Kelly YES': ('$'+str(kelly)) if kelly > 0 else '-',
+            'NO Signal': no_signal_str,
             'NO ask': str(no_ask)+'c' if no_ask is not None else 'none',
-            'Edge': edge_str,
-            'Kelly Bet': ('$'+str(kelly)) if kelly > 0 else '-',
+            'NO Edge': no_edge_str,
+            'Kelly NO': ('$'+str(kelly_no)) if kelly_no > 0 else '-',
             'Ensemble': ens_conf,
         })
+
+        # Track best YES bet
         if e is not None and e > best_edge and not busted:
             best_edge = e
             best_bet = {'label': label, 'edge': e, 'kelly': kelly,
                         'signal': signal_icon, 'uncertain': high_uncertainty}
 
+        # Track best NO bet
+        if busted and no_ask is not None and no_ask <= 5:
+            if no_e is None:
+                no_e_for_rank = 95  # busted bracket NO at 5c = ~95c edge
+            else:
+                no_e_for_rank = no_e
+            if no_e_for_rank > best_no_edge:
+                best_no_edge = no_e_for_rank
+                best_no_bet = {'label': label, 'edge': no_e_for_rank, 'kelly': kelly_no,
+                               'busted': True, 'no_ask': no_ask}
+        elif no_e is not None and no_e > best_no_edge and no_icon == '🟢':
+            best_no_edge = no_e
+            best_no_bet = {'label': label, 'edge': no_e, 'kelly': kelly_no,
+                           'busted': False, 'no_ask': no_ask}
+
     st.dataframe(pd.DataFrame(df_rows), use_container_width=True, hide_index=True)
 
+    # ── YES best bet banner ───────────────────────────────────────────────────
     if best_bet and best_bet['edge'] >= MIN_EDGE and not best_bet['uncertain']:
-        st.success('Best Bet: **' + best_bet['label'] + '** | Edge: +' +
+        st.success('🟢 Best YES Bet: **' + best_bet['label'] + '** | Edge: +' +
                    str(best_bet['edge']) + 'c | Kelly: $' + str(best_bet['kelly']))
     elif best_bet and best_bet['edge'] >= MIN_EDGE and best_bet['uncertain']:
-        st.warning('Best edge: **' + best_bet['label'] + '** (+' + str(best_bet['edge']) +
+        st.warning('Best YES edge: **' + best_bet['label'] + '** (+' + str(best_bet['edge']) +
                    'c) but HIGH UNCERTAINTY — consider skipping.')
     elif best_bet:
-        st.warning('No bracket meets the ' + str(MIN_EDGE) + 'c minimum. Best: ' +
+        st.warning('No YES bracket meets the ' + str(MIN_EDGE) + 'c minimum. Best: ' +
                    best_bet['label'] + ' (+' + str(best_bet['edge']) + 'c)')
+
+    # ── NO best bet banner ────────────────────────────────────────────────────
+    if best_no_bet:
+        if best_no_bet['busted']:
+            st.success('🟢 Best NO Bet: **' + best_no_bet['label'] + ' NO** | BUSTED bracket | ' +
+                       'NO ask: ' + str(best_no_bet['no_ask']) + 'c | Kelly: $' + str(best_no_bet['kelly']))
+        else:
+            st.success('🟢 Best NO Bet: **' + best_no_bet['label'] + ' NO** | Edge: +' +
+                       str(best_no_bet['edge']) + 'c | NO ask: ' + str(best_no_bet['no_ask']) +
+                       'c | Kelly: $' + str(best_no_bet['kelly']))
 
     parsed = parse_ladder(ladder_text)
     top_b = next((b for b in parsed if b[2] is None), None)
