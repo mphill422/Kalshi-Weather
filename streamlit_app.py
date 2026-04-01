@@ -1,9 +1,9 @@
-# Kalshi High Temperature Model - V4.32
+# Kalshi High Temperature Model - V4.34
 #
-# Changes from V4.31:
-# 1. NO table now shows AVOID and SKIP signals for all brackets — mirrors YES table
-# 2. No more blank dashes in NO Signal column — every bracket has a signal
-# 3. All V4.31 infrastructure retained
+# Changes from V4.33:
+# 1. Wunderground URLs updated to direct ICAO station format (wunderground.com/weather/KXXX)
+# 2. No more city name ambiguity — links go straight to exact settlement station
+# 3. All V4.33 logic retained
 
 import math, re, json, time, requests
 import streamlit as st
@@ -12,8 +12,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.32', layout='wide')
-st.title('Kalshi High Temperature Model - V4.32')
+st.set_page_config(page_title='Kalshi High Temp V4.34', layout='wide')
+st.title('Kalshi High Temperature Model - V4.34')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -63,6 +63,27 @@ OBHISTORY_STATIONS = {
     'San Antonio': 'KSAT', 'New Orleans': 'KMSY', 'Philadelphia': 'KPHL',
     'Boston': 'KBOS', 'Denver': 'KDEN', 'Oklahoma City': 'KOKC',
     'Minneapolis': 'KMSP', 'Washington DC': 'KDCA',
+}
+
+# Wunderground direct station URLs — exact settlement airport per city
+WUNDERGROUND_URLS = {
+    'Phoenix':       'https://www.wunderground.com/weather/KPHX',
+    'Las Vegas':     'https://www.wunderground.com/weather/KLAS',
+    'Los Angeles':   'https://www.wunderground.com/weather/KLAX',
+    'Dallas':        'https://www.wunderground.com/weather/KDFW',
+    'Austin':        'https://www.wunderground.com/weather/KAUS',
+    'Houston':       'https://www.wunderground.com/weather/KHOU',
+    'Atlanta':       'https://www.wunderground.com/weather/KATL',
+    'Miami':         'https://www.wunderground.com/weather/KMIA',
+    'New York':      'https://www.wunderground.com/weather/KNYC',
+    'San Antonio':   'https://www.wunderground.com/weather/KSAT',
+    'New Orleans':   'https://www.wunderground.com/weather/KMSY',
+    'Philadelphia':  'https://www.wunderground.com/weather/KPHL',
+    'Boston':        'https://www.wunderground.com/weather/KBOS',
+    'Denver':        'https://www.wunderground.com/weather/KDEN',
+    'Oklahoma City': 'https://www.wunderground.com/weather/KOKC',
+    'Minneapolis':   'https://www.wunderground.com/weather/KMSP',
+    'Washington DC': 'https://www.wunderground.com/weather/KDCA',
 }
 
 SETTLEMENT_LOCATION = {
@@ -1147,10 +1168,10 @@ with st.sidebar:
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V4.32 Changes**')
-    st.markdown('- NO table now shows AVOID/SKIP signals for all brackets')
-    st.markdown('- Mirrors YES table — no more blank dashes in NO column')
-    st.markdown('- Full signal visibility on both sides of every bracket')
+    st.markdown('**V4.34 Changes**')
+    st.markdown('- Wunderground links now use direct ICAO station format')
+    st.markdown('- One tap goes straight to correct settlement station')
+    st.markdown('- No more city name ambiguity in WU search')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1342,13 +1363,16 @@ with col2:
 with col3:
     if obs_high_today is not None:
         st.metric('Obs High Today', str(obs_high_today)+' F', delta='floor active')
-        st.caption('[NWS table](' + obs_url + ')')
+        wu_url = WUNDERGROUND_URLS.get(city, '')
+        st.caption('[NWS table](' + obs_url + ')' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else ''))
     elif obs_high_suspect:
         st.metric('Obs High Today', str(obs_high_raw)+'F')
-        st.caption('Discarded — failed sanity check')
+        wu_url = WUNDERGROUND_URLS.get(city, '')
+        st.caption('Discarded — failed sanity check' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else ''))
     else:
         st.metric('Obs High Today', 'Unavailable')
-        st.caption('[NWS table](' + obs_url + ')')
+        wu_url = WUNDERGROUND_URLS.get(city, '')
+        st.caption('[NWS table](' + obs_url + ')' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else ''))
 with col4:
     if ensemble_mean is not None:
         n_members = len(ensemble_members) if ensemble_members else 0
