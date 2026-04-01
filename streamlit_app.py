@@ -1,12 +1,9 @@
-# Kalshi High Temperature Model - V4.30
+# Kalshi High Temperature Model - V4.32
 #
-# Changes from V4.29:
-# 1. NO bet signals added to bracket table
-# 2. Three NO signal types: BUSTED brackets, low-probability overbought YES, high-confidence model NO
-# 3. Best NO Bet banner added below main table
-# 4. Kelly sizing for NO bets uses inverse probability (1 - model_prob)
-# 5. NO edge calculated as: (1 - model_prob)*100 - no_ask
-# 6. All V4.29 infrastructure retained
+# Changes from V4.31:
+# 1. NO table now shows AVOID and SKIP signals for all brackets — mirrors YES table
+# 2. No more blank dashes in NO Signal column — every bracket has a signal
+# 3. All V4.31 infrastructure retained
 
 import math, re, json, time, requests
 import streamlit as st
@@ -15,8 +12,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.30', layout='wide')
-st.title('Kalshi High Temperature Model - V4.30')
+st.set_page_config(page_title='Kalshi High Temp V4.32', layout='wide')
+st.title('Kalshi High Temperature Model - V4.32')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -430,26 +427,32 @@ def no_edge_cents(model_prob, no_ask_cents):
 
 def no_signal(no_edge, busted=False, model_prob=None, no_ask=None, high_uncertainty=False):
     """
-    Generate NO signal based on three conditions:
+    Generate NO signal for every bracket — mirrors YES table visually.
     1. BUSTED — obs high already eliminated this bracket → BET NO at any price under 5c
     2. Low model probability + cheap NO ask → BET NO
     3. High uncertainty — suppress green signals
+    4. Negative edge → AVOID
+    5. Small positive edge → SKIP NO
     """
     if busted:
         if no_ask is not None and no_ask <= 5:
             return '🟢', 'BET NO (busted)'
         return '🟡', 'CONSIDER NO (busted)'
     if no_edge is None:
-        return None, None
+        return '⚪', 'No price'
     if high_uncertainty:
         if no_edge >= MIN_EDGE:
             return '🟡', 'SKIP NO (uncertain)'
-        return None, None
+        if no_edge >= 0:
+            return '🔴', 'AVOID'
+        return '🔴', 'AVOID'
     if no_edge >= MIN_EDGE:
         return '🟢', 'BET NO'
     if no_edge >= 3:
         return '🟡', 'SKIP NO'
-    return None, None
+    if no_edge >= 0:
+        return '🔴', 'AVOID'
+    return '🔴', 'AVOID'
 
 def kelly_bet_no(model_prob, no_ask_cents, bankroll, fractional=0.15, max_pct=0.05, max_dollars=100):
     """Kelly sizing for NO bets — uses (1 - model_prob) as the win probability."""
@@ -1144,12 +1147,10 @@ with st.sidebar:
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V4.30 Changes**')
-    st.markdown('- NO bet signals added to bracket table')
-    st.markdown('- Busted brackets auto-generate BET NO signal')
-    st.markdown('- Overbought YES brackets flagged as BET NO')
-    st.markdown('- Best NO Bet banner added below table')
-    st.markdown('- Kelly sizing works for both YES and NO bets')
+    st.markdown('**V4.32 Changes**')
+    st.markdown('- NO table now shows AVOID/SKIP signals for all brackets')
+    st.markdown('- Mirrors YES table — no more blank dashes in NO column')
+    st.markdown('- Full signal visibility on both sides of every bracket')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1444,7 +1445,8 @@ if forecast is not None and current is not None:
         st.caption('High uncertainty mode — green signals suppressed')
 
     import pandas as pd
-    df_rows = []
+    yes_rows = []
+    no_rows = []
     best_bet = None
     best_edge = -999
     best_no_bet = None
@@ -1478,7 +1480,7 @@ if forecast is not None and current is not None:
         no_e = no_edge_cents(final_prob, no_ask)
         no_icon, no_text = no_signal(no_e, busted=busted, model_prob=final_prob,
                                      no_ask=no_ask, high_uncertainty=high_uncertainty)
-        kelly_no = kelly_bet_no(final_prob, no_ask, bankroll) if no_ask and (no_icon or busted) else 0.0
+        kelly_no = kelly_bet_no(final_prob, no_ask, bankroll) if no_ask and no_icon == '🟢' else 0.0
 
         ens_conf = ensemble_confidence(ens_prob) if ens_prob is not None else ''
         edge_str = ('+'+str(e)+'c') if e and e > 0 else (str(e)+'c' if e is not None else 'none')
@@ -1488,18 +1490,24 @@ if forecast is not None and current is not None:
         yes_signal_str = signal_icon + ' ' + signal_text if signal_text else ''
         no_signal_str = (no_icon + ' ' + no_text) if no_icon and no_text else '—'
 
-        df_rows.append({
-            'YES Signal': yes_signal_str,
+        yes_rows.append({
+            'Signal': yes_signal_str,
             'Bracket': label + (' BUSTED' if busted else ''),
             'Model %': str(round(final_prob*100, 1))+'%',
             'Fair': str(fair)+'c',
-            'YES ask': str(yes_ask)+'c' if yes_ask is not None else 'none',
-            'YES Edge': edge_str,
-            'Kelly YES': ('$'+str(kelly)) if kelly > 0 else '-',
+            'YES ask': str(yes_ask)+'c' if yes_ask is not None else '—',
+            'Edge': edge_str,
+            'Kelly': ('$'+str(kelly)) if kelly > 0 else '—',
+            'Ensemble': ens_conf,
+        })
+
+        no_rows.append({
             'NO Signal': no_signal_str,
-            'NO ask': str(no_ask)+'c' if no_ask is not None else 'none',
+            'Bracket': label + (' BUSTED' if busted else ''),
+            'Model %': str(round(final_prob*100, 1))+'%',
+            'NO ask': str(no_ask)+'c' if no_ask is not None else '—',
             'NO Edge': no_edge_str,
-            'Kelly NO': ('$'+str(kelly_no)) if kelly_no > 0 else '-',
+            'Kelly NO': ('$'+str(kelly_no)) if kelly_no > 0 else '—',
             'Ensemble': ens_conf,
         })
 
@@ -1524,9 +1532,10 @@ if forecast is not None and current is not None:
             best_no_bet = {'label': label, 'edge': no_e, 'kelly': kelly_no,
                            'busted': False, 'no_ask': no_ask}
 
-    st.dataframe(pd.DataFrame(df_rows), use_container_width=True, hide_index=True)
+    # ── YES Table ─────────────────────────────────────────────────────────────
+    st.markdown('#### 🟢 YES Signals')
+    st.dataframe(pd.DataFrame(yes_rows), use_container_width=True, hide_index=True)
 
-    # ── YES best bet banner ───────────────────────────────────────────────────
     if best_bet and best_bet['edge'] >= MIN_EDGE and not best_bet['uncertain']:
         st.success('🟢 Best YES Bet: **' + best_bet['label'] + '** | Edge: +' +
                    str(best_bet['edge']) + 'c | Kelly: $' + str(best_bet['kelly']))
@@ -1537,7 +1546,10 @@ if forecast is not None and current is not None:
         st.warning('No YES bracket meets the ' + str(MIN_EDGE) + 'c minimum. Best: ' +
                    best_bet['label'] + ' (+' + str(best_bet['edge']) + 'c)')
 
-    # ── NO best bet banner ────────────────────────────────────────────────────
+    # ── NO Table ──────────────────────────────────────────────────────────────
+    st.markdown('#### 🔴 NO Signals')
+    st.dataframe(pd.DataFrame(no_rows), use_container_width=True, hide_index=True)
+
     if best_no_bet:
         if best_no_bet['busted']:
             st.success('🟢 Best NO Bet: **' + best_no_bet['label'] + ' NO** | BUSTED bracket | ' +
