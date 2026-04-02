@@ -1,9 +1,11 @@
-# Kalshi High Temperature Model - V4.34
+# Kalshi High Temperature Model - V4.35
 #
-# Changes from V4.33:
-# 1. Wunderground URLs updated to direct ICAO station format (wunderground.com/weather/KXXX)
-# 2. No more city name ambiguity — links go straight to exact settlement station
-# 3. All V4.33 logic retained
+# Changes from V4.34:
+# 1. All Cities panel now shows best YES and NO signal per city — instant morning scan
+# 2. Market Implied % column added to YES and NO tables
+# 3. No more clicking through 17 cities to find BET signals — all visible at a glance
+# 4. Signal summary uses cached weather data — no extra API calls
+# 5. All V4.34 infrastructure retained (WU links, split tables, AVOID dots)
 
 import math, re, json, time, requests
 import streamlit as st
@@ -12,8 +14,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.34', layout='wide')
-st.title('Kalshi High Temperature Model - V4.34')
+st.set_page_config(page_title='Kalshi High Temp V4.35', layout='wide')
+st.title('Kalshi High Temperature Model - V4.35')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -490,6 +492,62 @@ def kelly_bet_no(model_prob, no_ask_cents, bankroll, fractional=0.15, max_pct=0.
     raw = kelly_frac * bankroll
     capped = min(raw, max_pct * bankroll, max_dollars)
     return round(max(0.0, capped), 2)
+
+def get_city_best_signals(city, consensus, ladder_text, ensemble_members, kalshi_markets_data, obs_high, high_uncertainty, bankroll):
+    """
+    Compute best YES and NO signal for a city — used in All Cities summary panel.
+    Returns (best_yes_str, best_no_str) for quick morning scan.
+    """
+    if consensus is None or not ladder_text:
+        return '—', '—'
+    try:
+        sigma_rows, _ = bracket_probs(consensus, ladder_text, city, obs_high=obs_high)
+        best_yes = None
+        best_yes_edge = -999
+        best_no = None
+        best_no_edge = -999
+
+        for label, sigma_prob in sigma_rows:
+            ens_prob = None
+            for lbl, lo, hi in parse_ladder(ladder_text):
+                if labels_match(lbl, label):
+                    ens_prob = ensemble_bracket_prob(ensemble_members, lo, hi)
+                    break
+            final_prob = blend_probs(sigma_prob, ens_prob, ensemble_members, city)
+            yes_ask = no_ask = None
+            if kalshi_markets_data:
+                match = next((m for m in kalshi_markets_data if labels_match(m[0], label)), None)
+                if match:
+                    yes_ask, no_ask = match[1], match[2]
+
+            busted = False
+            if obs_high is not None:
+                for lbl, lo, hi in parse_ladder(ladder_text):
+                    if labels_match(lbl, label) and hi is not None and obs_high > hi + 0.4:
+                        busted = True
+
+            # Best YES
+            e = edge_cents(final_prob, yes_ask)
+            if e is not None and e > best_yes_edge and not busted:
+                best_yes_edge = e
+                icon, _ = edge_signal(e, high_uncertainty)
+                if icon == '🟢':
+                    kelly = kelly_bet(final_prob, yes_ask, bankroll) if yes_ask else 0.0
+                    best_yes = f'🟢 {label} | +{e}c | ${kelly}'
+
+            # Best NO
+            no_e = no_edge_cents(final_prob, no_ask)
+            no_icon, _ = no_signal(no_e, busted=busted, model_prob=final_prob,
+                                   no_ask=no_ask, high_uncertainty=high_uncertainty)
+            if no_icon == '🟢' and no_e is not None and no_e > best_no_edge:
+                best_no_edge = no_e
+                kelly_no = kelly_bet_no(final_prob, no_ask, bankroll) if no_ask else 0.0
+                best_no = f'🟢 {label} NO | +{no_e}c | ${kelly_no}'
+
+        return best_yes or '—', best_no or '—'
+    except Exception:
+        return '—', '—'
+
 def fetch_gfs_ensemble(lat, lon):
     url = 'https://ensemble-api.open-meteo.com/v1/ensemble'
     params = {
@@ -1168,10 +1226,10 @@ with st.sidebar:
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V4.34 Changes**')
-    st.markdown('- Wunderground links now use direct ICAO station format')
-    st.markdown('- One tap goes straight to correct settlement station')
-    st.markdown('- No more city name ambiguity in WU search')
+    st.markdown('**V4.35 Changes**')
+    st.markdown('- All Cities panel shows best YES/NO signal per city')
+    st.markdown('- Morning scan in seconds — no clicking through 17 cities')
+    st.markdown('- Market Implied % added to YES and NO tables')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1518,6 +1576,7 @@ if forecast is not None and current is not None:
             'Signal': yes_signal_str,
             'Bracket': label + (' BUSTED' if busted else ''),
             'Model %': str(round(final_prob*100, 1))+'%',
+            'Mkt Implied %': str(round((yes_ask / 100) * 100, 1))+'%' if yes_ask else '—',
             'Fair': str(fair)+'c',
             'YES ask': str(yes_ask)+'c' if yes_ask is not None else '—',
             'Edge': edge_str,
@@ -1529,6 +1588,7 @@ if forecast is not None and current is not None:
             'NO Signal': no_signal_str,
             'Bracket': label + (' BUSTED' if busted else ''),
             'Model %': str(round(final_prob*100, 1))+'%',
+            'Mkt Implied %': str(round((yes_ask / 100) * 100, 1))+'%' if yes_ask else '—',
             'NO ask': str(no_ask)+'c' if no_ask is not None else '—',
             'NO Edge': no_edge_str,
             'Kelly NO': ('$'+str(kelly_no)) if kelly_no > 0 else '—',
@@ -1680,18 +1740,45 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
 
     # Render the full table
     if today_rows:
-        summary_df = pd.DataFrame([{
-            'City': r['city'],
-            'Consensus': str(r.get('consensus', ''))+'F',
-            'NWS': str(r.get('forecast', ''))+'F' if r.get('forecast') else '—',
-            'GFS': str(r.get('ensemble_mean', ''))+'F' if r.get('ensemble_mean') else '—',
-            'Gap': str(round(r['source_gap'], 1))+'F' if r.get('source_gap') else '—',
-            'Uncertain': '⚠️' if r.get('high_uncertainty') else '✅',
-            'Bias Adj': ('+' if (r.get('bias_correction') or 0) >= 0 else '')+str(r.get('bias_correction', 0))+'F',
-        } for r in sorted(today_rows, key=lambda x: x['city'])])
+        import pandas as pd
+        summary_rows = []
+        for r in sorted(today_rows, key=lambda x: x['city']):
+            c = r['city']
+            consensus_val = r.get('consensus')
+            ladder = saved_ladders.get(c, DEFAULT_LADDERS.get(c, ''))
+            cached_markets, _ = get_cached_prices(c)
+            obs_h = r.get('obs_high')
+            high_unc = r.get('high_uncertainty', False)
+
+            # Get ensemble members from cached weather if available
+            try:
+                cached_wx = fetch_city_weather(c)
+                members = cached_wx.get('ensemble_members') if cached_wx else None
+            except Exception:
+                members = None
+
+            best_yes, best_no = get_city_best_signals(
+                c, consensus_val, ladder, members,
+                cached_markets, obs_h, high_unc, bankroll
+            )
+
+            summary_rows.append({
+                'City': c,
+                'Consensus': str(consensus_val)+'F' if consensus_val else '—',
+                'NWS': str(r.get('forecast', ''))+'F' if r.get('forecast') else '—',
+                'GFS': str(r.get('ensemble_mean', ''))+'F' if r.get('ensemble_mean') else '—',
+                'Gap': str(round(r['source_gap'], 1))+'F' if r.get('source_gap') else '—',
+                '⚠️': '⚠️' if r.get('high_uncertainty') else '✅',
+                'Best YES': best_yes,
+                'Best NO': best_no,
+            })
+
+        summary_df = pd.DataFrame(summary_rows)
         st.dataframe(summary_df, use_container_width=True, hide_index=True)
         n_saved_total = len(today_rows)
+        n_yes = sum(1 for r in summary_rows if r['Best YES'] != '—')
+        n_no = sum(1 for r in summary_rows if r['Best NO'] != '—')
         status_icon = '✅' if n_saved_total == 17 else '⏳'
-        st.caption(f'{status_icon} {n_saved_total}/17 cities saved for {today_str}')
+        st.caption(f'{status_icon} {n_saved_total}/17 cities | 🟢 {n_yes} YES signals | 🟢 {n_no} NO signals today')
     else:
         st.info('Loading predictions for all cities — this panel fills itself in automatically.')
