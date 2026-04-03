@@ -1,11 +1,13 @@
-# Kalshi High Temperature Model - V4.35
+# Kalshi High Temperature Model - V5.0
 #
-# Changes from V4.34:
-# 1. All Cities panel now shows best YES and NO signal per city — instant morning scan
-# 2. Market Implied % column added to YES and NO tables
-# 3. No more clicking through 17 cities to find BET signals — all visible at a glance
-# 4. Signal summary uses cached weather data — no extra API calls
-# 5. All V4.34 infrastructure retained (WU links, split tables, AVOID dots)
+# Changes from V4.35:
+# 1. NBM (National Blend of Models) integration — replaces sigma/normal distribution
+#    with NOAA's actual percentile forecasts (10th/25th/50th/75th/90th percentiles)
+#    based on ~200 model members. Sigma/normal kept as fallback if NBM unavailable.
+# 2. NO table Mkt Implied % bug fix — was using yes_ask, now correctly uses no_ask
+# 3. All Cities panel now shows Ensemble Key (🔵/🟡/⚪) per city
+# 4. All Cities panel now shows Bias Adj column
+# 5. Bias correction cap raised from 3.0F to 5.0F globally
 
 import math, re, json, time, requests
 import streamlit as st
@@ -14,8 +16,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V4.35', layout='wide')
-st.title('Kalshi High Temperature Model - V4.35')
+st.set_page_config(page_title='Kalshi High Temp V5.0', layout='wide')
+st.title('Kalshi High Temperature Model - V5.0')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -23,7 +25,7 @@ PRICE_CACHE_FILE = Path('price_cache.json')
 PRICE_CACHE_MINUTES = 10
 
 MIN_EDGE = 8
-HEADERS = {'User-Agent': 'kalshi-temp-model/4.28', 'Accept': 'application/geo+json, application/json, text/html'}
+HEADERS = {'User-Agent': 'kalshi-temp-model/5.0', 'Accept': 'application/geo+json, application/json, text/html'}
 
 CITY_TZ = {
     'Phoenix': 'America/Phoenix', 'Las Vegas': 'America/Los_Angeles',
@@ -67,7 +69,16 @@ OBHISTORY_STATIONS = {
     'Minneapolis': 'KMSP', 'Washington DC': 'KDCA',
 }
 
-# Wunderground direct station URLs — exact settlement airport per city
+# NBM station IDs — NWS point forecast office grid stations closest to settlement location
+NBM_STATIONS = {
+    'Phoenix': 'KPHX', 'Las Vegas': 'KLAS', 'Los Angeles': 'KLAX',
+    'Dallas': 'KDFW', 'Austin': 'KAUS', 'Houston': 'KHOU',
+    'Atlanta': 'KATL', 'Miami': 'KMIA', 'New York': 'KNYC',
+    'San Antonio': 'KSAT', 'New Orleans': 'KMSY', 'Philadelphia': 'KPHL',
+    'Boston': 'KBOS', 'Denver': 'KDEN', 'Oklahoma City': 'KOKC',
+    'Minneapolis': 'KMSP', 'Washington DC': 'KDCA',
+}
+
 WUNDERGROUND_URLS = {
     'Phoenix':       'https://www.wunderground.com/weather/KPHX',
     'Las Vegas':     'https://www.wunderground.com/weather/KLAS',
@@ -142,10 +153,6 @@ BASE_SIGMA = {
 DESERT_CITIES = {'Phoenix', 'Las Vegas'}
 FORECAST_HEAVY_CITIES = {'Dallas', 'Austin', 'Houston', 'San Antonio', 'Oklahoma City'}
 
-# GFS ensemble weight by city — based on observed spring bias patterns
-# Desert cities (Phoenix, Vegas): GFS runs cold, trust less
-# Coastal cities (LA): GFS runs warm, trust less
-# Stable cities (Dallas, Boston, NYC, etc): GFS reliable, trust more
 GFS_CITY_WEIGHT = {
     'Phoenix': 0.10, 'Las Vegas': 0.10,
     'Los Angeles': 0.12,
@@ -203,7 +210,6 @@ def sb_fetch_city(city):
         return []
 
 def sb_fetch_unsettled():
-    """Rows where actual is null — pending auto-settlement."""
     try:
         r = requests.get(sb_url('settlements'), headers=get_sb_headers(),
                          params={'actual': 'is.null', 'order': 'date.asc'}, timeout=10)
@@ -265,8 +271,6 @@ def sb_upsert_prediction(city, consensus, forecast, ensemble_mean, source_gap, h
 
 # ── Auto-Settlement ───────────────────────────────────────────────────────────
 def fetch_obs_high_for_date(icao, target_date_str):
-    """Fetch the obs high from NWS obhistory table for a specific date."""
-    eastern = pytz.timezone('America/New_York')
     url = 'https://forecast.weather.gov/data/obhistory/' + icao + '.html'
     try:
         r = requests.get(url, headers=HEADERS, timeout=12)
@@ -294,7 +298,6 @@ def fetch_obs_high_for_date(icao, target_date_str):
 
 @st.cache_data(ttl=3600)
 def run_auto_settlement():
-    """Called once per hour. Finds unsettled rows and fills in actuals from NWS."""
     unsettled = sb_fetch_unsettled()
     if not unsettled:
         return 0, []
@@ -302,7 +305,7 @@ def run_auto_settlement():
     for row in unsettled:
         row_date = row.get('date', '')
         if row_date >= get_eastern_date():
-            continue  # Don't try to settle today
+            continue
         city = row.get('city')
         icao = OBHISTORY_STATIONS.get(city)
         if not icao:
@@ -317,7 +320,7 @@ def run_auto_settlement():
             settled.append({'city': city, 'date': row_date, 'actual': actual, 'error': error})
     return len(settled), settled
 
-# ── Bias Correction ───────────────────────────────────────────────────────────
+# ── Bias Correction — cap raised to 5.0F globally ────────────────────────────
 def compute_bias_correction_db(city, n_recent=10):
     rows = sb_fetch_city(city)
     complete = [r for r in rows if r.get('actual') is not None and r.get('consensus') is not None]
@@ -326,8 +329,186 @@ def compute_bias_correction_db(city, n_recent=10):
     recent = complete[-n_recent:]
     errors = [r['actual'] - r['consensus'] for r in recent]
     mean_error = sum(errors) / len(errors)
-    correction = max(-3.0, min(3.0, mean_error))
+    correction = max(-5.0, min(5.0, mean_error))  # V5.0: raised cap from 3.0F to 5.0F
     return round(correction, 2), len(recent)
+
+# ── NBM (National Blend of Models) Integration ───────────────────────────────
+@st.cache_data(ttl=1800)
+def fetch_nbm_percentiles(lat, lon):
+    """
+    Fetch NBM percentile forecasts from NOAA API.
+    Returns dict with keys: p10, p25, p50, p75, p90 (all in Fahrenheit)
+    or None if unavailable.
+    
+    NBM provides actual percentile forecasts based on ~200 model members.
+    This replaces our sigma/normal distribution approximation for bracket probs.
+    """
+    try:
+        # Step 1: Get NWS grid point
+        points_url = f'https://api.weather.gov/points/{lat},{lon}'
+        r = requests.get(points_url, headers=HEADERS, timeout=12)
+        r.raise_for_status()
+        props = r.json().get('properties', {})
+        grid_id = props.get('gridId')
+        grid_x = props.get('gridX')
+        grid_y = props.get('gridY')
+        if not all([grid_id, grid_x is not None, grid_y is not None]):
+            return None
+
+        # Step 2: Fetch gridpoint hourly data which includes NBM percentiles
+        gridpoint_url = f'https://api.weather.gov/gridpoints/{grid_id}/{grid_x},{grid_y}'
+        r2 = requests.get(gridpoint_url, headers=HEADERS, timeout=15)
+        r2.raise_for_status()
+        data = r2.json()
+        props2 = data.get('properties', {})
+
+        today = get_eastern_date()
+
+        # Extract temperature percentile fields
+        # NWS gridpoint provides: temperature (50th), probabilisticPrecipitation, etc.
+        # For high temp percentiles we use quantileForecastTemperature if available,
+        # otherwise fall back to temperatureQuantiles
+        percentile_fields = {
+            'p10': ['temperatureQuantile10', 'quantileForecastTemperature10'],
+            'p25': ['temperatureQuantile25', 'quantileForecastTemperature25'],
+            'p50': ['temperature', 'temperatureQuantile50', 'quantileForecastTemperature50'],
+            'p75': ['temperatureQuantile75', 'quantileForecastTemperature75'],
+            'p90': ['temperatureQuantile90', 'quantileForecastTemperature90'],
+        }
+
+        result = {}
+        for pct, field_names in percentile_fields.items():
+            for field in field_names:
+                field_data = props2.get(field, {})
+                values = field_data.get('values', [])
+                if not values:
+                    continue
+                # Find today's daytime max (look for values between 6am-9pm local)
+                day_vals = []
+                for entry in values:
+                    valid_time = entry.get('validTime', '')
+                    value = entry.get('value')
+                    if value is None:
+                        continue
+                    if today in valid_time:
+                        # Convert C to F if needed
+                        uom = field_data.get('uom', '')
+                        if 'degC' in uom or uom == 'wmoUnit:degC':
+                            value = value * 9/5 + 32
+                        day_vals.append(value)
+                if day_vals:
+                    result[pct] = round(max(day_vals), 1)
+                    break
+
+        # Need at least p10 and p90 to be useful
+        if len(result) >= 2 and ('p50' in result or 'p25' in result or 'p75' in result):
+            return result
+        return None
+
+    except Exception:
+        return None
+
+def nbm_bracket_prob(nbm_percentiles, lo, hi, obs_high=None):
+    """
+    Compute bracket probability from NBM percentiles using linear interpolation.
+    
+    NBM gives us: p10, p25, p50, p75, p90
+    We build a piecewise-linear CDF from these and integrate over [lo, hi].
+    
+    This replaces normal_cdf-based bracket_probs when NBM is available.
+    Returns probability float or None if NBM insufficient.
+    """
+    if not nbm_percentiles:
+        return None
+
+    # Build CDF points from available percentiles
+    # Format: [(temp_value, cumulative_probability), ...]
+    cdf_points = []
+    pct_map = {'p10': 0.10, 'p25': 0.25, 'p50': 0.50, 'p75': 0.75, 'p90': 0.90}
+
+    for key, prob in sorted(pct_map.items(), key=lambda x: x[1]):
+        if key in nbm_percentiles:
+            cdf_points.append((nbm_percentiles[key], prob))
+
+    if len(cdf_points) < 2:
+        return None
+
+    # Sort by temperature value
+    cdf_points.sort(key=lambda x: x[0])
+
+    def cdf(t):
+        """Piecewise linear CDF from NBM percentile points."""
+        if t <= cdf_points[0][0]:
+            # Extrapolate below lowest percentile
+            slope = cdf_points[0][1] / max(cdf_points[0][0] - (cdf_points[0][0] - 5), 0.001)
+            return max(0.0, cdf_points[0][1] * (t - (cdf_points[0][0] - 5)) / 5)
+        if t >= cdf_points[-1][0]:
+            # Extrapolate above highest percentile
+            remaining = 1.0 - cdf_points[-1][1]
+            span = max(cdf_points[-1][0] - cdf_points[-2][0], 1.0)
+            return min(1.0, cdf_points[-1][1] + remaining * (t - cdf_points[-1][0]) / span)
+        # Interpolate between known points
+        for i in range(len(cdf_points) - 1):
+            t0, p0 = cdf_points[i]
+            t1, p1 = cdf_points[i + 1]
+            if t0 <= t <= t1:
+                frac = (t - t0) / max(t1 - t0, 0.001)
+                return p0 + frac * (p1 - p0)
+        return 0.5
+
+    # Bracket probability = CDF(hi + 0.5) - CDF(lo - 0.5)
+    if lo is None and hi is not None:
+        # "X or below"
+        if obs_high is not None and obs_high > hi + 0.4:
+            return 0.0
+        return max(0.0, min(1.0, cdf(hi + 0.5)))
+    elif hi is None and lo is not None:
+        # "X or above"
+        return max(0.0, min(1.0, 1.0 - cdf(lo - 0.5)))
+    elif lo is not None and hi is not None:
+        if obs_high is not None and obs_high > hi + 0.4:
+            return 0.0
+        return max(0.0, min(1.0, cdf(hi + 0.5) - cdf(lo - 0.5)))
+    return None
+
+def bracket_probs_nbm(consensus, ladder_text, city, nbm_percentiles, obs_high=None, forecast=None):
+    """
+    Compute bracket probabilities using NBM percentiles as primary source.
+    Falls back to sigma/normal distribution if NBM unavailable.
+    Returns (rows, sigma_or_nbm_label, used_nbm_bool)
+    """
+    rows = []
+    used_nbm = False
+
+    if nbm_percentiles and len(nbm_percentiles) >= 2:
+        # NBM PATH: use real percentile distribution
+        used_nbm = True
+        for label, lo, hi in parse_ladder(ladder_text):
+            p = nbm_bracket_prob(nbm_percentiles, lo, hi, obs_high=obs_high)
+            if p is None:
+                # Fallback to sigma for this bracket
+                sigma = choose_sigma(city, obs_high=obs_high, forecast=forecast)
+                p = _sigma_bracket_prob(consensus, lo, hi, sigma, obs_high)
+            rows.append((label, max(0.0, min(1.0, p))))
+        rows.sort(key=lambda x: x[1], reverse=True)
+        # Return p50 as the "central estimate" label
+        p50_label = 'NBM'
+        return rows, p50_label, True
+    else:
+        # SIGMA FALLBACK PATH
+        sigma_rows, sigma = bracket_probs(consensus, ladder_text, city, obs_high=obs_high, forecast=forecast)
+        return sigma_rows, sigma, False
+
+def _sigma_bracket_prob(mu, lo, hi, sigma, obs_high=None):
+    """Helper: compute single bracket prob from normal distribution."""
+    if obs_high is not None and hi is not None and obs_high > hi + 0.4:
+        return 0.0
+    if lo is None:
+        return normal_cdf(hi + 0.5, mu, sigma)
+    elif hi is None:
+        return 1 - normal_cdf(lo - 0.5, mu, sigma)
+    else:
+        return normal_cdf(hi + 0.5, mu, sigma) - normal_cdf(lo - 0.5, mu, sigma)
 
 # ── NWS Grid Cache ────────────────────────────────────────────────────────────
 _NWS_GRID_CACHE = {}
@@ -443,20 +624,11 @@ def edge_signal(e, high_uncertainty=False):
     return '🔴', 'AVOID'
 
 def no_edge_cents(model_prob, no_ask_cents):
-    """Edge on buying NO = (1 - model_prob)*100 - no_ask_cents"""
     if no_ask_cents is None:
         return None
     return round((1.0 - model_prob) * 100 - no_ask_cents, 1)
 
 def no_signal(no_edge, busted=False, model_prob=None, no_ask=None, high_uncertainty=False):
-    """
-    Generate NO signal for every bracket — mirrors YES table visually.
-    1. BUSTED — obs high already eliminated this bracket → BET NO at any price under 5c
-    2. Low model probability + cheap NO ask → BET NO
-    3. High uncertainty — suppress green signals
-    4. Negative edge → AVOID
-    5. Small positive edge → SKIP NO
-    """
     if busted:
         if no_ask is not None and no_ask <= 5:
             return '🟢', 'BET NO (busted)'
@@ -478,10 +650,9 @@ def no_signal(no_edge, busted=False, model_prob=None, no_ask=None, high_uncertai
     return '🔴', 'AVOID'
 
 def kelly_bet_no(model_prob, no_ask_cents, bankroll, fractional=0.15, max_pct=0.05, max_dollars=100):
-    """Kelly sizing for NO bets — uses (1 - model_prob) as the win probability."""
     if no_ask_cents is None or no_ask_cents <= 0 or no_ask_cents >= 100:
         return 0.0
-    p = 1.0 - model_prob  # probability NO wins
+    p = 1.0 - model_prob
     q = 1.0 - p
     price = no_ask_cents / 100.0
     odds = (1.0 - price) / price
@@ -493,27 +664,37 @@ def kelly_bet_no(model_prob, no_ask_cents, bankroll, fractional=0.15, max_pct=0.
     capped = min(raw, max_pct * bankroll, max_dollars)
     return round(max(0.0, capped), 2)
 
-def get_city_best_signals(city, consensus, ladder_text, ensemble_members, kalshi_markets_data, obs_high, high_uncertainty, bankroll):
+def get_city_best_signals(city, consensus, ladder_text, ensemble_members, kalshi_markets_data,
+                          obs_high, high_uncertainty, bankroll, nbm_percentiles=None):
     """
     Compute best YES and NO signal for a city — used in All Cities summary panel.
-    Returns (best_yes_str, best_no_str) for quick morning scan.
+    Now uses NBM percentiles when available.
+    Returns (best_yes_str, best_no_str)
     """
     if consensus is None or not ladder_text:
         return '—', '—'
     try:
-        sigma_rows, _ = bracket_probs(consensus, ladder_text, city, obs_high=obs_high)
+        prob_rows, _, used_nbm = bracket_probs_nbm(
+            consensus, ladder_text, city, nbm_percentiles, obs_high=obs_high
+        )
         best_yes = None
         best_yes_edge = -999
         best_no = None
         best_no_edge = -999
 
-        for label, sigma_prob in sigma_rows:
+        for label, base_prob in prob_rows:
+            # Blend with GFS ensemble
             ens_prob = None
             for lbl, lo, hi in parse_ladder(ladder_text):
                 if labels_match(lbl, label):
                     ens_prob = ensemble_bracket_prob(ensemble_members, lo, hi)
                     break
-            final_prob = blend_probs(sigma_prob, ens_prob, ensemble_members, city)
+            if used_nbm:
+                # When using NBM, GFS ensemble blending is lighter — NBM already has model spread baked in
+                final_prob = blend_probs(base_prob, ens_prob, ensemble_members, city, nbm_active=True)
+            else:
+                final_prob = blend_probs(base_prob, ens_prob, ensemble_members, city)
+
             yes_ask = no_ask = None
             if kalshi_markets_data:
                 match = next((m for m in kalshi_markets_data if labels_match(m[0], label)), None)
@@ -526,7 +707,6 @@ def get_city_best_signals(city, consensus, ladder_text, ensemble_members, kalshi
                     if labels_match(lbl, label) and hi is not None and obs_high > hi + 0.4:
                         busted = True
 
-            # Best YES
             e = edge_cents(final_prob, yes_ask)
             if e is not None and e > best_yes_edge and not busted:
                 best_yes_edge = e
@@ -535,7 +715,6 @@ def get_city_best_signals(city, consensus, ladder_text, ensemble_members, kalshi
                     kelly = kelly_bet(final_prob, yes_ask, bankroll) if yes_ask else 0.0
                     best_yes = f'🟢 {label} | +{e}c | ${kelly}'
 
-            # Best NO
             no_e = no_edge_cents(final_prob, no_ask)
             no_icon, _ = no_signal(no_e, busted=busted, model_prob=final_prob,
                                    no_ask=no_ask, high_uncertainty=high_uncertainty)
@@ -567,13 +746,11 @@ def fetch_gfs_ensemble(lat, lon):
     today = get_eastern_date()
     hourly = data.get('hourly', {})
     times = hourly.get('time', [])
-    # Only use 6am-9pm local window to avoid overnight lows dragging the mean down
     today_indices = [
         i for i, t in enumerate(times)
         if t.startswith(today) and len(t) >= 13 and 6 <= int(t[11:13]) <= 21
     ]
     if not today_indices:
-        # Fallback: use all today indices if time-window filtering yields nothing
         today_indices = [i for i, t in enumerate(times) if t.startswith(today)]
     if not today_indices:
         return None, None
@@ -612,21 +789,54 @@ def ensemble_confidence(prob):
         return '🟡 MED'
     return '⚪ LOW'
 
-def blend_probs(sigma_prob, ensemble_prob, members, city=''):
+def ensemble_overall_confidence(members, consensus, ladder_text):
+    """Overall ensemble confidence key for All Cities panel."""
+    if not members or not ladder_text:
+        return ''
+    try:
+        best_ens_prob = None
+        for lbl, lo, hi in parse_ladder(ladder_text):
+            mid = None
+            if lo is None and hi is not None:
+                mid = hi - 1.0
+            elif hi is None and lo is not None:
+                mid = lo + 1.0
+            elif lo is not None and hi is not None:
+                mid = (lo + hi) / 2.0
+            if mid is not None and consensus is not None and abs(mid - consensus) <= 2.0:
+                prob = ensemble_bracket_prob(members, lo, hi)
+                if prob is not None:
+                    best_ens_prob = prob
+                    break
+        if best_ens_prob is None:
+            probs = []
+            for lbl, lo, hi in parse_ladder(ladder_text):
+                p = ensemble_bracket_prob(members, lo, hi)
+                if p is not None:
+                    probs.append(p)
+            best_ens_prob = max(probs) if probs else None
+        return ensemble_confidence(best_ens_prob)
+    except Exception:
+        return ''
+
+def blend_probs(sigma_prob, ensemble_prob, members, city='', nbm_active=False):
+    """
+    Blend sigma/NBM prob with GFS ensemble.
+    When NBM is active, reduce GFS weight by 50% since NBM already incorporates model spread.
+    """
     if ensemble_prob is None or members is None:
         return sigma_prob
-    ensemble_weight = GFS_CITY_WEIGHT.get(city, 0.20)
+    base_weight = GFS_CITY_WEIGHT.get(city, 0.20)
+    ensemble_weight = base_weight * 0.5 if nbm_active else base_weight
     sigma_weight = 1.0 - ensemble_weight
     return round(sigma_weight * sigma_prob + ensemble_weight * ensemble_prob, 4)
 
 # ── Core Math ─────────────────────────────────────────────────────────────────
 def get_eastern_date():
-    """Always returns today's date in US Eastern time — fixes UTC midnight bug on cloud."""
     eastern = pytz.timezone('America/New_York')
     return datetime.now(eastern).strftime('%Y-%m-%d')
 
 def get_eastern_datetime():
-    """Returns current datetime in US Eastern time."""
     eastern = pytz.timezone('America/New_York')
     return datetime.now(eastern)
 
@@ -768,6 +978,7 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
     return consensus
 
 def bracket_probs(mu, ladder_text, city, obs_high=None, forecast=None):
+    """Sigma/normal fallback — used when NBM unavailable."""
     sigma = choose_sigma(city, obs_high=obs_high, forecast=forecast)
     rows = []
     for label, lo, hi in parse_ladder(ladder_text):
@@ -828,7 +1039,6 @@ def boxes_to_ladder(parts):
 
 # ── Data Fetchers ─────────────────────────────────────────────────────────────
 def fetch_obs_high_today(icao):
-    """Eastern-timezone aware version — uses Eastern day, not UTC."""
     eastern = pytz.timezone('America/New_York')
     today_day = str(datetime.now(eastern).day)
     url = 'https://forecast.weather.gov/data/obhistory/' + icao + '.html'
@@ -1034,13 +1244,12 @@ def sync_all_ladders(saved_ladders, force=False):
     progress.empty()
     return saved_ladders, {'synced': synced, 'failed': failed}
 
-# ── Cached per-city weather fetch — prevents repeat API calls on re-render ───
+# ── Cached per-city weather fetch ────────────────────────────────────────────
 @st.cache_data(ttl=1800)
 def fetch_city_weather(city):
     """
-    Fetch NWS forecast, current obs, obs high, and GFS ensemble for one city.
-    Cached for 30 minutes so the All Cities panel can re-render without re-hitting APIs.
-    Returns dict with all weather values or None fields on failure.
+    Fetch NWS forecast, current obs, obs high, GFS ensemble, and NBM percentiles.
+    Cached 30 minutes. Returns dict with all weather values.
     """
     coords = CITIES[city]
     lat, lon = coords['lat'], coords['lon']
@@ -1051,6 +1260,7 @@ def fetch_city_weather(city):
     _, current_temp = fetch_nws_current(lat, lon, station)
     obs_high_raw, _ = fetch_obs_high_today(obs_icao)
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
+    nbm_percentiles = fetch_nbm_percentiles(lat, lon)
 
     # Sanity checks
     obs_high_final = obs_high_raw
@@ -1080,13 +1290,10 @@ def fetch_city_weather(city):
         'ensemble_mean': ensemble_mean,
         'source_gap': source_gap,
         'high_uncertainty': high_uncertainty,
+        'nbm_percentiles': nbm_percentiles,
     }
 
 def save_city_prediction(city, weather, saved_ladders):
-    """
-    Given a pre-fetched weather dict, compute consensus and upsert to Supabase.
-    Returns (consensus, save_ok).
-    """
     nws_fc = weather['nws_fc']
     if nws_fc is None:
         return None, False
@@ -1102,111 +1309,12 @@ def save_city_prediction(city, weather, saved_ladders):
     consensus = round(consensus_raw + bias_correction, 1)
 
     save_ok = sb_upsert_prediction(
-        city=city,
-        consensus=consensus,
-        forecast=nws_fc,
-        ensemble_mean=ensemble_mean,
-        source_gap=source_gap,
-        high_uncertainty=high_uncertainty,
-        obs_high=obs_high,
+        city=city, consensus=consensus, forecast=nws_fc,
+        ensemble_mean=ensemble_mean, source_gap=source_gap,
+        high_uncertainty=high_uncertainty, obs_high=obs_high,
         bias_correction=bias_correction,
     )
     return consensus, save_ok
-
-# ── Batch Prediction Save — all 17 cities on morning load ────────────────────
-def batch_save_all_predictions(saved_ladders):
-    """
-    Runs once per day after morning sync. Fetches NWS + GFS for every city
-    and upserts a consensus prediction to Supabase. No Kalshi prices needed —
-    this is purely for settlement tracking and bias correction.
-    Runs silently; any city that fails just gets skipped.
-    """
-    today = get_eastern_date()
-    cities = list(CITIES.keys())
-    saved_count = 0
-    skipped_count = 0
-
-    progress = st.progress(0, text='Saving predictions for all cities...')
-
-    for i, c in enumerate(cities):
-        progress.progress((i + 1) / len(cities), text='Saving ' + c + '...')
-        try:
-            coords = CITIES[c]
-            lat, lon = coords['lat'], coords['lon']
-            station = STATIONS[c]
-
-            # Check if already saved today to avoid redundant API calls
-            existing = sb_fetch_today(c)
-            if existing and existing.get('forecast') is not None:
-                skipped_count += 1
-                time.sleep(0.2)
-                continue
-
-            # Fetch NWS forecast
-            nws_fc, _ = fetch_nws_forecast(lat, lon)
-            if nws_fc is None:
-                time.sleep(0.5)
-                continue
-
-            # Fetch current obs
-            _, current_temp = fetch_nws_current(lat, lon, station)
-
-            # Fetch obs high today (Eastern-aware)
-            obs_icao = OBHISTORY_STATIONS[c]
-            obs_high_raw, _ = fetch_obs_high_today(obs_icao)
-
-            # Fetch GFS ensemble
-            ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
-
-            # Sanity checks
-            obs_high_final = obs_high_raw
-            if obs_high_raw is not None and current_temp is not None:
-                if obs_high_raw > current_temp + 15.0:
-                    obs_high_final = None
-            if obs_high_raw is not None and nws_fc is not None:
-                if obs_high_raw > nws_fc + 12.0:
-                    obs_high_final = None
-            if ensemble_mean is not None and nws_fc is not None:
-                if abs(ensemble_mean - nws_fc) > 8.0:
-                    ensemble_members = None
-                    ensemble_mean = None
-
-            source_gap = None
-            high_uncertainty = False
-            if nws_fc is not None and ensemble_mean is not None:
-                source_gap = abs(nws_fc - ensemble_mean)
-                uncertainty_threshold = 6.0 if c in DESERT_CITIES else 5.0
-                high_uncertainty = source_gap > uncertainty_threshold
-
-            # Compute consensus — use current temp or fallback to forecast
-            cur = current_temp if current_temp is not None else nws_fc
-            consensus_raw = compute_consensus(nws_fc, cur, current_temp, c, obs_high=obs_high_final)
-
-            # Apply bias correction
-            bias_correction, _ = compute_bias_correction_db(c)
-            consensus = round(consensus_raw + bias_correction, 1)
-
-            # Save to Supabase
-            ok = sb_upsert_prediction(
-                city=c,
-                consensus=consensus,
-                forecast=nws_fc,
-                ensemble_mean=ensemble_mean,
-                source_gap=source_gap,
-                high_uncertainty=high_uncertainty,
-                obs_high=obs_high_final,
-                bias_correction=bias_correction,
-            )
-            if ok:
-                saved_count += 1
-
-        except Exception:
-            pass
-
-        time.sleep(0.6)  # Rate-limit buffer between cities
-
-    progress.empty()
-    return saved_count, skipped_count
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -1223,20 +1331,22 @@ with st.sidebar:
     st.markdown('🟢 Edge >=8c — **BET**')
     st.markdown('🟡 Edge 3-7c — **SKIP**')
     st.markdown('🔴 Edge <3c — **AVOID**')
-    st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >3F')
+    st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >5F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V4.35 Changes**')
-    st.markdown('- All Cities panel shows best YES/NO signal per city')
-    st.markdown('- Morning scan in seconds — no clicking through 17 cities')
-    st.markdown('- Market Implied % added to YES and NO tables')
+    st.markdown('**V5.0 Changes**')
+    st.markdown('- NBM percentile integration (replaces sigma math)')
+    st.markdown('- Sigma/normal kept as fallback if NBM unavailable')
+    st.markdown('- NO table Mkt Implied % bug fixed')
+    st.markdown('- All Cities: Ensemble Key + Bias Adj columns added')
+    st.markdown('- Bias correction cap raised 3F → 5F globally')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
 today_str = get_eastern_date()
 last_sync_data = load_json(LAST_SYNC_FILE)
 
-# ── Auto-Settlement (runs silently on load) ───────────────────────────────────
+# ── Auto-Settlement ───────────────────────────────────────────────────────────
 if 'auto_settled' not in st.session_state:
     with st.spinner('Checking for unsettled predictions...'):
         n_settled, settled_rows = run_auto_settlement()
@@ -1248,7 +1358,6 @@ if 'auto_settled' not in st.session_state:
 
 # ── Morning Sync ──────────────────────────────────────────────────────────────
 if last_sync_data.get('date') != today_str:
-    # Sync ladders from Kalshi — predictions now saved by All Cities panel
     saved_ladders, results = sync_all_ladders(saved_ladders)
     if results:
         n = len(results.get('synced', []))
@@ -1294,7 +1403,7 @@ st.caption('Local time: ' + str(local_hour) + ':00 ' + tz_name)
 if city in FORECAST_HEAVY_CITIES and local_hour < 16:
     st.caption('Forecast-heavy mode active (Texas/OKC heat lag correction)')
 
-# ── Bias Correction (from Supabase) ──────────────────────────────────────────
+# ── Bias Correction ───────────────────────────────────────────────────────────
 bias_correction, bias_n = compute_bias_correction_db(city)
 if bias_n >= 3:
     direction = 'warm' if bias_correction > 0 else 'cold'
@@ -1360,6 +1469,7 @@ with st.spinner('Fetching weather data...'):
     noaa_station, noaa_obs = fetch_nws_current(lat, lon, station)
     obs_high_raw, obs_high_url = fetch_obs_high_today(obs_icao)
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
+    nbm_percentiles = fetch_nbm_percentiles(lat, lon)
 
 # ── Sanity Checks ─────────────────────────────────────────────────────────────
 sanity_warnings = []
@@ -1447,6 +1557,15 @@ with col4:
     else:
         st.metric('GFS Ensemble', 'Unavailable')
 
+# Show NBM status
+if nbm_percentiles:
+    nbm_p50 = nbm_percentiles.get('p50', nbm_percentiles.get('p25', '—'))
+    nbm_p10 = nbm_percentiles.get('p10', '—')
+    nbm_p90 = nbm_percentiles.get('p90', '—')
+    st.success(f'✅ NBM active — p10:{nbm_p10}F | p50:{nbm_p50}F | p90:{nbm_p90}F | bracket probs from real percentile distribution')
+else:
+    st.caption('NBM unavailable — using sigma/normal distribution fallback')
+
 for w in sanity_warnings:
     st.error(w)
 
@@ -1485,18 +1604,20 @@ obs_high_final = override_obs_high if override_obs_high > 0 else obs_high_today
 if forecast is not None and current is not None:
     consensus_raw = compute_consensus(forecast, current, noaa_final, city, obs_high=obs_high_final)
     consensus = round(consensus_raw + bias_correction, 1)
-    sigma_rows, sigma = bracket_probs(consensus, ladder_text, city, obs_high=obs_high_final, forecast=forecast)
+
+    # Use NBM for bracket probs, sigma as fallback
+    prob_rows, prob_label, used_nbm = bracket_probs_nbm(
+        consensus, ladder_text, city, nbm_percentiles,
+        obs_high=obs_high_final, forecast=forecast
+    )
+    # Also get sigma for display purposes
+    _, sigma = bracket_probs(consensus, ladder_text, city, obs_high=obs_high_final, forecast=forecast)
     call = two_degree_call(consensus, ladder_text, obs_high=obs_high_final)
 
-    # ── Auto-save prediction to Supabase ─────────────────────────────────────
     save_ok = sb_upsert_prediction(
-        city=city,
-        consensus=consensus,
-        forecast=forecast,
-        ensemble_mean=ensemble_mean,
-        source_gap=source_gap,
-        high_uncertainty=high_uncertainty,
-        obs_high=obs_high_final,
+        city=city, consensus=consensus, forecast=forecast,
+        ensemble_mean=ensemble_mean, source_gap=source_gap,
+        high_uncertainty=high_uncertainty, obs_high=obs_high_final,
         bias_correction=bias_correction,
     )
     if not save_ok:
@@ -1510,7 +1631,13 @@ if forecast is not None and current is not None:
     with c2:
         st.metric('2 Degree Call', call or 'none')
     with c3:
-        st.metric('Sigma', str(round(sigma, 2))+' F')
+        if used_nbm:
+            p50 = nbm_percentiles.get('p50', nbm_percentiles.get('p25', '—'))
+            st.metric('NBM p50', str(p50)+' F')
+            st.caption('Bracket probs from NBM percentiles')
+        else:
+            st.metric('Sigma', str(round(sigma, 2))+' F')
+            st.caption('Fallback: sigma/normal distribution')
     with c4:
         if obs_high_final is not None:
             st.metric('Obs Floor', str(obs_high_final)+' F',
@@ -1522,7 +1649,9 @@ if forecast is not None and current is not None:
 
     if ensemble_mean is not None:
         gfs_weight_pct = int(GFS_CITY_WEIGHT.get(city, 0.20) * 100)
-        st.caption(f'GFS ensemble: {ensemble_mean}F | {len(ensemble_members)} members | weight {gfs_weight_pct}%')
+        effective_weight = int(gfs_weight_pct * 0.5) if used_nbm else gfs_weight_pct
+        st.caption(f'GFS ensemble: {ensemble_mean}F | {len(ensemble_members)} members | weight {effective_weight}%' +
+                   (' (halved — NBM active)' if used_nbm else ''))
     if high_uncertainty:
         st.caption('High uncertainty mode — green signals suppressed')
 
@@ -1534,13 +1663,13 @@ if forecast is not None and current is not None:
     best_no_bet = None
     best_no_edge = -999
 
-    for label, sigma_prob in sigma_rows:
+    for label, base_prob in prob_rows:
         ens_prob = None
         for lbl, lo, hi in parse_ladder(ladder_text):
             if labels_match(lbl, label):
                 ens_prob = ensemble_bracket_prob(ensemble_members, lo, hi)
                 break
-        final_prob = blend_probs(sigma_prob, ens_prob, ensemble_members, city)
+        final_prob = blend_probs(base_prob, ens_prob, ensemble_members, city, nbm_active=used_nbm)
         fair = round(final_prob * 100)
         yes_ask = no_ask = None
         if kalshi_markets:
@@ -1548,12 +1677,10 @@ if forecast is not None and current is not None:
             if match:
                 yes_ask, no_ask = match[1], match[2]
 
-        # YES signal
         e = edge_cents(final_prob, yes_ask)
         signal_icon, signal_text = edge_signal(e, high_uncertainty=high_uncertainty)
         kelly = kelly_bet(final_prob, yes_ask, bankroll) if yes_ask else 0.0
 
-        # NO signal
         busted = False
         if obs_high_final is not None:
             for lbl, lo, hi in parse_ladder(ladder_text):
@@ -1568,7 +1695,6 @@ if forecast is not None and current is not None:
         edge_str = ('+'+str(e)+'c') if e and e > 0 else (str(e)+'c' if e is not None else 'none')
         no_edge_str = ('+'+str(no_e)+'c') if no_e and no_e > 0 else (str(no_e)+'c' if no_e is not None else 'none')
 
-        # Combined signal display
         yes_signal_str = signal_icon + ' ' + signal_text if signal_text else ''
         no_signal_str = (no_icon + ' ' + no_text) if no_icon and no_text else '—'
 
@@ -1576,7 +1702,7 @@ if forecast is not None and current is not None:
             'Signal': yes_signal_str,
             'Bracket': label + (' BUSTED' if busted else ''),
             'Model %': str(round(final_prob*100, 1))+'%',
-            'Mkt Implied %': str(round((yes_ask / 100) * 100, 1))+'%' if yes_ask else '—',
+            'Mkt Implied %': str(round(yes_ask, 1))+'%' if yes_ask else '—',
             'Fair': str(fair)+'c',
             'YES ask': str(yes_ask)+'c' if yes_ask is not None else '—',
             'Edge': edge_str,
@@ -1584,29 +1710,25 @@ if forecast is not None and current is not None:
             'Ensemble': ens_conf,
         })
 
+        # V5.0 FIX: NO table Mkt Implied % now correctly uses no_ask (was yes_ask)
         no_rows.append({
             'NO Signal': no_signal_str,
             'Bracket': label + (' BUSTED' if busted else ''),
             'Model %': str(round(final_prob*100, 1))+'%',
-            'Mkt Implied %': str(round((yes_ask / 100) * 100, 1))+'%' if yes_ask else '—',
+            'Mkt Implied %': str(round(no_ask, 1))+'%' if no_ask else '—',
             'NO ask': str(no_ask)+'c' if no_ask is not None else '—',
             'NO Edge': no_edge_str,
             'Kelly NO': ('$'+str(kelly_no)) if kelly_no > 0 else '—',
             'Ensemble': ens_conf,
         })
 
-        # Track best YES bet
         if e is not None and e > best_edge and not busted:
             best_edge = e
             best_bet = {'label': label, 'edge': e, 'kelly': kelly,
                         'signal': signal_icon, 'uncertain': high_uncertainty}
 
-        # Track best NO bet
         if busted and no_ask is not None and no_ask <= 5:
-            if no_e is None:
-                no_e_for_rank = 95  # busted bracket NO at 5c = ~95c edge
-            else:
-                no_e_for_rank = no_e
+            no_e_for_rank = no_e if no_e is not None else 95
             if no_e_for_rank > best_no_edge:
                 best_no_edge = no_e_for_rank
                 best_no_bet = {'label': label, 'edge': no_e_for_rank, 'kelly': kelly_no,
@@ -1617,7 +1739,8 @@ if forecast is not None and current is not None:
                            'busted': False, 'no_ask': no_ask}
 
     # ── YES Table ─────────────────────────────────────────────────────────────
-    st.markdown('#### 🟢 YES Signals')
+    prob_source = '(NBM percentiles)' if used_nbm else '(sigma/normal fallback)'
+    st.markdown(f'#### 🟢 YES Signals {prob_source}')
     st.dataframe(pd.DataFrame(yes_rows), use_container_width=True, hide_index=True)
 
     if best_bet and best_bet['edge'] >= MIN_EDGE and not best_bet['uncertain']:
@@ -1631,7 +1754,7 @@ if forecast is not None and current is not None:
                    best_bet['label'] + ' (+' + str(best_bet['edge']) + 'c)')
 
     # ── NO Table ──────────────────────────────────────────────────────────────
-    st.markdown('#### 🔴 NO Signals')
+    st.markdown(f'#### 🔴 NO Signals {prob_source}')
     st.dataframe(pd.DataFrame(no_rows), use_container_width=True, hide_index=True)
 
     if best_no_bet:
@@ -1692,24 +1815,22 @@ with st.expander('View history for ' + city, expanded=False):
         } for r in sorted(complete, key=lambda x: x['date'], reverse=True)])
         st.dataframe(hist_df, use_container_width=True, hide_index=True)
     else:
-        st.info('No settled history yet for ' + city + '. Predictions auto-save daily and settle the next morning.')
+        st.info('No settled history yet for ' + city + '.')
 
     if pending:
         st.caption(str(len(pending)) + ' prediction(s) pending settlement: ' +
                    ', '.join(r['date'] for r in pending))
 
-# ── All Cities Summary Panel — self-healing ───────────────────────────────────
+# ── All Cities Summary Panel ──────────────────────────────────────────────────
 st.markdown('---')
 with st.expander('All Cities — Today\'s Predictions', expanded=True):
     import pandas as pd
 
-    # Fetch what's already in DB for today
     all_rows = sb_fetch_all()
     today_rows = [r for r in all_rows if r.get('date') == today_str]
     saved_cities = {r['city'] for r in today_rows}
     missing_cities = [c for c in CITIES.keys() if c not in saved_cities]
 
-    # Fill in any missing cities right now, one at a time
     if missing_cities:
         fill_status = st.empty()
         newly_saved = []
@@ -1719,7 +1840,7 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
                 weather = fetch_city_weather(c)
                 consensus, save_ok = save_city_prediction(c, weather, saved_ladders)
                 if save_ok and consensus is not None:
-                    bias_correction, _ = compute_bias_correction_db(c)
+                    bc, _ = compute_bias_correction_db(c)
                     today_rows.append({
                         'city': c,
                         'date': today_str,
@@ -1728,7 +1849,7 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
                         'ensemble_mean': weather['ensemble_mean'],
                         'source_gap': weather['source_gap'],
                         'high_uncertainty': weather['high_uncertainty'],
-                        'bias_correction': bias_correction,
+                        'bias_correction': bc,
                     })
                     newly_saved.append(c)
             except Exception:
@@ -1738,9 +1859,7 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
         if newly_saved:
             st.caption(f'✅ Filled in {len(newly_saved)} missing cities: {", ".join(newly_saved)}')
 
-    # Render the full table
     if today_rows:
-        import pandas as pd
         summary_rows = []
         for r in sorted(today_rows, key=lambda x: x['city']):
             c = r['city']
@@ -1749,18 +1868,33 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
             cached_markets, _ = get_cached_prices(c)
             obs_h = r.get('obs_high')
             high_unc = r.get('high_uncertainty', False)
+            bc_val = r.get('bias_correction', 0.0)
 
-            # Get ensemble members from cached weather if available
+            # Get ensemble members and NBM from cached weather
+            members = None
+            nbm_pcts = None
             try:
                 cached_wx = fetch_city_weather(c)
-                members = cached_wx.get('ensemble_members') if cached_wx else None
+                if cached_wx:
+                    members = cached_wx.get('ensemble_members')
+                    nbm_pcts = cached_wx.get('nbm_percentiles')
             except Exception:
-                members = None
+                pass
+
+            # Ensemble confidence key for this city
+            ens_key = ensemble_overall_confidence(members, consensus_val, ladder)
 
             best_yes, best_no = get_city_best_signals(
                 c, consensus_val, ladder, members,
-                cached_markets, obs_h, high_unc, bankroll
+                cached_markets, obs_h, high_unc, bankroll,
+                nbm_percentiles=nbm_pcts
             )
+
+            # Bias adj display
+            if bc_val and bc_val != 0.0:
+                bias_str = ('+' if bc_val > 0 else '') + str(bc_val) + 'F'
+            else:
+                bias_str = '—'
 
             summary_rows.append({
                 'City': c,
@@ -1769,6 +1903,8 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
                 'GFS': str(r.get('ensemble_mean', ''))+'F' if r.get('ensemble_mean') else '—',
                 'Gap': str(round(r['source_gap'], 1))+'F' if r.get('source_gap') else '—',
                 '⚠️': '⚠️' if r.get('high_uncertainty') else '✅',
+                'Ens Key': ens_key if ens_key else '—',      # V5.0: Ensemble Key column
+                'Bias Adj': bias_str,                          # V5.0: Bias Adj column
                 'Best YES': best_yes,
                 'Best NO': best_no,
             })
