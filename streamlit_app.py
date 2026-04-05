@@ -5,7 +5,8 @@
 #    "⚠️ Obs high of XX.XF discarded — verify manually before betting"
 # 2. NBM fix — replaced broken NWS gridpoint API fetch (field names don't exist)
 #    with Iowa State AFOS archive fetch of actual NBM text bulletin (NBP product)
-#    Parses real NBM fields: TXNP1(p10), TXNP2(p25), TXNMN(p50), TXNP3(p75), TXNP4(p90)
+#    Correct NBM field names (v4.x): TXNP1(p10), TXNP2(p25), TXNP5(p50),
+#    TXNP7(p75), TXNP9(p90), TXNMN(mean) — previous version had wrong names
 #    Also adds visible NBM/Sigma status indicator to All Cities panel
 # 3. Cold front detection warning — when temp trending down significantly from obs high,
 #    flags city as "⚠️ Peak may already be in — verify before betting"
@@ -313,7 +314,7 @@ def run_auto_settlement():
             settled.append({'city': city, 'date': row_date, 'actual': actual, 'error': error})
     return len(settled), settled
 
-# ── Bias Correction — cap raised to 5.0F globally ────────────────────────────
+# ── Bias Correction ───────────────────────────────────────────────────────────
 def compute_bias_correction_db(city, n_recent=10):
     rows = sb_fetch_city(city)
     complete = [r for r in rows if r.get('actual') is not None and r.get('consensus') is not None]
@@ -325,20 +326,22 @@ def compute_bias_correction_db(city, n_recent=10):
     correction = max(-5.0, min(5.0, mean_error))
     return round(correction, 2), len(recent)
 
-# ── V5.1 FIX: NBM via Iowa State AFOS archive ────────────────────────────────
+# ── V5.1 NBM via Iowa State AFOS — CORRECTED field names ─────────────────────
 @st.cache_data(ttl=1800)
 def fetch_nbm_percentiles(lat, lon):
     """
-    V5.1: Fetch NBM percentile forecasts from Iowa State AFOS archive (NBP text bulletin).
-    Replaces broken NWS gridpoint API approach — those percentile field names don't exist
-    in the gridpoint API response.
+    V5.1: Fetch NBM percentile forecasts from Iowa State AFOS archive (NBP bulletin).
 
-    NBM NBP bulletin fields:
-      TXNP1 = 10th percentile max temp (F)
-      TXNP2 = 25th percentile max temp (F)
-      TXNMN = mean/50th percentile max temp (F)
-      TXNP3 = 75th percentile max temp (F)
-      TXNP4 = 90th percentile max temp (F)
+    Correct NBM v4.x field names:
+      TXNMN = mean max/min temp (F)
+      TXNP1 = 10th percentile
+      TXNP2 = 25th percentile
+      TXNP5 = 50th percentile  ← was wrongly TXNP3 in first attempt
+      TXNP7 = 75th percentile  ← was wrongly TXNP3
+      TXNP9 = 90th percentile  ← was wrongly TXNP4
+
+    Max temp (daytime high) is listed at 00z column.
+    NBP bulletin PIL format: NBP + 3-letter station (e.g. NBPDFW for KDFW)
 
     Returns dict with keys: p10, p25, p50, p75, p90 or None if unavailable.
     """
@@ -355,7 +358,7 @@ def fetch_nbm_percentiles(lat, lon):
     if not icao:
         return None
 
-    # Build PIL: NBP + 3-letter station (e.g. NBPDFW for Dallas/KDFW)
+    # NBP PIL: NBP + 3-letter station (drop K prefix)
     station_3 = icao[1:] if icao.startswith('K') else icao[:3]
     pil = 'NBP' + station_3
 
@@ -373,55 +376,69 @@ def fetch_nbm_percentiles(lat, lon):
     lines = text.split('\n')
 
     def parse_nbm_line(lines, key):
-        """Find line starting with key and return its numeric values."""
+        """
+        Find line starting with key and return all valid temperature values.
+        NBP format: "TXNP1 51| 62 47| 53 44| 62..."
+        Values before pipe = 12z (overnight low), after pipe = 00z (daytime max).
+        We extract all numbers and take the max of the first few as today's high.
+        """
         for line in lines:
             stripped = line.strip()
-            if re.match(r'^' + re.escape(key) + r'\b', stripped, re.IGNORECASE):
-                parts = stripped.split()
+            if re.match(r'^' + re.escape(key) + r'\s', stripped, re.IGNORECASE):
+                remainder = stripped[len(key):]
+                nums = re.findall(r'\d+', remainder)
                 vals = []
-                for p in parts[1:]:
+                for n in nums:
                     try:
-                        v = float(p)
-                        if 0 < v < 130:
+                        v = float(n)
+                        if 30 < v < 130:  # valid Fahrenheit temp range
                             vals.append(v)
                     except Exception:
                         pass
                 return vals
         return []
 
-    p10_vals = parse_nbm_line(lines, 'TXNP1')
-    p25_vals = parse_nbm_line(lines, 'TXNP2')
-    p50_vals = parse_nbm_line(lines, 'TXNMN')
-    p75_vals = parse_nbm_line(lines, 'TXNP3')
-    p90_vals = parse_nbm_line(lines, 'TXNP4')
+    def get_today_high(vals):
+        """Take max of first 4 values — covers today's min/max pair and tomorrow's min."""
+        if not vals:
+            return None
+        return round(max(vals[:4]), 1)
+
+    p10_vals  = parse_nbm_line(lines, 'TXNP1')
+    p25_vals  = parse_nbm_line(lines, 'TXNP2')
+    p50_vals  = parse_nbm_line(lines, 'TXNP5')
+    p75_vals  = parse_nbm_line(lines, 'TXNP7')
+    p90_vals  = parse_nbm_line(lines, 'TXNP9')
+    mean_vals = parse_nbm_line(lines, 'TXNMN')
 
     result = {}
-    # Take max over first 24 values (today's forecast window)
     if p10_vals:
-        result['p10'] = round(max(p10_vals[:24]), 1)
+        result['p10'] = get_today_high(p10_vals)
     if p25_vals:
-        result['p25'] = round(max(p25_vals[:24]), 1)
+        result['p25'] = get_today_high(p25_vals)
     if p50_vals:
-        result['p50'] = round(max(p50_vals[:24]), 1)
+        result['p50'] = get_today_high(p50_vals)
+    elif mean_vals:
+        result['p50'] = get_today_high(mean_vals)
     if p75_vals:
-        result['p75'] = round(max(p75_vals[:24]), 1)
+        result['p75'] = get_today_high(p75_vals)
     if p90_vals:
-        result['p90'] = round(max(p90_vals[:24]), 1)
+        result['p90'] = get_today_high(p90_vals)
+
+    # Remove any None values
+    result = {k: v for k, v in result.items() if v is not None}
 
     if len(result) >= 2 and ('p50' in result or 'p25' in result or 'p75' in result):
         return result
     return None
 
 def nbm_bracket_prob(nbm_percentiles, lo, hi, obs_high=None):
-    """
-    Compute bracket probability from NBM percentiles using piecewise linear CDF.
-    """
+    """Compute bracket probability from NBM percentiles using piecewise linear CDF."""
     if not nbm_percentiles:
         return None
 
     cdf_points = []
     pct_map = {'p10': 0.10, 'p25': 0.25, 'p50': 0.50, 'p75': 0.75, 'p90': 0.90}
-
     for key, prob in sorted(pct_map.items(), key=lambda x: x[1]):
         if key in nbm_percentiles:
             cdf_points.append((nbm_percentiles[key], prob))
@@ -459,15 +476,9 @@ def nbm_bracket_prob(nbm_percentiles, lo, hi, obs_high=None):
     return None
 
 def bracket_probs_nbm(consensus, ladder_text, city, nbm_percentiles, obs_high=None, forecast=None):
-    """
-    Compute bracket probabilities using NBM as primary, sigma as fallback.
-    Returns (rows, label, used_nbm_bool)
-    """
-    rows = []
-    used_nbm = False
-
+    """Compute bracket probabilities using NBM as primary, sigma as fallback."""
     if nbm_percentiles and len(nbm_percentiles) >= 2:
-        used_nbm = True
+        rows = []
         for label, lo, hi in parse_ladder(ladder_text):
             p = nbm_bracket_prob(nbm_percentiles, lo, hi, obs_high=obs_high)
             if p is None:
@@ -493,35 +504,29 @@ def _sigma_bracket_prob(mu, lo, hi, sigma, obs_high=None):
 # ── V5.1: Bracket Boundary Warning ───────────────────────────────────────────
 def check_bracket_boundary(consensus, ladder_text, boundary_threshold=0.5):
     """
-    V5.1: Returns a warning string if consensus falls within boundary_threshold
-    of any bracket ceiling or floor. NWS rounds to whole numbers, so 0.5F from
-    a boundary means settlement could go either way.
-    Returns list of warning strings (empty if no boundary risk).
+    V5.1: Flag when consensus falls within 0.5F of any bracket ceiling or floor.
+    NWS rounds to whole numbers so 73.9 -> 74, meaning boundary proximity is real risk.
     """
     warnings = []
     for label, lo, hi in parse_ladder(ladder_text):
         if hi is not None and lo is not None:
-            # Check ceiling
             if abs(consensus - hi) <= boundary_threshold:
                 warnings.append(
                     f'⚠️ Boundary risk: Consensus {consensus}F is within {boundary_threshold}F of '
                     f'{hi}F ceiling ({label}) — NWS rounding could push to next bracket up. Verify before betting.'
                 )
-            # Check floor
             if abs(consensus - lo) <= boundary_threshold:
                 warnings.append(
                     f'⚠️ Boundary risk: Consensus {consensus}F is within {boundary_threshold}F of '
                     f'{lo}F floor ({label}) — NWS rounding could push to bracket below. Verify before betting.'
                 )
         elif hi is not None and lo is None:
-            # "X or below" bracket — check ceiling
             if abs(consensus - hi) <= boundary_threshold:
                 warnings.append(
                     f'⚠️ Boundary risk: Consensus {consensus}F is within {boundary_threshold}F of '
                     f'{hi}F ceiling ({label}) — NWS rounding could push to next bracket up. Verify before betting.'
                 )
         elif lo is not None and hi is None:
-            # "X or above" bracket — check floor
             if abs(consensus - lo) <= boundary_threshold:
                 warnings.append(
                     f'⚠️ Boundary risk: Consensus {consensus}F is within {boundary_threshold}F of '
@@ -532,12 +537,8 @@ def check_bracket_boundary(consensus, ladder_text, boundary_threshold=0.5):
 # ── V5.1: Cold Front Detection ────────────────────────────────────────────────
 def check_cold_front_warning(obs_high, current_temp, nws_forecast):
     """
-    V5.1: Detect when the daily high may already be in due to a cold front passage.
-    Triggers when:
-      - obs_high exists AND
-      - current_temp is significantly below obs_high (>= 5F drop) AND
-      - current_temp is also below nws_forecast (front has undercut the forecast)
-    Returns warning string or None.
+    V5.1: Detect when daily high may already be in due to cold front passage.
+    Triggers when current temp drops 5F+ below obs high.
     """
     if obs_high is None or current_temp is None:
         return None
@@ -1288,7 +1289,6 @@ def fetch_city_weather(city):
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
     nbm_percentiles = fetch_nbm_percentiles(lat, lon)
 
-    # Sanity checks
     obs_high_final = obs_high_raw
     obs_high_discarded = False
     obs_high_discard_reason = None
@@ -1373,7 +1373,7 @@ with st.sidebar:
     st.markdown('---')
     st.markdown('**V5.1 Changes**')
     st.markdown('- Discarded obs high now shows ⚠️ warning (not silent)')
-    st.markdown('- NBM fix: now fetches real NBM text bulletin via Iowa State')
+    st.markdown('- NBM fix: Iowa State AFOS, correct field names (TXNP1/2/5/7/9)')
     st.markdown('- Cold front detection: ⚠️ Peak may already be in')
     st.markdown('- Bracket boundary warning: ⚠️ within 0.5F of ceiling/floor')
     st.markdown('- NBM/Sigma status visible in All Cities panel')
@@ -1383,7 +1383,6 @@ saved_ladders = load_json(SAVE_FILE)
 today_str = get_eastern_date()
 last_sync_data = load_json(LAST_SYNC_FILE)
 
-# ── Auto-Settlement ───────────────────────────────────────────────────────────
 if 'auto_settled' not in st.session_state:
     with st.spinner('Checking for unsettled predictions...'):
         n_settled, settled_rows = run_auto_settlement()
@@ -1393,7 +1392,6 @@ if 'auto_settled' not in st.session_state:
             direction = '✅' if abs(s['error']) <= 1.5 else '⚠️'
             st.success(f"{direction} Auto-settled {s['city']} ({s['date']}): actual={s['actual']}F | error={s['error']:+.1f}F")
 
-# ── Morning Sync ──────────────────────────────────────────────────────────────
 if last_sync_data.get('date') != today_str:
     saved_ladders, results = sync_all_ladders(saved_ladders)
     if results:
@@ -1414,7 +1412,6 @@ else:
                 st.warning('Could not fetch: ' + ', '.join(results['failed']))
             st.rerun()
 
-# ── City Selection ────────────────────────────────────────────────────────────
 city_list = list(CITIES.keys())
 default_idx = city_list.index('New York')
 city = st.selectbox('City', city_list, index=default_idx)
@@ -1440,7 +1437,6 @@ st.caption('Local time: ' + str(local_hour) + ':00 ' + tz_name)
 if city in FORECAST_HEAVY_CITIES and local_hour < 16:
     st.caption('Forecast-heavy mode active (Texas/OKC heat lag correction)')
 
-# ── Bias Correction ───────────────────────────────────────────────────────────
 bias_correction, bias_n = compute_bias_correction_db(city)
 if bias_n >= 3:
     direction = 'warm' if bias_correction > 0 else 'cold'
@@ -1454,7 +1450,6 @@ else:
 if city not in saved_ladders:
     saved_ladders[city] = DEFAULT_LADDERS.get(city, '')
 
-# ── Kalshi Prices ─────────────────────────────────────────────────────────────
 kalshi_markets, fetched_at = get_cached_prices(city)
 if kalshi_markets is None:
     with st.spinner('Fetching live Kalshi prices for ' + city + '...'):
@@ -1499,7 +1494,6 @@ with st.expander('Edit Brackets', expanded=False):
 ladder_text = saved_ladders[city]
 st.caption('Current ladder: ' + ladder_text)
 
-# ── Live Weather ──────────────────────────────────────────────────────────────
 st.subheader('Live Weather')
 with st.spinner('Fetching weather data...'):
     nws_forecast, nws_fc_url = fetch_nws_forecast(lat, lon)
@@ -1508,7 +1502,6 @@ with st.spinner('Fetching weather data...'):
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
     nbm_percentiles = fetch_nbm_percentiles(lat, lon)
 
-# ── Sanity Checks ─────────────────────────────────────────────────────────────
 sanity_warnings = []
 obs_high_today = obs_high_raw
 obs_high_suspect = False
@@ -1570,10 +1563,9 @@ with col3:
         wu_url = WUNDERGROUND_URLS.get(city, '')
         st.caption('[NWS table](' + obs_url + ')' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else ''))
     elif obs_high_suspect:
-        # V5.1 FIX: Show discarded obs high as visible warning, not silent drop
         st.metric('Obs High Today', str(obs_high_raw)+'F ⚠️')
         wu_url = WUNDERGROUND_URLS.get(city, '')
-        st.caption('⚠️ Discarded — verify manually · [Wunderground ↗](' + wu_url + ')' if wu_url else '⚠️ Discarded — verify manually')
+        st.caption('⚠️ Discarded — verify manually' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else ''))
     else:
         st.metric('Obs High Today', 'Unavailable')
         wu_url = WUNDERGROUND_URLS.get(city, '')
@@ -1594,7 +1586,6 @@ with col4:
     else:
         st.metric('GFS Ensemble', 'Unavailable')
 
-# V5.1: NBM status with clearer label
 if nbm_percentiles:
     nbm_p50 = nbm_percentiles.get('p50', nbm_percentiles.get('p25', '—'))
     nbm_p10 = nbm_percentiles.get('p10', '—')
@@ -1603,7 +1594,6 @@ if nbm_percentiles:
 else:
     st.warning('⚠️ NBM unavailable — using sigma/normal distribution fallback')
 
-# V5.1 FIX: Discarded obs high warning shown prominently
 for w in sanity_warnings:
     st.error('⚠️ ' + w)
 
@@ -1614,7 +1604,6 @@ elif high_uncertainty and source_gap is not None:
 elif source_gap is not None and source_gap > 2.5:
     st.info(f'Source gap: NWS vs Ensemble = {round(source_gap, 1)}F — moderate divergence.')
 
-# V5.1: Cold front detection warning
 cold_front_warning = check_cold_front_warning(obs_high_raw, noaa_obs, nws_forecast)
 if cold_front_warning:
     st.warning(cold_front_warning)
@@ -1643,17 +1632,14 @@ current = override_cur if override_cur > 0 else noaa_obs
 noaa_final = override_noaa if override_noaa > 0 else noaa_obs
 obs_high_final = override_obs_high if override_obs_high > 0 else obs_high_today
 
-# ── Model Output ──────────────────────────────────────────────────────────────
 if forecast is not None and current is not None:
     consensus_raw = compute_consensus(forecast, current, noaa_final, city, obs_high=obs_high_final)
     consensus = round(consensus_raw + bias_correction, 1)
 
-    # V5.1: Bracket boundary warning
     boundary_warnings = check_bracket_boundary(consensus, ladder_text)
     for bw in boundary_warnings:
         st.warning(bw)
 
-    # Use NBM for bracket probs, sigma as fallback
     prob_rows, prob_label, used_nbm = bracket_probs_nbm(
         consensus, ladder_text, city, nbm_percentiles,
         obs_high=obs_high_final, forecast=forecast
@@ -1784,7 +1770,6 @@ if forecast is not None and current is not None:
             best_no_bet = {'label': label, 'edge': no_e, 'kelly': kelly_no,
                            'busted': False, 'no_ask': no_ask}
 
-    # ── YES Table ─────────────────────────────────────────────────────────────
     prob_source = '(NBM percentiles)' if used_nbm else '(sigma/normal fallback)'
     st.markdown(f'#### 🟢 YES Signals {prob_source}')
     st.dataframe(pd.DataFrame(yes_rows), use_container_width=True, hide_index=True)
@@ -1799,7 +1784,6 @@ if forecast is not None and current is not None:
         st.warning('No YES bracket meets the ' + str(MIN_EDGE) + 'c minimum. Best: ' +
                    best_bet['label'] + ' (+' + str(best_bet['edge']) + 'c)')
 
-    # ── NO Table ──────────────────────────────────────────────────────────────
     st.markdown(f'#### 🔴 NO Signals {prob_source}')
     st.dataframe(pd.DataFrame(no_rows), use_container_width=True, hide_index=True)
 
@@ -1927,8 +1911,6 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
                 pass
 
             ens_key = ensemble_overall_confidence(members, consensus_val, ladder)
-
-            # V5.1: NBM/Sigma status per city
             nbm_status = '✅ NBM' if nbm_pcts else '📊 Sigma'
 
             best_yes, best_no = get_city_best_signals(
@@ -1950,7 +1932,7 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
                 'Gap': str(round(r['source_gap'], 1))+'F' if r.get('source_gap') else '—',
                 '⚠️': '⚠️' if r.get('high_uncertainty') else '✅',
                 'Ens Key': ens_key if ens_key else '—',
-                'Prob Src': nbm_status,          # V5.1: NBM vs Sigma indicator
+                'Prob Src': nbm_status,
                 'Bias Adj': bias_str,
                 'Best YES': best_yes,
                 'Best NO': best_no,
