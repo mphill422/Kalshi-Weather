@@ -1,17 +1,15 @@
 # Kalshi High Temperature Model - V5.2
 #
 # Changes from V5.1:
-# 1. Auto-settler fix — removed session state lock, now runs every app load
-#    so overnight settlements populate automatically
-# 2. NBM — switched to NOMADS bulk file approach, greps for station in file
-#    URL: https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.YYYYMMDD/CC/text/blend_nbptx.tCCz
-# 3. Green signal suppression — when obs high unavailable + current temp is
-#    5F+ below NWS forecast in morning hours (<12pm local), suppress green signals
-#    and show warning: "⚠️ Temp below forecast with no obs high — signals unreliable"
-# 4. Cold front warning without obs high — triggers when current temp is 8F+
-#    below NWS forecast in morning hours, even without obs high data
-# 5. Market conviction check — when any bracket is priced >70% on Kalshi,
-#    flag it and suppress green signals on brackets that conflict with market
+# 1. Auto-settler fix — removed session state lock, runs every app load.
+#    ALSO switched settlement source to Iowa State CLI JSON API which has
+#    historical data (vs NWS obs history table which only shows last 3 days).
+#    URL: https://mesonet.agron.iastate.edu/json/cli.py?station=KDFW&year=2026
+#    This will automatically settle all pending April rows on next app load.
+# 2. NBM — NOMADS bulk file approach
+# 3. Green signal suppression — no obs high + temp 5F+ below forecast in AM
+# 4. Cold front warning without obs high — 8F+ gap in morning hours
+# 5. Market conviction check — >70% bracket suppresses conflicting signals
 
 import math, re, json, time, requests
 import streamlit as st
@@ -73,23 +71,33 @@ OBHISTORY_STATIONS = {
     'Minneapolis': 'KMSP', 'Washington DC': 'KDCA',
 }
 
+# Iowa State CLI JSON API uses ICAO station IDs
+CLI_STATIONS = {
+    'Phoenix': 'KPHX', 'Las Vegas': 'KLAS', 'Los Angeles': 'KLAX',
+    'Dallas': 'KDFW', 'Austin': 'KAUS', 'Houston': 'KHOU',
+    'Atlanta': 'KATL', 'Miami': 'KMIA', 'New York': 'KNYC',
+    'San Antonio': 'KSAT', 'New Orleans': 'KMSY', 'Philadelphia': 'KPHL',
+    'Boston': 'KBOS', 'Denver': 'KDEN', 'Oklahoma City': 'KOKC',
+    'Minneapolis': 'KMSP', 'Washington DC': 'KDCA',
+}
+
 WUNDERGROUND_URLS = {
-    'Phoenix':       'https://www.wunderground.com/weather/KPHX',
-    'Las Vegas':     'https://www.wunderground.com/weather/KLAS',
-    'Los Angeles':   'https://www.wunderground.com/weather/KLAX',
-    'Dallas':        'https://www.wunderground.com/weather/KDFW',
-    'Austin':        'https://www.wunderground.com/weather/KAUS',
-    'Houston':       'https://www.wunderground.com/weather/KHOU',
-    'Atlanta':       'https://www.wunderground.com/weather/KATL',
-    'Miami':         'https://www.wunderground.com/weather/KMIA',
-    'New York':      'https://www.wunderground.com/weather/KNYC',
-    'San Antonio':   'https://www.wunderground.com/weather/KSAT',
-    'New Orleans':   'https://www.wunderground.com/weather/KMSY',
-    'Philadelphia':  'https://www.wunderground.com/weather/KPHL',
-    'Boston':        'https://www.wunderground.com/weather/KBOS',
-    'Denver':        'https://www.wunderground.com/weather/KDEN',
+    'Phoenix': 'https://www.wunderground.com/weather/KPHX',
+    'Las Vegas': 'https://www.wunderground.com/weather/KLAS',
+    'Los Angeles': 'https://www.wunderground.com/weather/KLAX',
+    'Dallas': 'https://www.wunderground.com/weather/KDFW',
+    'Austin': 'https://www.wunderground.com/weather/KAUS',
+    'Houston': 'https://www.wunderground.com/weather/KHOU',
+    'Atlanta': 'https://www.wunderground.com/weather/KATL',
+    'Miami': 'https://www.wunderground.com/weather/KMIA',
+    'New York': 'https://www.wunderground.com/weather/KNYC',
+    'San Antonio': 'https://www.wunderground.com/weather/KSAT',
+    'New Orleans': 'https://www.wunderground.com/weather/KMSY',
+    'Philadelphia': 'https://www.wunderground.com/weather/KPHL',
+    'Boston': 'https://www.wunderground.com/weather/KBOS',
+    'Denver': 'https://www.wunderground.com/weather/KDEN',
     'Oklahoma City': 'https://www.wunderground.com/weather/KOKC',
-    'Minneapolis':   'https://www.wunderground.com/weather/KMSP',
+    'Minneapolis': 'https://www.wunderground.com/weather/KMSP',
     'Washington DC': 'https://www.wunderground.com/weather/KDCA',
 }
 
@@ -156,68 +164,55 @@ GFS_CITY_WEIGHT = {
     'Denver': 0.22, 'Minneapolis': 0.22,
 }
 
-# ── Supabase Client ───────────────────────────────────────────────────────────
+# ── Supabase ──────────────────────────────────────────────────────────────────
 _SB_URL = 'https://oirnfhhuyjuotkrlymxd.supabase.co'
 _SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9pcm5maGh1eWp1b3Rrcmx5bXhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDIzMDYyMjAsImV4cCI6MjA1NzgyNjIyMH0.3Mp81UjdxkpAYq_cuaOa-0Vqo1LkMgxawOM1gWF6TJ0'
 
 def get_sb_headers():
-    try:
-        key = st.secrets['supabase']['key']
-    except Exception:
-        key = _SB_KEY
-    return {
-        'apikey': key, 'Authorization': 'Bearer ' + key,
-        'Content-Type': 'application/json', 'Prefer': 'return=representation',
-    }
+    try: key = st.secrets['supabase']['key']
+    except Exception: key = _SB_KEY
+    return {'apikey': key, 'Authorization': 'Bearer ' + key,
+            'Content-Type': 'application/json', 'Prefer': 'return=representation'}
 
 def sb_url(table):
-    try:
-        url = st.secrets['supabase']['url']
-    except Exception:
-        url = _SB_URL
+    try: url = st.secrets['supabase']['url']
+    except Exception: url = _SB_URL
     return url + '/rest/v1/' + table
 
 def sb_insert(row):
     try:
         r = requests.post(sb_url('settlements'), headers=get_sb_headers(), json=row, timeout=10)
         return r.status_code in (200, 201)
-    except Exception:
-        return False
+    except Exception: return False
 
 def sb_fetch_all():
     try:
         r = requests.get(sb_url('settlements'), headers=get_sb_headers(),
                          params={'order': 'date.asc', 'limit': '1000'}, timeout=10)
         return r.json() if r.status_code == 200 else []
-    except Exception:
-        return []
+    except Exception: return []
 
 def sb_fetch_city(city):
     try:
         r = requests.get(sb_url('settlements'), headers=get_sb_headers(),
                          params={'city': 'eq.' + city, 'order': 'date.asc', 'limit': '200'}, timeout=10)
         return r.json() if r.status_code == 200 else []
-    except Exception:
-        return []
+    except Exception: return []
 
 def sb_fetch_unsettled():
     try:
         r = requests.get(sb_url('settlements'), headers=get_sb_headers(),
                          params={'actual': 'is.null', 'order': 'date.asc'}, timeout=10)
         return r.json() if r.status_code == 200 else []
-    except Exception:
-        return []
+    except Exception: return []
 
 def sb_update_actual(row_id, actual, error):
     try:
-        r = requests.patch(
-            sb_url('settlements') + '?id=eq.' + str(row_id),
-            headers=get_sb_headers(),
-            json={'actual': actual, 'error': round(error, 2)}, timeout=10
-        )
+        r = requests.patch(sb_url('settlements') + '?id=eq.' + str(row_id),
+                           headers=get_sb_headers(),
+                           json={'actual': actual, 'error': round(error, 2)}, timeout=10)
         return r.status_code in (200, 204)
-    except Exception:
-        return False
+    except Exception: return False
 
 def sb_fetch_today(city):
     today = get_eastern_date()
@@ -226,16 +221,14 @@ def sb_fetch_today(city):
                          params={'date': 'eq.' + today, 'city': 'eq.' + city}, timeout=10)
         rows = r.json() if r.status_code == 200 else []
         return rows[0] if rows else None
-    except Exception:
-        return None
+    except Exception: return None
 
 def sb_upsert_prediction(city, consensus, forecast, ensemble_mean, source_gap,
                           high_uncertainty, obs_high, bias_correction):
     today = get_eastern_date()
     existing = sb_fetch_today(city)
     row = {
-        'date': today, 'city': city,
-        'consensus': round(consensus, 2),
+        'date': today, 'city': city, 'consensus': round(consensus, 2),
         'forecast': round(forecast, 2) if forecast else None,
         'ensemble_mean': round(ensemble_mean, 2) if ensemble_mean else None,
         'source_gap': round(source_gap, 2) if source_gap else None,
@@ -246,65 +239,90 @@ def sb_upsert_prediction(city, consensus, forecast, ensemble_mean, source_gap,
     }
     if existing:
         try:
-            r = requests.patch(
-                sb_url('settlements') + '?id=eq.' + str(existing['id']),
-                headers=get_sb_headers(),
-                json={k: v for k, v in row.items() if k not in ('date', 'city')}, timeout=10
-            )
+            r = requests.patch(sb_url('settlements') + '?id=eq.' + str(existing['id']),
+                               headers=get_sb_headers(),
+                               json={k: v for k, v in row.items() if k not in ('date', 'city')}, timeout=10)
             return r.status_code in (200, 204)
-        except Exception:
-            return False
-    else:
-        return sb_insert(row)
+        except Exception: return False
+    else: return sb_insert(row)
 
-# ── Auto-Settlement — V5.2: no session state lock, runs every load ────────────
+# ── V5.2 Auto-Settlement — Iowa State CLI JSON API ────────────────────────────
+_CLI_CACHE = {}  # {station_year_key: {date_str: max_temp}}
+
+def fetch_cli_max_temp(city, target_date_str):
+    """
+    V5.2: Use Iowa State CLI JSON API for historical settlement data.
+    Replaces NWS obs history table (only last ~3 days).
+    API: https://mesonet.agron.iastate.edu/json/cli.py?station=KDFW&year=2026
+    Response: JSON with 'results' list, each has 'valid' (YYYY-MM-DD) and 'high' (F).
+    """
+    station = CLI_STATIONS.get(city)
+    if not station:
+        return None
+    year = target_date_str[:4]
+    cache_key = station + '_' + year
+    if cache_key not in _CLI_CACHE:
+        try:
+            url = f'https://mesonet.agron.iastate.edu/json/cli.py?station={station}&year={year}'
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            lookup = {}
+            for entry in data.get('results', []):
+                valid = entry.get('valid', '')
+                high = entry.get('high')
+                if valid and high is not None:
+                    try: lookup[valid] = float(high)
+                    except Exception: pass
+            _CLI_CACHE[cache_key] = lookup
+        except Exception:
+            return None
+    return _CLI_CACHE.get(cache_key, {}).get(target_date_str)
+
 def fetch_obs_high_for_date(icao, target_date_str):
+    """Fallback: NWS obs history (last ~3 days only)."""
     url = 'https://forecast.weather.gov/data/obhistory/' + icao + '.html'
     try:
         r = requests.get(url, headers=HEADERS, timeout=12)
         r.raise_for_status()
-    except Exception:
-        return None
+    except Exception: return None
     soup = BeautifulSoup(r.text, 'html.parser')
     tables = soup.find_all('table')
     table = max(tables, key=lambda t: len(t.find_all('tr')), default=None) if tables else None
-    if not table:
-        return None
+    if not table: return None
     target_day = str(datetime.strptime(target_date_str, '%Y-%m-%d').day)
     highs = []
     for row in table.find_all('tr'):
         cols = [td.get_text(strip=True) for td in row.find_all('td')]
-        if not cols or len(cols) < 9 or cols[0] != target_day:
-            continue
+        if not cols or len(cols) < 9 or cols[0] != target_day: continue
         try:
             t = float(cols[8])
-            if 0 < t < 130:
-                highs.append(t)
-        except Exception:
-            pass
+            if 0 < t < 130: highs.append(t)
+        except Exception: pass
     return round(max(highs), 1) if highs else None
 
 def run_auto_settlement():
     """
-    V5.2: Removed @st.cache_data and session state lock.
-    Now runs every app load to ensure overnight settlements populate.
-    Uses a lightweight check — only fetches cities with unsettled rows.
+    V5.2: No session state lock — runs every app load.
+    Iowa State CLI JSON API as primary (has historical data).
+    NWS obs history as fallback for very recent dates.
     """
     unsettled = sb_fetch_unsettled()
-    if not unsettled:
-        return 0, []
+    if not unsettled: return 0, []
     settled = []
+    today = get_eastern_date()
     for row in unsettled:
         row_date = row.get('date', '')
-        if row_date >= get_eastern_date():
-            continue
+        if row_date >= today: continue
         city = row.get('city')
         icao = OBHISTORY_STATIONS.get(city)
-        if not icao:
-            continue
-        actual = fetch_obs_high_for_date(icao, row_date)
+        if not icao: continue
+        # Primary: Iowa State CLI JSON API
+        actual = fetch_cli_max_temp(city, row_date)
+        # Fallback: NWS obs history
         if actual is None:
-            continue
+            actual = fetch_obs_high_for_date(icao, row_date)
+        if actual is None: continue
         consensus = row.get('consensus')
         error = round(actual - consensus, 2) if consensus is not None else None
         ok = sb_update_actual(row['id'], actual, error)
@@ -316,24 +334,15 @@ def run_auto_settlement():
 def compute_bias_correction_db(city, n_recent=10):
     rows = sb_fetch_city(city)
     complete = [r for r in rows if r.get('actual') is not None and r.get('consensus') is not None]
-    if len(complete) < 3:
-        return 0.0, len(complete)
+    if len(complete) < 3: return 0.0, len(complete)
     recent = complete[-n_recent:]
     errors = [r['actual'] - r['consensus'] for r in recent]
     mean_error = sum(errors) / len(errors)
-    correction = max(-5.0, min(5.0, mean_error))
-    return round(correction, 2), len(recent)
+    return round(max(-5.0, min(5.0, mean_error)), 2), len(recent)
 
-# ── V5.2 NBM — NOMADS bulk file approach ─────────────────────────────────────
+# ── V5.2 NBM — NOMADS bulk file ───────────────────────────────────────────────
 @st.cache_data(ttl=1800)
 def fetch_nbm_percentiles(lat, lon):
-    """
-    V5.2: Fetch NBM NBP bulletin from NOMADS bulk file.
-    Greps for the specific station within the combined file.
-    URL: https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.YYYYMMDD/CC/text/blend_nbptx.tCCz
-    NBP only at 01/07/13/19z cycles.
-    Fields: TXNP1(p10), TXNP2(p25), TXNP5(p50), TXNP7(p75), TXNP9(p90)
-    """
     city_name = None
     best_dist = float('inf')
     for c, coords in CITIES.items():
@@ -341,26 +350,18 @@ def fetch_nbm_percentiles(lat, lon):
         if dist < best_dist:
             best_dist = dist
             city_name = c
-
     icao = OBHISTORY_STATIONS.get(city_name, '')
-    if not icao:
-        return None
+    if not icao: return None
 
-    # Try most recent valid NBP cycles: 01/07/13/19z only
     now_utc = datetime.utcnow()
     date_str = now_utc.strftime('%Y%m%d')
     utc_hour = now_utc.hour
-
-    if utc_hour >= 19:
-        cycles = [('19', date_str), ('13', date_str), ('07', date_str), ('01', date_str)]
-    elif utc_hour >= 13:
-        cycles = [('13', date_str), ('07', date_str), ('01', date_str)]
-    elif utc_hour >= 7:
-        cycles = [('07', date_str), ('01', date_str)]
-    else:
-        cycles = [('01', date_str)]
-    # Also try yesterday's 19z as fallback
     yesterday = (now_utc - timedelta(days=1)).strftime('%Y%m%d')
+
+    if utc_hour >= 19: cycles = [('19', date_str), ('13', date_str), ('07', date_str), ('01', date_str)]
+    elif utc_hour >= 13: cycles = [('13', date_str), ('07', date_str), ('01', date_str)]
+    elif utc_hour >= 7: cycles = [('07', date_str), ('01', date_str)]
+    else: cycles = [('01', date_str)]
     cycles.append(('19', yesterday))
 
     station_block = None
@@ -368,23 +369,17 @@ def fetch_nbm_percentiles(lat, lon):
         url = f'https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.{ds}/{cyc}/text/blend_nbptx.t{cyc}z'
         try:
             r = requests.get(url, headers=HEADERS, timeout=20, stream=True)
-            if r.status_code != 200:
-                continue
-            # Read in chunks looking for our station
+            if r.status_code != 200: continue
             content = ''
             found = False
             for chunk in r.iter_content(chunk_size=65536, decode_unicode=True):
                 if chunk:
                     content += chunk
-                    # Look for station header line
                     if icao + ' ' in content and 'TXNP' in content:
                         found = True
                         break
-                    # Limit to 5MB to avoid huge downloads
-                    if len(content) > 5_000_000:
-                        break
+                    if len(content) > 5_000_000: break
             if found:
-                # Extract the station's block
                 lines = content.split('\n')
                 start_idx = None
                 for i, line in enumerate(lines):
@@ -392,15 +387,11 @@ def fetch_nbm_percentiles(lat, lon):
                         start_idx = i
                         break
                 if start_idx is not None:
-                    # Take next 60 lines as the station block
                     station_block = '\n'.join(lines[start_idx:start_idx+60])
                     break
-        except Exception:
-            continue
+        except Exception: continue
 
-    if not station_block:
-        return None
-
+    if not station_block: return None
     lines = station_block.split('\n')
 
     def parse_nbm_line(lines, key):
@@ -408,86 +399,66 @@ def fetch_nbm_percentiles(lat, lon):
             stripped = line.strip()
             if re.match(r'^' + re.escape(key) + r'\s', stripped, re.IGNORECASE):
                 remainder = stripped[len(key):]
-                nums = re.findall(r'\d+', remainder)
                 vals = []
-                for n in nums:
+                for n in re.findall(r'\d+', remainder):
                     try:
                         v = float(n)
-                        if 30 < v < 130:
-                            vals.append(v)
-                    except Exception:
-                        pass
+                        if 30 < v < 130: vals.append(v)
+                    except Exception: pass
                 return vals
         return []
 
     def get_today_high(vals):
-        if not vals:
-            return None
-        return round(max(vals[:4]), 1)
-
-    p10_vals  = parse_nbm_line(lines, 'TXNP1')
-    p25_vals  = parse_nbm_line(lines, 'TXNP2')
-    p50_vals  = parse_nbm_line(lines, 'TXNP5')
-    p75_vals  = parse_nbm_line(lines, 'TXNP7')
-    p90_vals  = parse_nbm_line(lines, 'TXNP9')
-    mean_vals = parse_nbm_line(lines, 'TXNMN')
+        return round(max(vals[:4]), 1) if vals else None
 
     result = {}
-    if p10_vals:
-        result['p10'] = get_today_high(p10_vals)
-    if p25_vals:
-        result['p25'] = get_today_high(p25_vals)
-    if p50_vals:
-        result['p50'] = get_today_high(p50_vals)
-    elif mean_vals:
-        result['p50'] = get_today_high(mean_vals)
-    if p75_vals:
-        result['p75'] = get_today_high(p75_vals)
-    if p90_vals:
-        result['p90'] = get_today_high(p90_vals)
+    p10 = parse_nbm_line(lines, 'TXNP1')
+    p25 = parse_nbm_line(lines, 'TXNP2')
+    p50 = parse_nbm_line(lines, 'TXNP5')
+    p75 = parse_nbm_line(lines, 'TXNP7')
+    p90 = parse_nbm_line(lines, 'TXNP9')
+    mn  = parse_nbm_line(lines, 'TXNMN')
+
+    if p10: result['p10'] = get_today_high(p10)
+    if p25: result['p25'] = get_today_high(p25)
+    if p50: result['p50'] = get_today_high(p50)
+    elif mn: result['p50'] = get_today_high(mn)
+    if p75: result['p75'] = get_today_high(p75)
+    if p90: result['p90'] = get_today_high(p90)
 
     result = {k: v for k, v in result.items() if v is not None}
-
     if len(result) >= 2 and ('p50' in result or 'p25' in result or 'p75' in result):
         return result
     return None
 
 def nbm_bracket_prob(nbm_percentiles, lo, hi, obs_high=None):
-    if not nbm_percentiles:
-        return None
+    if not nbm_percentiles: return None
     cdf_points = []
     pct_map = {'p10': 0.10, 'p25': 0.25, 'p50': 0.50, 'p75': 0.75, 'p90': 0.90}
     for key, prob in sorted(pct_map.items(), key=lambda x: x[1]):
-        if key in nbm_percentiles:
-            cdf_points.append((nbm_percentiles[key], prob))
-    if len(cdf_points) < 2:
-        return None
+        if key in nbm_percentiles: cdf_points.append((nbm_percentiles[key], prob))
+    if len(cdf_points) < 2: return None
     cdf_points.sort(key=lambda x: x[0])
 
     def cdf(t):
-        if t <= cdf_points[0][0]:
-            return max(0.0, cdf_points[0][1] * (t - (cdf_points[0][0] - 5)) / 5)
+        if t <= cdf_points[0][0]: return max(0.0, cdf_points[0][1] * (t - (cdf_points[0][0] - 5)) / 5)
         if t >= cdf_points[-1][0]:
             remaining = 1.0 - cdf_points[-1][1]
             span = max(cdf_points[-1][0] - cdf_points[-2][0], 1.0)
             return min(1.0, cdf_points[-1][1] + remaining * (t - cdf_points[-1][0]) / span)
         for i in range(len(cdf_points) - 1):
-            t0, p0 = cdf_points[i]
-            t1, p1 = cdf_points[i + 1]
+            t0, p0 = cdf_points[i]; t1, p1 = cdf_points[i + 1]
             if t0 <= t <= t1:
-                frac = (t - t0) / max(t1 - t0, 0.001)
-                return p0 + frac * (p1 - p0)
+                return p0 + (t - t0) / max(t1 - t0, 0.001) * (p1 - p0)
         return 0.5
 
     if lo is None and hi is not None:
-        if obs_high is not None and obs_high > hi + 0.4:
-            return 0.0
+        if obs_high is not None and obs_high > hi + 0.4: return 0.0
         return max(0.0, min(1.0, cdf(hi + 0.5)))
     elif hi is None and lo is not None:
         return max(0.0, min(1.0, 1.0 - cdf(lo - 0.5)))
     elif lo is not None and hi is not None:
-        if obs_high is not None and obs_high > hi + 0.4:
-            return 0.0
+        if obs_high is not None and obs_high > hi + 0.4: return 0.0
         return max(0.0, min(1.0, cdf(hi + 0.5) - cdf(lo - 0.5)))
     return None
 
@@ -503,177 +474,104 @@ def bracket_probs_nbm(consensus, ladder_text, city, nbm_percentiles, obs_high=No
         rows.sort(key=lambda x: x[1], reverse=True)
         return rows, 'NBM', True
     else:
-        sigma_rows, sigma = bracket_probs(consensus, ladder_text, city,
-                                          obs_high=obs_high, forecast=forecast)
+        sigma_rows, sigma = bracket_probs(consensus, ladder_text, city, obs_high=obs_high, forecast=forecast)
         return sigma_rows, sigma, False
 
 def _sigma_bracket_prob(mu, lo, hi, sigma, obs_high=None):
-    if obs_high is not None and hi is not None and obs_high > hi + 0.4:
-        return 0.0
-    if lo is None:
-        return normal_cdf(hi + 0.5, mu, sigma)
-    elif hi is None:
-        return 1 - normal_cdf(lo - 0.5, mu, sigma)
-    else:
-        return normal_cdf(hi + 0.5, mu, sigma) - normal_cdf(lo - 0.5, mu, sigma)
+    if obs_high is not None and hi is not None and obs_high > hi + 0.4: return 0.0
+    if lo is None: return normal_cdf(hi + 0.5, mu, sigma)
+    elif hi is None: return 1 - normal_cdf(lo - 0.5, mu, sigma)
+    else: return normal_cdf(hi + 0.5, mu, sigma) - normal_cdf(lo - 0.5, mu, sigma)
 
-# ── V5.2: Market Conviction Check ────────────────────────────────────────────
+# ── V5.2: Market Conviction ───────────────────────────────────────────────────
 def check_market_conviction(kalshi_markets, ladder_text, conviction_threshold=70):
-    """
-    V5.2: If any bracket is priced >70% on Kalshi, the market has strong conviction.
-    Returns (conviction_label, conviction_lo, conviction_hi, warning_str) or None.
-    When conviction exists, signals on conflicting brackets should be suppressed.
-    """
-    if not kalshi_markets:
-        return None
+    if not kalshi_markets: return None
     for label, yes_ask, no_ask in kalshi_markets:
         if yes_ask is not None and yes_ask >= conviction_threshold:
             lo, hi = label_to_numeric_key(label)
-            warning = (
-                f'⚠️ Market conviction: {label} is priced at {yes_ask}c ({yes_ask}% implied). '
-                f'Market strongly believes the high will be in this bracket. '
-                f'Verify before betting any other bracket.'
-            )
-            return (label, lo, hi, warning)
+            return (label, lo, hi,
+                    f'⚠️ Market conviction: {label} is priced at {yes_ask}c ({yes_ask}% implied). '
+                    f'Market strongly believes the high will be in this bracket. '
+                    f'Verify before betting any other bracket.')
     return None
 
 def is_conflicting_with_conviction(label, conviction_lo, conviction_hi, ladder_text):
-    """
-    Returns True if a bracket is more than one bracket away from the conviction bracket.
-    Used to suppress signals that conflict with strong market conviction.
-    """
-    if conviction_lo is None and conviction_hi is None:
-        return False
+    if conviction_lo is None and conviction_hi is None: return False
     parsed = parse_ladder(ladder_text)
-    conviction_idx = None
-    label_idx = None
+    conviction_idx = label_idx = None
     for i, (lbl, lo, hi) in enumerate(parsed):
         lo_k, hi_k = label_to_numeric_key(lbl)
-        if lo_k == conviction_lo and hi_k == conviction_hi:
-            conviction_idx = i
         lo_l, hi_l = label_to_numeric_key(label)
-        if lo_l == lo_k and hi_l == hi_k:
-            label_idx = i
-    if conviction_idx is None or label_idx is None:
-        return False
+        if lo_k == conviction_lo and hi_k == conviction_hi: conviction_idx = i
+        if lo_l == lo_k and hi_l == hi_k: label_idx = i
+    if conviction_idx is None or label_idx is None: return False
     return abs(label_idx - conviction_idx) > 1
 
 # ── V5.2: Bracket Boundary Warning ───────────────────────────────────────────
 def check_bracket_boundary(consensus, ladder_text, boundary_threshold=0.5):
     warnings = []
     for label, lo, hi in parse_ladder(ladder_text):
-        if hi is not None and lo is not None:
-            if abs(consensus - hi) <= boundary_threshold:
-                warnings.append(
-                    f'⚠️ Boundary risk: Consensus {consensus}F is within {boundary_threshold}F of '
-                    f'{hi}F ceiling ({label}) — NWS rounding could push to next bracket up. Verify before betting.'
-                )
-            if abs(consensus - lo) <= boundary_threshold:
-                warnings.append(
-                    f'⚠️ Boundary risk: Consensus {consensus}F is within {boundary_threshold}F of '
-                    f'{lo}F floor ({label}) — NWS rounding could push to bracket below. Verify before betting.'
-                )
-        elif hi is not None and lo is None:
-            if abs(consensus - hi) <= boundary_threshold:
-                warnings.append(
-                    f'⚠️ Boundary risk: Consensus {consensus}F is within {boundary_threshold}F of '
-                    f'{hi}F ceiling ({label}) — NWS rounding could push to next bracket up. Verify before betting.'
-                )
-        elif lo is not None and hi is None:
-            if abs(consensus - lo) <= boundary_threshold:
-                warnings.append(
-                    f'⚠️ Boundary risk: Consensus {consensus}F is within {boundary_threshold}F of '
-                    f'{lo}F floor ({label}) — NWS rounding could push to bracket below. Verify before betting.'
-                )
+        if hi is not None and abs(consensus - hi) <= boundary_threshold:
+            warnings.append(f'⚠️ Boundary risk: Consensus {consensus}F is within {boundary_threshold}F of {hi}F ceiling ({label}) — NWS rounding could push to next bracket up. Verify before betting.')
+        if lo is not None and abs(consensus - lo) <= boundary_threshold:
+            warnings.append(f'⚠️ Boundary risk: Consensus {consensus}F is within {boundary_threshold}F of {lo}F floor ({label}) — NWS rounding could push to bracket below. Verify before betting.')
     return warnings
 
-# ── V5.2: Cold Front Detection (with and without obs high) ───────────────────
+# ── V5.2: Cold Front + Morning Suppression ────────────────────────────────────
 def check_cold_front_warning(obs_high, current_temp, nws_forecast, local_hour):
-    """
-    V5.2: Detect cold front passage with or without obs high.
-    Case 1 (with obs high): current temp drops 5F+ below obs high
-    Case 2 (without obs high): current temp is 8F+ below NWS forecast in morning (<12pm local)
-    """
     if obs_high is not None and current_temp is not None:
         temp_drop = obs_high - current_temp
         if temp_drop >= 5.0:
-            msg = (
-                f'⚠️ Peak may already be in: Obs high {obs_high}F but current temp is '
-                f'{round(current_temp, 1)}F ({round(temp_drop, 1)}F drop). '
-                f'Cold front passage likely — verify before betting.'
-            )
+            msg = (f'⚠️ Peak may already be in: Obs high {obs_high}F but current temp is '
+                   f'{round(current_temp, 1)}F ({round(temp_drop, 1)}F drop). Cold front passage likely — verify before betting.')
             if nws_forecast is not None and current_temp < nws_forecast - 3.0:
                 msg += f' NWS forecast ({nws_forecast}F) also now above current temp.'
             return msg
-
-    # V5.2: Cold front detection WITHOUT obs high
     if obs_high is None and current_temp is not None and nws_forecast is not None:
         fc_gap = nws_forecast - current_temp
         if fc_gap >= 8.0 and local_hour < 12:
-            return (
-                f'⚠️ No obs high available — current temp {round(current_temp, 1)}F is '
-                f'{round(fc_gap, 1)}F below NWS forecast ({nws_forecast}F) in morning hours. '
-                f'Possible overnight peak or front passage. Verify before betting.'
-            )
+            return (f'⚠️ No obs high — current temp {round(current_temp, 1)}F is '
+                    f'{round(fc_gap, 1)}F below NWS forecast ({nws_forecast}F) in morning hours. '
+                    f'Possible overnight peak or front passage. Verify before betting.')
     return None
 
-# ── V5.2: Morning Signal Suppression ─────────────────────────────────────────
 def check_morning_suppression(obs_high, current_temp, nws_forecast, local_hour):
-    """
-    V5.2: Suppress green signals when obs high unavailable + current temp is
-    5F+ below NWS forecast in morning hours (<12pm local).
-    This catches the DC scenario where the high hit overnight but obs high
-    isn't showing yet — model would wrongly BET lower brackets.
-    Returns (should_suppress, warning_msg)
-    """
-    if obs_high is not None:
-        return False, None
-    if current_temp is None or nws_forecast is None:
-        return False, None
+    if obs_high is not None: return False, None
+    if current_temp is None or nws_forecast is None: return False, None
     fc_gap = nws_forecast - current_temp
     if fc_gap >= 5.0 and local_hour < 12:
-        return True, (
-            f'⚠️ Signal suppression active: No obs high + current temp '
-            f'({round(current_temp, 1)}F) is {round(fc_gap, 1)}F below NWS forecast '
-            f'({nws_forecast}F) in morning hours. High may have already occurred. '
-            f'Green signals suppressed — verify manually before betting.'
-        )
+        return True, (f'⚠️ Signal suppression active: No obs high + current temp '
+                      f'({round(current_temp, 1)}F) is {round(fc_gap, 1)}F below NWS forecast '
+                      f'({nws_forecast}F) in morning hours. High may have already occurred. '
+                      f'Green signals suppressed — verify manually before betting.')
     return False, None
 
-# ── NWS Grid Cache ────────────────────────────────────────────────────────────
+# ── NWS Fetchers ──────────────────────────────────────────────────────────────
 _NWS_GRID_CACHE = {}
 
 def fetch_nws_grid(lat, lon):
     key = (round(lat, 4), round(lon, 4))
-    if key in _NWS_GRID_CACHE:
-        return _NWS_GRID_CACHE[key]
+    if key in _NWS_GRID_CACHE: return _NWS_GRID_CACHE[key]
     try:
         r = requests.get(f'https://api.weather.gov/points/{lat},{lon}', headers=HEADERS, timeout=12)
         r.raise_for_status()
         props = r.json().get('properties', {})
-        office = props.get('gridId')
-        gx = props.get('gridX')
-        gy = props.get('gridY')
-        fc_url = props.get('forecast')
-        if not all([office, gx is not None, gy is not None, fc_url]):
-            return None
+        office, gx, gy, fc_url = props.get('gridId'), props.get('gridX'), props.get('gridY'), props.get('forecast')
+        if not all([office, gx is not None, gy is not None, fc_url]): return None
         result = (office, gx, gy, fc_url)
         _NWS_GRID_CACHE[key] = result
         return result
-    except Exception:
-        return None
+    except Exception: return None
 
 def fetch_nws_forecast(lat, lon):
     grid = fetch_nws_grid(lat, lon)
-    if not grid:
-        return None, None
+    if not grid: return None, None
     _, _, _, fc_url = grid
     try:
         r = requests.get(fc_url, headers=HEADERS, timeout=12)
         r.raise_for_status()
         periods = r.json().get('properties', {}).get('periods', [])
-    except Exception:
-        return None, None
+    except Exception: return None, None
     today = get_eastern_date()
     for period in periods:
         start = period.get('startTime', '')
@@ -681,14 +579,12 @@ def fetch_nws_forecast(lat, lon):
         temp = period.get('temperature')
         unit = period.get('temperatureUnit', 'F')
         if start.startswith(today) and is_day and temp is not None:
-            temp_f = float(temp) if unit == 'F' else float(temp) * 9/5 + 32
-            return round(temp_f, 1), fc_url
+            return round(float(temp) if unit == 'F' else float(temp) * 9/5 + 32, 1), fc_url
     for period in periods[:2]:
         temp = period.get('temperature')
         unit = period.get('temperatureUnit', 'F')
         if temp is not None:
-            temp_f = float(temp) if unit == 'F' else float(temp) * 9/5 + 32
-            return round(temp_f, 1), fc_url
+            return round(float(temp) if unit == 'F' else float(temp) * 9/5 + 32, 1), fc_url
     return None, None
 
 def fetch_nws_current(lat, lon, station_id):
@@ -696,315 +592,197 @@ def fetch_nws_current(lat, lon, station_id):
         obs = safe_get('https://api.weather.gov/stations/' + station_id + '/observations/latest')
         if obs:
             temp_c = obs.get('properties', {}).get('temperature', {}).get('value')
-            if temp_c is not None:
-                return station_id, float(c_to_f(temp_c))
+            if temp_c is not None: return station_id, float(c_to_f(temp_c))
     points = safe_get('https://api.weather.gov/points/' + str(lat) + ',' + str(lon))
-    if not points:
-        return station_id, None
+    if not points: return station_id, None
     stations_url = points.get('properties', {}).get('observationStations')
-    if not stations_url:
-        return station_id, None
+    if not stations_url: return station_id, None
     stations = safe_get(stations_url)
-    if not stations or not stations.get('observationStations'):
-        return station_id, None
+    if not stations or not stations.get('observationStations'): return station_id, None
     first = stations['observationStations'][0]
     sid = first.rstrip('/').split('/')[-1]
     obs = safe_get(first + '/observations/latest')
-    if not obs:
-        return sid, None
+    if not obs: return sid, None
     temp_c = obs.get('properties', {}).get('temperature', {}).get('value')
-    if temp_c is None:
-        return sid, None
+    if temp_c is None: return sid, None
     return sid, float(c_to_f(temp_c))
 
-# ── Kelly Criterion ───────────────────────────────────────────────────────────
+# ── Kelly ─────────────────────────────────────────────────────────────────────
 def kelly_bet(model_prob, market_price_cents, bankroll, fractional=0.15, max_pct=0.05, max_dollars=100):
-    if market_price_cents is None or market_price_cents <= 0 or market_price_cents >= 100:
-        return 0.0
-    p = model_prob
-    q = 1.0 - p
+    if market_price_cents is None or market_price_cents <= 0 or market_price_cents >= 100: return 0.0
+    p, q = model_prob, 1.0 - model_prob
     price = market_price_cents / 100.0
     odds = (1.0 - price) / price
     kelly_full = (p * odds - q) / odds
-    if kelly_full <= 0:
-        return 0.0
-    kelly_frac = kelly_full * fractional
-    raw = kelly_frac * bankroll
-    capped = min(raw, max_pct * bankroll, max_dollars)
-    return round(max(0.0, capped), 2)
+    if kelly_full <= 0: return 0.0
+    return round(max(0.0, min(kelly_full * fractional * bankroll, max_pct * bankroll, max_dollars)), 2)
 
 def edge_cents(model_prob, market_price_cents):
-    if market_price_cents is None:
-        return None
+    if market_price_cents is None: return None
     return round(model_prob * 100 - market_price_cents, 1)
 
 def edge_signal(e, high_uncertainty=False, morning_suppressed=False, conviction_conflict=False):
-    """V5.2: Added morning_suppressed and conviction_conflict suppression."""
-    if e is None:
-        return '⚪', 'No price'
+    if e is None: return '⚪', 'No price'
     if morning_suppressed:
-        if e >= MIN_EDGE:
-            return '🟡', 'SKIP (no obs high — verify)'
-        if e >= 3:
-            return '🟡', 'SKIP'
-        return '🔴', 'AVOID'
+        return ('🟡', 'SKIP (no obs high — verify)') if e >= MIN_EDGE else ('🟡', 'SKIP') if e >= 3 else ('🔴', 'AVOID')
     if conviction_conflict:
-        if e >= MIN_EDGE:
-            return '🟡', 'SKIP (market conviction conflict)'
-        if e >= 3:
-            return '🟡', 'SKIP'
-        return '🔴', 'AVOID'
+        return ('🟡', 'SKIP (market conviction conflict)') if e >= MIN_EDGE else ('🟡', 'SKIP') if e >= 3 else ('🔴', 'AVOID')
     if high_uncertainty:
-        if e >= MIN_EDGE:
-            return '🟡', 'SKIP (uncertain)'
-        if e >= 3:
-            return '🟡', 'SKIP'
-        return '🔴', 'AVOID'
-    if e >= MIN_EDGE:
-        return '🟢', 'BET'
-    if e >= 3:
-        return '🟡', 'SKIP'
+        return ('🟡', 'SKIP (uncertain)') if e >= MIN_EDGE else ('🟡', 'SKIP') if e >= 3 else ('🔴', 'AVOID')
+    if e >= MIN_EDGE: return '🟢', 'BET'
+    if e >= 3: return '🟡', 'SKIP'
     return '🔴', 'AVOID'
 
 def no_edge_cents(model_prob, no_ask_cents):
-    if no_ask_cents is None:
-        return None
+    if no_ask_cents is None: return None
     return round((1.0 - model_prob) * 100 - no_ask_cents, 1)
 
 def no_signal(no_edge, busted=False, model_prob=None, no_ask=None,
               high_uncertainty=False, morning_suppressed=False, conviction_conflict=False):
     if busted:
-        if no_ask is not None and no_ask <= 5:
-            return '🟢', 'BET NO (busted)'
-        return '🟡', 'CONSIDER NO (busted)'
-    if no_edge is None:
-        return '⚪', 'No price'
+        return ('🟢', 'BET NO (busted)') if no_ask is not None and no_ask <= 5 else ('🟡', 'CONSIDER NO (busted)')
+    if no_edge is None: return '⚪', 'No price'
     if morning_suppressed or conviction_conflict or high_uncertainty:
-        if no_edge >= MIN_EDGE:
-            return '🟡', 'SKIP NO'
-        if no_edge >= 0:
-            return '🔴', 'AVOID'
-        return '🔴', 'AVOID'
-    if no_edge >= MIN_EDGE:
-        return '🟢', 'BET NO'
-    if no_edge >= 3:
-        return '🟡', 'SKIP NO'
-    if no_edge >= 0:
-        return '🔴', 'AVOID'
+        return ('🟡', 'SKIP NO') if no_edge >= MIN_EDGE else ('🔴', 'AVOID')
+    if no_edge >= MIN_EDGE: return '🟢', 'BET NO'
+    if no_edge >= 3: return '🟡', 'SKIP NO'
     return '🔴', 'AVOID'
 
 def kelly_bet_no(model_prob, no_ask_cents, bankroll, fractional=0.15, max_pct=0.05, max_dollars=100):
-    if no_ask_cents is None or no_ask_cents <= 0 or no_ask_cents >= 100:
-        return 0.0
-    p = 1.0 - model_prob
-    q = 1.0 - p
+    if no_ask_cents is None or no_ask_cents <= 0 or no_ask_cents >= 100: return 0.0
+    p, q = 1.0 - model_prob, model_prob
     price = no_ask_cents / 100.0
     odds = (1.0 - price) / price
     kelly_full = (p * odds - q) / odds
-    if kelly_full <= 0:
-        return 0.0
-    kelly_frac = kelly_full * fractional
-    raw = kelly_frac * bankroll
-    capped = min(raw, max_pct * bankroll, max_dollars)
-    return round(max(0.0, capped), 2)
+    if kelly_full <= 0: return 0.0
+    return round(max(0.0, min(kelly_full * fractional * bankroll, max_pct * bankroll, max_dollars)), 2)
 
 def get_city_best_signals(city, consensus, ladder_text, ensemble_members, kalshi_markets_data,
                           obs_high, high_uncertainty, bankroll, nbm_percentiles=None,
                           current_temp=None, nws_forecast=None, local_hour=12):
-    if consensus is None or not ladder_text:
-        return '—', '—'
+    if consensus is None or not ladder_text: return '—', '—'
     try:
-        prob_rows, _, used_nbm = bracket_probs_nbm(
-            consensus, ladder_text, city, nbm_percentiles, obs_high=obs_high
-        )
+        prob_rows, _, used_nbm = bracket_probs_nbm(consensus, ladder_text, city, nbm_percentiles, obs_high=obs_high)
         morning_suppressed, _ = check_morning_suppression(obs_high, current_temp, nws_forecast, local_hour)
         conviction_result = check_market_conviction(kalshi_markets_data, ladder_text)
-
-        best_yes = None
-        best_yes_edge = -999
-        best_no = None
-        best_no_edge = -999
+        best_yes = best_no = None
+        best_yes_edge = best_no_edge = -999
 
         for label, base_prob in prob_rows:
-            ens_prob = None
-            for lbl, lo, hi in parse_ladder(ladder_text):
-                if labels_match(lbl, label):
-                    ens_prob = ensemble_bracket_prob(ensemble_members, lo, hi)
-                    break
+            ens_prob = next((ensemble_bracket_prob(ensemble_members, lo, hi)
+                             for lbl, lo, hi in parse_ladder(ladder_text) if labels_match(lbl, label)), None)
             final_prob = blend_probs(base_prob, ens_prob, ensemble_members, city, nbm_active=used_nbm)
-
             yes_ask = no_ask = None
             if kalshi_markets_data:
                 match = next((m for m in kalshi_markets_data if labels_match(m[0], label)), None)
-                if match:
-                    yes_ask, no_ask = match[1], match[2]
-
-            busted = False
-            if obs_high is not None:
-                for lbl, lo, hi in parse_ladder(ladder_text):
-                    if labels_match(lbl, label) and hi is not None and obs_high > hi + 0.4:
-                        busted = True
-
-            conviction_conflict = False
-            if conviction_result:
-                _, c_lo, c_hi, _ = conviction_result
-                conviction_conflict = is_conflicting_with_conviction(label, c_lo, c_hi, ladder_text)
-
+                if match: yes_ask, no_ask = match[1], match[2]
+            busted = obs_high is not None and any(
+                labels_match(lbl, label) and hi is not None and obs_high > hi + 0.4
+                for lbl, lo, hi in parse_ladder(ladder_text))
+            conviction_conflict = (conviction_result and
+                                   is_conflicting_with_conviction(label, conviction_result[1], conviction_result[2], ladder_text))
             e = edge_cents(final_prob, yes_ask)
             icon, _ = edge_signal(e, high_uncertainty, morning_suppressed, conviction_conflict)
             if e is not None and e > best_yes_edge and not busted and icon == '🟢':
                 best_yes_edge = e
                 kelly = kelly_bet(final_prob, yes_ask, bankroll) if yes_ask else 0.0
                 best_yes = f'🟢 {label} | +{e}c | ${kelly}'
-
             no_e = no_edge_cents(final_prob, no_ask)
-            no_icon, _ = no_signal(no_e, busted=busted, model_prob=final_prob,
-                                   no_ask=no_ask, high_uncertainty=high_uncertainty,
-                                   morning_suppressed=morning_suppressed,
+            no_icon, _ = no_signal(no_e, busted=busted, model_prob=final_prob, no_ask=no_ask,
+                                   high_uncertainty=high_uncertainty, morning_suppressed=morning_suppressed,
                                    conviction_conflict=conviction_conflict)
             if no_icon == '🟢' and no_e is not None and no_e > best_no_edge:
                 best_no_edge = no_e
                 kelly_no = kelly_bet_no(final_prob, no_ask, bankroll) if no_ask else 0.0
                 best_no = f'🟢 {label} NO | +{no_e}c | ${kelly_no}'
-
         return best_yes or '—', best_no or '—'
-    except Exception:
-        return '—', '—'
+    except Exception: return '—', '—'
 
 def fetch_gfs_ensemble(lat, lon):
-    url = 'https://ensemble-api.open-meteo.com/v1/ensemble'
-    params = {
-        'latitude': lat, 'longitude': lon,
-        'hourly': 'temperature_2m',
-        'temperature_unit': 'fahrenheit',
-        'timezone': 'auto',
-        'forecast_days': 2,
-        'models': 'gfs_seamless',
-    }
+    params = {'latitude': lat, 'longitude': lon, 'hourly': 'temperature_2m',
+               'temperature_unit': 'fahrenheit', 'timezone': 'auto', 'forecast_days': 2, 'models': 'gfs_seamless'}
     try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+        r = requests.get('https://ensemble-api.open-meteo.com/v1/ensemble', params=params, headers=HEADERS, timeout=20)
         r.raise_for_status()
         data = r.json()
-    except Exception:
-        return None, None
+    except Exception: return None, None
     today = get_eastern_date()
     hourly = data.get('hourly', {})
     times = hourly.get('time', [])
-    today_indices = [
-        i for i, t in enumerate(times)
-        if t.startswith(today) and len(t) >= 13 and 6 <= int(t[11:13]) <= 21
-    ]
-    if not today_indices:
-        today_indices = [i for i, t in enumerate(times) if t.startswith(today)]
-    if not today_indices:
-        return None, None
+    today_indices = [i for i, t in enumerate(times)
+                     if t.startswith(today) and len(t) >= 13 and 6 <= int(t[11:13]) <= 21]
+    if not today_indices: today_indices = [i for i, t in enumerate(times) if t.startswith(today)]
+    if not today_indices: return None, None
     member_maxes = []
     for key, vals in hourly.items():
-        if key == 'time' or 'temperature_2m' not in key:
-            continue
-        if not isinstance(vals, list):
-            continue
+        if key == 'time' or 'temperature_2m' not in key or not isinstance(vals, list): continue
         today_vals = [vals[i] for i in today_indices if i < len(vals) and vals[i] is not None]
         if today_vals:
-            try:
-                member_maxes.append(round(max(float(v) for v in today_vals), 1))
-            except Exception:
-                pass
-    if len(member_maxes) < 3:
-        return None, None
-    mean = round(sum(member_maxes) / len(member_maxes), 1)
-    return member_maxes, mean
+            try: member_maxes.append(round(max(float(v) for v in today_vals), 1))
+            except Exception: pass
+    if len(member_maxes) < 3: return None, None
+    return member_maxes, round(sum(member_maxes) / len(member_maxes), 1)
 
 def ensemble_bracket_prob(members, lo, hi):
-    if not members:
-        return None
-    count = sum(
-        1 for m in members
-        if (lo is None or m >= lo - 0.5) and (hi is None or m <= hi + 0.5)
-    )
-    return count / len(members)
+    if not members: return None
+    return sum(1 for m in members if (lo is None or m >= lo - 0.5) and (hi is None or m <= hi + 0.5)) / len(members)
 
 def ensemble_confidence(prob):
-    if prob is None:
-        return ''
-    if prob >= 0.80 or prob <= 0.20:
-        return '🔵 HIGH'
-    if prob >= 0.65 or prob <= 0.35:
-        return '🟡 MED'
+    if prob is None: return ''
+    if prob >= 0.80 or prob <= 0.20: return '🔵 HIGH'
+    if prob >= 0.65 or prob <= 0.35: return '🟡 MED'
     return '⚪ LOW'
 
 def ensemble_overall_confidence(members, consensus, ladder_text):
-    if not members or not ladder_text:
-        return ''
+    if not members or not ladder_text: return ''
     try:
         best_ens_prob = None
         for lbl, lo, hi in parse_ladder(ladder_text):
-            mid = None
-            if lo is None and hi is not None:
-                mid = hi - 1.0
-            elif hi is None and lo is not None:
-                mid = lo + 1.0
-            elif lo is not None and hi is not None:
-                mid = (lo + hi) / 2.0
+            mid = (hi - 1.0 if lo is None and hi is not None else
+                   lo + 1.0 if hi is None and lo is not None else
+                   (lo + hi) / 2.0 if lo is not None and hi is not None else None)
             if mid is not None and consensus is not None and abs(mid - consensus) <= 2.0:
                 prob = ensemble_bracket_prob(members, lo, hi)
-                if prob is not None:
-                    best_ens_prob = prob
-                    break
+                if prob is not None: best_ens_prob = prob; break
         if best_ens_prob is None:
-            probs = []
-            for lbl, lo, hi in parse_ladder(ladder_text):
-                p = ensemble_bracket_prob(members, lo, hi)
-                if p is not None:
-                    probs.append(p)
+            probs = [p for p in (ensemble_bracket_prob(members, lo, hi) for _, lo, hi in parse_ladder(ladder_text)) if p is not None]
             best_ens_prob = max(probs) if probs else None
         return ensemble_confidence(best_ens_prob)
-    except Exception:
-        return ''
+    except Exception: return ''
 
 def blend_probs(sigma_prob, ensemble_prob, members, city='', nbm_active=False):
-    if ensemble_prob is None or members is None:
-        return sigma_prob
+    if ensemble_prob is None or members is None: return sigma_prob
     base_weight = GFS_CITY_WEIGHT.get(city, 0.20)
     ensemble_weight = base_weight * 0.5 if nbm_active else base_weight
-    sigma_weight = 1.0 - ensemble_weight
-    return round(sigma_weight * sigma_prob + ensemble_weight * ensemble_prob, 4)
+    return round((1.0 - ensemble_weight) * sigma_prob + ensemble_weight * ensemble_prob, 4)
 
-# ── Core Math ─────────────────────────────────────────────────────────────────
+# ── Core ──────────────────────────────────────────────────────────────────────
 def get_eastern_date():
-    eastern = pytz.timezone('America/New_York')
-    return datetime.now(eastern).strftime('%Y-%m-%d')
+    return datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
 
 def get_eastern_datetime():
-    eastern = pytz.timezone('America/New_York')
-    return datetime.now(eastern)
+    return datetime.now(pytz.timezone('America/New_York'))
 
 def get_local_hour(city):
-    tz_name = CITY_TZ.get(city, 'America/New_York')
-    tz = pytz.timezone(tz_name)
-    return datetime.now(tz).hour
+    return datetime.now(pytz.timezone(CITY_TZ.get(city, 'America/New_York'))).hour
 
 def get_event_ticker(series):
     return series + '-' + get_eastern_datetime().strftime('%d%b%y').upper()
 
 def load_json(path):
     if path.exists():
-        try:
-            return json.loads(path.read_text())
-        except Exception:
-            return {}
+        try: return json.loads(path.read_text())
+        except Exception: return {}
     return {}
 
-def save_json(path, data):
-    path.write_text(json.dumps(data, indent=2))
+def save_json(path, data): path.write_text(json.dumps(data, indent=2))
 
 def safe_get(url, params=None):
     try:
         r = requests.get(url, params=params, headers=HEADERS, timeout=12)
         r.raise_for_status()
         return r.json()
-    except Exception:
-        return None
+    except Exception: return None
 
 def safe_get_with_retry(url, params=None, retries=3, delay=2.0):
     for attempt in range(retries):
@@ -1013,12 +791,10 @@ def safe_get_with_retry(url, params=None, retries=3, delay=2.0):
             r.raise_for_status()
             return r.json()
         except Exception:
-            if attempt < retries - 1:
-                time.sleep(delay)
+            if attempt < retries - 1: time.sleep(delay)
     return None
 
-def c_to_f(c):
-    return c * 9 / 5 + 32
+def c_to_f(c): return c * 9 / 5 + 32
 
 def normal_cdf(x, mu, sigma):
     return 0.5 * (1 + math.erf((x - mu) / (sigma * math.sqrt(2))))
@@ -1029,56 +805,42 @@ def normalize_label(label):
     label = re.sub(r'(\d+)\s*[\-\u2013\u2014]\s*(\d+)', lambda m: m.group(1)+'-'+m.group(2), label)
     label = re.sub(r'\s+or\s+below', ' or below', label, flags=re.I)
     label = re.sub(r'\s+or\s+above', ' or above', label, flags=re.I)
-    label = label.replace('\u00b0', '').replace('deg', '').replace('+', ' or above')
-    return label.strip()
+    return label.replace('\u00b0', '').replace('deg', '').replace('+', ' or above').strip()
 
 def label_to_numeric_key(label):
     label = normalize_label(label)
     nums = [int(x) for x in re.findall(r'\d+', label)]
     low = label.lower()
-    if not nums:
-        return None, None
-    if 'below' in low:
-        return None, nums[0]
-    if 'above' in low:
-        return nums[0], None
-    if len(nums) >= 2:
-        return nums[0], nums[1]
+    if not nums: return None, None
+    if 'below' in low: return None, nums[0]
+    if 'above' in low: return nums[0], None
+    if len(nums) >= 2: return nums[0], nums[1]
     return None, None
 
-def labels_match(label_a, label_b):
-    lo_a, hi_a = label_to_numeric_key(label_a)
-    lo_b, hi_b = label_to_numeric_key(label_b)
-    return lo_a == lo_b and hi_a == hi_b
+def labels_match(a, b):
+    return label_to_numeric_key(a) == label_to_numeric_key(b)
 
 def parse_ladder(text):
     out = []
     for p in text.split('|'):
         p = normalize_label(p)
         nums = [int(x) for x in re.findall(r'\d+', p)]
-        if not nums:
-            continue
+        if not nums: continue
         low = p.lower()
-        if 'below' in low:
-            out.append((p, None, nums[0]))
-        elif 'above' in low:
-            out.append((p, nums[0], None))
-        elif len(nums) >= 2:
-            out.append((p, nums[0], nums[1]))
+        if 'below' in low: out.append((p, None, nums[0]))
+        elif 'above' in low: out.append((p, nums[0], None))
+        elif len(nums) >= 2: out.append((p, nums[0], nums[1]))
     return out
 
 def choose_sigma(city, obs_high=None, forecast=None):
     s = BASE_SIGMA.get(city, 2.1)
     local_hour = get_local_hour(city)
     s *= 1.00 if local_hour < 11 else 0.94 if local_hour < 14 else 0.90 if local_hour < 16 else 0.86
-    if city in DESERT_CITIES:
-        s *= 0.92
+    if city in DESERT_CITIES: s *= 0.92
     if obs_high is not None and forecast is not None:
         gap = abs(forecast - obs_high)
-        if gap < 2:
-            s *= 0.80
-        elif gap < 4:
-            s *= 0.90
+        if gap < 2: s *= 0.80
+        elif gap < 4: s *= 0.90
     return max(1.30, min(2.80, s))
 
 def late_day_floor(fc, obs, local_hour):
@@ -1105,15 +867,11 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
         base = fc * 0.65 + cur * 0.18 + noaa * 0.17 if noaa is not None else fc * 0.78 + cur * 0.22
     else:
         base = fc * 0.45 + cur * 0.25 + noaa * 0.30 if noaa is not None else fc * 0.60 + cur * 0.40
-    if abs(base - fc) > 4.0:
-        base = fc - 4.0 if base < fc else fc + 4.0
+    if abs(base - fc) > 4.0: base = fc - 4.0 if base < fc else fc + 4.0
     obs = noaa if noaa is not None else cur
-    if obs is not None:
-        consensus = max(base, late_day_floor(fc, obs, local_hour))
-    else:
-        consensus = base
-    if obs_high is not None and obs_high > consensus:
-        consensus = obs_high
+    if obs is not None: consensus = max(base, late_day_floor(fc, obs, local_hour))
+    else: consensus = base
+    if obs_high is not None and obs_high > consensus: consensus = obs_high
     return consensus
 
 def bracket_probs(mu, ladder_text, city, obs_high=None, forecast=None):
@@ -1121,14 +879,10 @@ def bracket_probs(mu, ladder_text, city, obs_high=None, forecast=None):
     rows = []
     for label, lo, hi in parse_ladder(ladder_text):
         if obs_high is not None and hi is not None and obs_high > hi + 0.4:
-            rows.append((label, 0.0))
-            continue
-        if lo is None:
-            p = normal_cdf(hi + 0.5, mu, sigma)
-        elif hi is None:
-            p = 1 - normal_cdf(lo - 0.5, mu, sigma)
-        else:
-            p = normal_cdf(hi + 0.5, mu, sigma) - normal_cdf(lo - 0.5, mu, sigma)
+            rows.append((label, 0.0)); continue
+        if lo is None: p = normal_cdf(hi + 0.5, mu, sigma)
+        elif hi is None: p = 1 - normal_cdf(lo - 0.5, mu, sigma)
+        else: p = normal_cdf(hi + 0.5, mu, sigma) - normal_cdf(lo - 0.5, mu, sigma)
         rows.append((label, max(0.0, min(1.0, p))))
     rows.sort(key=lambda x: x[1], reverse=True)
     return rows, sigma
@@ -1136,46 +890,34 @@ def bracket_probs(mu, ladder_text, city, obs_high=None, forecast=None):
 def two_degree_call(mu, ladder_text, obs_high=None):
     best_label, best_dist = None, float('inf')
     for label, lo, hi in parse_ladder(ladder_text):
-        if obs_high is not None and hi is not None and obs_high > hi + 0.4:
-            continue
-        if lo is None and hi is not None:
-            mid = hi - 1.0
-        elif hi is None and lo is not None:
-            mid = lo + 1.0
-        elif lo is not None and hi is not None:
-            mid = (lo + hi) / 2
-        else:
-            continue
+        if obs_high is not None and hi is not None and obs_high > hi + 0.4: continue
+        mid = (hi - 1.0 if lo is None and hi is not None else
+               lo + 1.0 if hi is None and lo is not None else
+               (lo + hi) / 2 if lo is not None and hi is not None else None)
+        if mid is None: continue
         dist = abs(mid - mu)
-        if dist < best_dist:
-            best_dist = dist
-            best_label = label
+        if dist < best_dist: best_dist = dist; best_label = label
     return best_label
 
 def ladder_to_boxes(text):
     parts = [normalize_label(p) for p in text.split('|')]
-    while len(parts) < 6:
-        parts.append('')
+    while len(parts) < 6: parts.append('')
     return parts[:6]
 
 def boxes_to_ladder(parts):
     cleaned = []
     for i, p in enumerate(parts):
         t = normalize_label(p)
-        if not t:
-            continue
+        if not t: continue
         nums = re.findall(r'\d+', t)
         low = t.lower()
-        if 'below' in low or 'above' in low or '-' in t:
-            cleaned.append(t)
+        if 'below' in low or 'above' in low or '-' in t: cleaned.append(t)
         elif len(nums) == 1:
             n = int(nums[0])
             cleaned.append(str(n) + (' or below' if i == 0 else ' or above' if i == 5 else ''))
-        else:
-            cleaned.append(t)
+        else: cleaned.append(t)
     return ' | '.join(cleaned)
 
-# ── Data Fetchers ─────────────────────────────────────────────────────────────
 def fetch_obs_high_today(icao):
     eastern = pytz.timezone('America/New_York')
     today_day = str(datetime.now(eastern).day)
@@ -1183,86 +925,59 @@ def fetch_obs_high_today(icao):
     try:
         r = requests.get(url, headers=HEADERS, timeout=12)
         r.raise_for_status()
-    except Exception:
-        return None, url
+    except Exception: return None, url
     soup = BeautifulSoup(r.text, 'html.parser')
     tables = soup.find_all('table')
     table = max(tables, key=lambda t: len(t.find_all('tr')), default=None) if tables else None
-    if not table:
-        return None, url
+    if not table: return None, url
     highs = []
     for row in table.find_all('tr'):
         cols = [td.get_text(strip=True) for td in row.find_all('td')]
-        if not cols or len(cols) < 9 or cols[0] != today_day:
-            continue
+        if not cols or len(cols) < 9 or cols[0] != today_day: continue
         try:
             t = float(cols[8])
-            if 0 < t < 130:
-                highs.append(t)
-        except Exception:
-            pass
+            if 0 < t < 130: highs.append(t)
+        except Exception: pass
     return (round(max(highs), 1), url) if highs else (None, url)
 
 def parse_market_label(m):
     for field in ['subtitle', 'yes_sub_title', 'no_sub_title']:
-        s = (m.get(field) or '').replace('\u00b0', '').replace('deg', '').strip()
+        s = normalize_label((m.get(field) or '').replace('\u00b0', '').replace('deg', '').strip())
         if s:
-            s = normalize_label(s)
             below = re.match(r'^(\d+)\s*or\s*below$', s, re.I)
             above = re.match(r'^(\d+)\s*or\s*above$', s, re.I)
             rng = re.match(r'^(\d+)-(\d+)$', s)
-            if below:
-                return below.group(1)+' or below', int(below.group(1))-10000
-            if above:
-                return above.group(1)+' or above', int(above.group(1))+10000
-            if rng:
-                return rng.group(1)+'-'+rng.group(2), int(rng.group(1))
+            if below: return below.group(1)+' or below', int(below.group(1))-10000
+            if above: return above.group(1)+' or above', int(above.group(1))+10000
+            if rng: return rng.group(1)+'-'+rng.group(2), int(rng.group(1))
     title = (m.get('title') or '').replace('\u00b0', '').replace('**', '').replace('deg', '')
     if title:
         ma = re.search(r'be\s*[>=]+\s*(\d+)', title, re.I)
-        if ma:
-            n = int(ma.group(1))
-            return str(n)+' or above', n+10000
+        if ma: n = int(ma.group(1)); return str(n)+' or above', n+10000
         mb = re.search(r'be\s*[<=]+\s*(\d+)', title, re.I)
-        if mb:
-            n = int(mb.group(1))
-            return str(n)+' or below', n-10000
+        if mb: n = int(mb.group(1)); return str(n)+' or below', n-10000
         mr = re.search(r'be\s*(\d+)\s*(?:to|-)\s*(\d+)', title, re.I)
-        if mr:
-            lo, hi = int(mr.group(1)), int(mr.group(2))
-            return str(lo)+'-'+str(hi), lo
+        if mr: lo, hi = int(mr.group(1)), int(mr.group(2)); return str(lo)+'-'+str(hi), lo
         nums = re.findall(r'\d+', title)
         if len(nums) >= 2:
             lo, hi = int(nums[-2]), int(nums[-1])
-            if 0 < hi-lo <= 5:
-                return str(lo)+'-'+str(hi), lo
-    cap = m.get('cap_strike')
-    floor_s = m.get('floor_strike')
+            if 0 < hi-lo <= 5: return str(lo)+'-'+str(hi), lo
+    cap, floor_s = m.get('cap_strike'), m.get('floor_strike')
     if cap is not None and floor_s is not None:
-        try:
-            lo, hi = int(float(floor_s)), int(float(cap))
-            return str(lo)+'-'+str(hi), lo
-        except Exception:
-            pass
+        try: lo, hi = int(float(floor_s)), int(float(cap)); return str(lo)+'-'+str(hi), lo
+        except Exception: pass
     if cap is not None:
-        try:
-            n = int(float(cap))
-            return str(n)+' or below', n-10000
-        except Exception:
-            pass
+        try: n = int(float(cap)); return str(n)+' or below', n-10000
+        except Exception: pass
     for field in ['short_title', 'market_title', 'name']:
-        val = (m.get(field) or '').replace('\u00b0', '').strip()
+        val = normalize_label((m.get(field) or '').replace('\u00b0', '').strip())
         if val:
-            val = normalize_label(val)
             rng = re.match(r'^(\d+)-(\d+)$', val)
             below = re.match(r'^(\d+)\s*or\s*below$', val, re.I)
             above = re.match(r'^(\d+)\s*or\s*above$', val, re.I)
-            if rng:
-                return rng.group(1)+'-'+rng.group(2), int(rng.group(1))
-            if below:
-                return below.group(1)+' or below', int(below.group(1))-10000
-            if above:
-                return above.group(1)+' or above', int(above.group(1))+10000
+            if rng: return rng.group(1)+'-'+rng.group(2), int(rng.group(1))
+            if below: return below.group(1)+' or below', int(below.group(1))-10000
+            if above: return above.group(1)+' or above', int(above.group(1))+10000
     return None, None
 
 def get_price_cents(m):
@@ -1270,33 +985,23 @@ def get_price_cents(m):
     for f in ['yes_ask_dollars', 'yes_bid_dollars']:
         v = m.get(f)
         if v:
-            try:
-                yes_ask = round(float(v)*100)
-                break
-            except Exception:
-                pass
+            try: yes_ask = round(float(v)*100); break
+            except Exception: pass
     for f in ['no_ask_dollars', 'no_bid_dollars']:
         v = m.get(f)
         if v:
-            try:
-                no_ask = round(float(v)*100)
-                break
-            except Exception:
-                pass
+            try: no_ask = round(float(v)*100); break
+            except Exception: pass
     if yes_ask is None:
         raw = m.get('yes_ask') or m.get('yes_bid')
         if raw is not None:
-            try:
-                yes_ask = int(raw)
-            except Exception:
-                pass
+            try: yes_ask = int(raw)
+            except Exception: pass
     if no_ask is None:
         raw = m.get('no_ask') or m.get('no_bid')
         if raw is not None:
-            try:
-                no_ask = int(raw)
-            except Exception:
-                pass
+            try: no_ask = int(raw)
+            except Exception: pass
     return yes_ask, no_ask
 
 def fetch_kalshi_brackets(series, retries=3):
@@ -1311,38 +1016,28 @@ def fetch_kalshi_brackets(series, retries=3):
         data = safe_get_with_retry(url, {'series_ticker': series, 'status': 'open', 'limit': 30}, retries=retries, delay=2.0)
     if not data or not data.get('markets'):
         data = safe_get_with_retry(url, {'series_ticker': series, 'limit': 30}, retries=retries, delay=2.0)
-    if not data or not data.get('markets'):
-        return None
+    if not data or not data.get('markets'): return None
     all_markets = data['markets']
     markets = [m for m in all_markets if
-               today_upper in (m.get('ticker') or '').upper() or
-               today_upper2 in (m.get('ticker') or '').upper() or
-               today_upper3 in (m.get('ticker') or '').upper() or
-               today_upper2 in (m.get('event_ticker') or '').upper() or
-               today_upper3 in (m.get('event_ticker') or '').upper()]
-    if not markets:
-        markets = [m for m in all_markets if (m.get('close_time') or '').startswith(today_date)]
-    if not markets:
-        markets = all_markets
+               any(x in (m.get('ticker') or '').upper() for x in [today_upper, today_upper2, today_upper3]) or
+               any(x in (m.get('event_ticker') or '').upper() for x in [today_upper2, today_upper3])]
+    if not markets: markets = [m for m in all_markets if (m.get('close_time') or '').startswith(today_date)]
+    if not markets: markets = all_markets
     parsed = []
     for m in markets:
         label, key = parse_market_label(m)
-        if label is None:
-            continue
+        if label is None: continue
         yes_ask, no_ask = get_price_cents(m)
         parsed.append((key, label, yes_ask, no_ask))
-    if len(parsed) < 2:
-        return None
+    if len(parsed) < 2: return None
     parsed.sort(key=lambda x: x[0])
     return [(label, yes_ask, no_ask) for _, label, yes_ask, no_ask in parsed]
 
 def get_cached_prices(city):
     cache = load_json(PRICE_CACHE_FILE)
     entry = cache.get(city)
-    if not entry:
-        return None, None
-    if (time.time() - entry.get('fetched_at', 0)) / 60 > PRICE_CACHE_MINUTES:
-        return None, None
+    if not entry: return None, None
+    if (time.time() - entry.get('fetched_at', 0)) / 60 > PRICE_CACHE_MINUTES: return None, None
     return entry.get('markets'), entry.get('fetched_at')
 
 def save_cached_prices(city, markets):
@@ -1352,15 +1047,13 @@ def save_cached_prices(city, markets):
 
 def clear_city_cache(city):
     cache = load_json(PRICE_CACHE_FILE)
-    if city in cache:
-        del cache[city]
+    if city in cache: del cache[city]
     save_json(PRICE_CACHE_FILE, cache)
 
 def sync_all_ladders(saved_ladders, force=False):
     today = get_eastern_date()
     last_sync = load_json(LAST_SYNC_FILE)
-    if not force and last_sync.get('date') == today:
-        return saved_ladders, None
+    if not force and last_sync.get('date') == today: return saved_ladders, None
     cities = list(SERIES.keys())
     progress = st.progress(0, text='Syncing all city ladders from Kalshi...')
     synced, failed = [], []
@@ -1369,30 +1062,24 @@ def sync_all_ladders(saved_ladders, force=False):
         markets = fetch_kalshi_brackets(SERIES[c], retries=3)
         if markets:
             labels = [normalize_label(m[0]) for m in markets]
-            while len(labels) < 6:
-                labels.append('')
+            while len(labels) < 6: labels.append('')
             saved_ladders[c] = ' | '.join(labels[:6])
             save_cached_prices(c, markets)
             synced.append(c)
-        else:
-            failed.append(c)
+        else: failed.append(c)
         time.sleep(0.5)
     save_json(SAVE_FILE, saved_ladders)
     save_json(LAST_SYNC_FILE, {'date': today, 'synced': synced, 'failed': failed})
     progress.empty()
     return saved_ladders, {'synced': synced, 'failed': failed}
 
-# ── Cached per-city weather fetch ────────────────────────────────────────────
 @st.cache_data(ttl=1800)
 def fetch_city_weather(city):
     coords = CITIES[city]
     lat, lon = coords['lat'], coords['lon']
-    station = STATIONS[city]
-    obs_icao = OBHISTORY_STATIONS[city]
-
     nws_fc, _ = fetch_nws_forecast(lat, lon)
-    _, current_temp = fetch_nws_current(lat, lon, station)
-    obs_high_raw, _ = fetch_obs_high_today(obs_icao)
+    _, current_temp = fetch_nws_current(lat, lon, STATIONS[city])
+    obs_high_raw, _ = fetch_obs_high_today(OBHISTORY_STATIONS[city])
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
     nbm_percentiles = fetch_nbm_percentiles(lat, lon)
 
@@ -1400,67 +1087,49 @@ def fetch_city_weather(city):
     obs_high_discarded = False
     obs_high_discard_reason = None
 
-    if obs_high_raw is not None and current_temp is not None:
-        if obs_high_raw > current_temp + 15.0:
-            obs_high_final = None
-            obs_high_discarded = True
-            obs_high_discard_reason = f'Obs high {obs_high_raw}F discarded — {round(obs_high_raw - current_temp, 1)}F above current temp'
-    if obs_high_raw is not None and nws_fc is not None and not obs_high_discarded:
-        if obs_high_raw > nws_fc + 12.0:
-            obs_high_final = None
-            obs_high_discarded = True
-            obs_high_discard_reason = f'Obs high {obs_high_raw}F discarded — {round(obs_high_raw - nws_fc, 1)}F above NWS forecast'
+    if obs_high_raw is not None and current_temp is not None and obs_high_raw > current_temp + 15.0:
+        obs_high_final = None; obs_high_discarded = True
+        obs_high_discard_reason = f'Obs high {obs_high_raw}F discarded — {round(obs_high_raw - current_temp, 1)}F above current temp'
+    if obs_high_raw is not None and nws_fc is not None and not obs_high_discarded and obs_high_raw > nws_fc + 12.0:
+        obs_high_final = None; obs_high_discarded = True
+        obs_high_discard_reason = f'Obs high {obs_high_raw}F discarded — {round(obs_high_raw - nws_fc, 1)}F above NWS forecast'
 
-    if ensemble_mean is not None and nws_fc is not None:
-        if abs(ensemble_mean - nws_fc) > 8.0:
-            ensemble_members = None
-            ensemble_mean = None
+    if ensemble_mean is not None and nws_fc is not None and abs(ensemble_mean - nws_fc) > 8.0:
+        ensemble_members = None; ensemble_mean = None
 
-    source_gap = None
-    high_uncertainty = False
+    source_gap = None; high_uncertainty = False
     if nws_fc is not None and ensemble_mean is not None:
         source_gap = abs(nws_fc - ensemble_mean)
-        uncertainty_threshold = 6.0 if city in DESERT_CITIES else 5.0
-        high_uncertainty = source_gap > uncertainty_threshold
-
-    local_hour = get_local_hour(city)
+        high_uncertainty = source_gap > (6.0 if city in DESERT_CITIES else 5.0)
 
     return {
         'nws_fc': nws_fc, 'current_temp': current_temp,
         'obs_high': obs_high_final, 'obs_high_raw': obs_high_raw,
-        'obs_high_discarded': obs_high_discarded,
-        'obs_high_discard_reason': obs_high_discard_reason,
+        'obs_high_discarded': obs_high_discarded, 'obs_high_discard_reason': obs_high_discard_reason,
         'ensemble_members': ensemble_members, 'ensemble_mean': ensemble_mean,
         'source_gap': source_gap, 'high_uncertainty': high_uncertainty,
-        'nbm_percentiles': nbm_percentiles, 'local_hour': local_hour,
+        'nbm_percentiles': nbm_percentiles, 'local_hour': get_local_hour(city),
     }
 
 def save_city_prediction(city, weather, saved_ladders):
     nws_fc = weather['nws_fc']
-    if nws_fc is None:
-        return None, False
+    if nws_fc is None: return None, False
     current_temp = weather['current_temp']
     obs_high = weather['obs_high']
-    ensemble_mean = weather['ensemble_mean']
-    source_gap = weather['source_gap']
-    high_uncertainty = weather['high_uncertainty']
     cur = current_temp if current_temp is not None else nws_fc
     consensus_raw = compute_consensus(nws_fc, cur, current_temp, city, obs_high=obs_high)
     bias_correction, _ = compute_bias_correction_db(city)
     consensus = round(consensus_raw + bias_correction, 1)
-    save_ok = sb_upsert_prediction(
-        city=city, consensus=consensus, forecast=nws_fc,
-        ensemble_mean=ensemble_mean, source_gap=source_gap,
-        high_uncertainty=high_uncertainty, obs_high=obs_high,
-        bias_correction=bias_correction,
-    )
+    save_ok = sb_upsert_prediction(city=city, consensus=consensus, forecast=nws_fc,
+                                    ensemble_mean=weather['ensemble_mean'], source_gap=weather['source_gap'],
+                                    high_uncertainty=weather['high_uncertainty'], obs_high=obs_high,
+                                    bias_correction=bias_correction)
     return consensus, save_ok
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header('Kelly Settings')
-    bankroll = st.number_input('My Bankroll ($)', min_value=10.0, max_value=100000.0,
-                               value=500.0, step=10.0)
+    bankroll = st.number_input('My Bankroll ($)', min_value=10.0, max_value=100000.0, value=500.0, step=10.0)
     st.caption('Used to calculate optimal bet sizes.')
     st.markdown('---')
     st.markdown('**Edge threshold:** ' + str(MIN_EDGE) + 'c minimum to bet')
@@ -1475,24 +1144,30 @@ with st.sidebar:
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
     st.markdown('**V5.2 Changes**')
-    st.markdown('- Auto-settler runs every load (no more lock)')
-    st.markdown('- NBM: NOMADS bulk file approach')
-    st.markdown('- Signal suppression: no obs high + temp below forecast in AM')
+    st.markdown('- Auto-settler: Iowa State CLI JSON API (historical data)')
+    st.markdown('- Auto-settler runs every load — no lock')
+    st.markdown('- NBM: NOMADS bulk file')
+    st.markdown('- Signal suppression: no obs high + temp below forecast AM')
     st.markdown('- Cold front warning without obs high')
-    st.markdown('- Market conviction check: >70% bracket suppresses conflicts')
+    st.markdown('- Market conviction check: >70% suppresses conflicts')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
 today_str = get_eastern_date()
 last_sync_data = load_json(LAST_SYNC_FILE)
 
-# V5.2: Auto-settlement runs every load — no session state lock
+# V5.2: Runs every load — Iowa State CLI API settles historical dates
 with st.spinner('Checking for unsettled predictions...'):
     n_settled, settled_rows = run_auto_settlement()
 if n_settled > 0:
     for s in settled_rows:
         direction = '✅' if abs(s['error']) <= 1.5 else '⚠️'
         st.success(f"{direction} Auto-settled {s['city']} ({s['date']}): actual={s['actual']}F | error={s['error']:+.1f}F")
+else:
+    unsettled_check = sb_fetch_unsettled()
+    pending_past = [r for r in unsettled_check if r.get('date', '') < today_str]
+    if pending_past:
+        st.caption(f'⏳ {len(pending_past)} past predictions still pending — Iowa State CLI data may not be available yet.')
 
 if last_sync_data.get('date') != today_str:
     saved_ladders, results = sync_all_ladders(saved_ladders)
@@ -1510,16 +1185,14 @@ else:
         if st.button('Refresh All'):
             saved_ladders, results = sync_all_ladders(saved_ladders, force=True)
             st.success('Re-synced ' + str(len(results.get('synced', []))) + '/' + str(len(SERIES)) + ' city ladders')
-            if results.get('failed'):
-                st.warning('Could not fetch: ' + ', '.join(results['failed']))
+            if results.get('failed'): st.warning('Could not fetch: ' + ', '.join(results['failed']))
             st.rerun()
 
 city_list = list(CITIES.keys())
 default_idx = city_list.index('New York')
 city = st.selectbox('City', city_list, index=default_idx)
 
-if 'last_city' not in st.session_state:
-    st.session_state.last_city = city
+if 'last_city' not in st.session_state: st.session_state.last_city = city
 if st.session_state.last_city != city:
     st.session_state.last_city = city
     clear_city_cache(city)
@@ -1544,7 +1217,7 @@ if bias_n >= 3:
     st.info(f'Bias correction active: +{bias_correction}F applied to consensus '
             f'(model ran {direction} by avg {abs(bias_correction)}F over last {bias_n} days)')
 elif bias_n > 0:
-    st.caption(f'Bias correction: {bias_n} settlement(s) logged for {city} — need 3+ for correction')
+    st.caption(f'Bias correction: {bias_n} settlement(s) logged — need 3+ for correction')
 else:
     st.caption(f'Bias correction: no history yet for {city} — will activate after 3 settled days')
 
@@ -1558,8 +1231,7 @@ if kalshi_markets is None:
         if kalshi_markets:
             save_cached_prices(city, kalshi_markets)
             labels = [normalize_label(m[0]) for m in kalshi_markets]
-            while len(labels) < 6:
-                labels.append('')
+            while len(labels) < 6: labels.append('')
             saved_ladders[city] = ' | '.join(labels[:6])
             save_json(SAVE_FILE, saved_ladders)
             fetched_at = time.time()
@@ -1597,7 +1269,7 @@ st.caption('Current ladder: ' + ladder_text)
 
 st.subheader('Live Weather')
 with st.spinner('Fetching weather data...'):
-    nws_forecast, nws_fc_url = fetch_nws_forecast(lat, lon)
+    nws_forecast, _ = fetch_nws_forecast(lat, lon)
     noaa_station, noaa_obs = fetch_nws_current(lat, lon, station)
     obs_high_raw, obs_high_url = fetch_obs_high_today(obs_icao)
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
@@ -1609,49 +1281,29 @@ obs_high_suspect = False
 
 if obs_high_raw is not None:
     if noaa_obs is not None and obs_high_raw > noaa_obs + 15.0:
-        obs_high_today = None
-        obs_high_suspect = True
-        sanity_warnings.append(
-            f'Obs high of {obs_high_raw}F discarded — {round(obs_high_raw - noaa_obs, 1)}F above current temp '
-            f'({round(noaa_obs, 1)}F). Verify manually before betting.')
+        obs_high_today = None; obs_high_suspect = True
+        sanity_warnings.append(f'Obs high of {obs_high_raw}F discarded — {round(obs_high_raw - noaa_obs, 1)}F above current temp ({round(noaa_obs, 1)}F). Verify manually before betting.')
     elif nws_forecast is not None and obs_high_raw > nws_forecast + 12.0:
-        obs_high_today = None
-        obs_high_suspect = True
-        sanity_warnings.append(
-            f'Obs high of {obs_high_raw}F discarded — {round(obs_high_raw - nws_forecast, 1)}F above NWS forecast '
-            f'({nws_forecast}F). Verify manually before betting.')
+        obs_high_today = None; obs_high_suspect = True
+        sanity_warnings.append(f'Obs high of {obs_high_raw}F discarded — {round(obs_high_raw - nws_forecast, 1)}F above NWS forecast ({nws_forecast}F). Verify manually before betting.')
 
 nws_stale = False
-if nws_forecast is not None and noaa_obs is not None:
-    if noaa_obs > nws_forecast + 5.0:
-        nws_stale = True
-        sanity_warnings.append(
-            f'NWS forecast ({nws_forecast}F) is {round(noaa_obs - nws_forecast, 1)}F below current temp '
-            f'({round(noaa_obs, 1)}F) — forecast may be stale.')
+if nws_forecast is not None and noaa_obs is not None and noaa_obs > nws_forecast + 5.0:
+    nws_stale = True
+    sanity_warnings.append(f'NWS forecast ({nws_forecast}F) is {round(noaa_obs - nws_forecast, 1)}F below current temp ({round(noaa_obs, 1)}F) — forecast may be stale.')
 
 ensemble_suspect = False
-if ensemble_mean is not None and nws_forecast is not None:
-    if abs(ensemble_mean - nws_forecast) > 8.0:
-        ensemble_suspect = True
-        sanity_warnings.append(
-            f'GFS ensemble ({ensemble_mean}F) differs from NWS by '
-            f'{round(abs(ensemble_mean - nws_forecast), 1)}F — discarded (>8F threshold).')
-        ensemble_members = None
-        ensemble_mean = None
+if ensemble_mean is not None and nws_forecast is not None and abs(ensemble_mean - nws_forecast) > 8.0:
+    ensemble_suspect = True
+    sanity_warnings.append(f'GFS ensemble ({ensemble_mean}F) differs from NWS by {round(abs(ensemble_mean - nws_forecast), 1)}F — discarded.')
+    ensemble_members = None; ensemble_mean = None
 
-high_uncertainty = False
-source_gap = None
+high_uncertainty = False; source_gap = None
 if nws_forecast is not None and ensemble_mean is not None:
     source_gap = abs(nws_forecast - ensemble_mean)
-    uncertainty_threshold = 6.0 if city in DESERT_CITIES else 5.0
-    high_uncertainty = source_gap > uncertainty_threshold
+    high_uncertainty = source_gap > (6.0 if city in DESERT_CITIES else 5.0)
 
-# V5.2: Morning suppression check
-morning_suppressed, morning_warning = check_morning_suppression(
-    obs_high_today, noaa_obs, nws_forecast, local_hour
-)
-
-# V5.2: Market conviction check
+morning_suppressed, morning_warning = check_morning_suppression(obs_high_today, noaa_obs, nws_forecast, local_hour)
 conviction_result = check_market_conviction(kalshi_markets, ladder_text)
 
 col1, col2, col3, col4 = st.columns(4)
@@ -1659,14 +1311,12 @@ with col1:
     if nws_forecast:
         st.metric('NWS Forecast', str(nws_forecast)+' F')
         st.caption('Primary — settlement source' + (' (stale?)' if nws_stale else ''))
-    else:
-        st.metric('NWS Forecast', 'Unavailable')
+    else: st.metric('NWS Forecast', 'Unavailable')
 with col2:
     if noaa_obs is not None:
         st.metric('Current Temp', str(round(noaa_obs, 1))+' F')
         st.caption('Station: ' + noaa_station)
-    else:
-        st.metric('Current Temp', 'Unavailable')
+    else: st.metric('Current Temp', 'Unavailable')
 with col3:
     if obs_high_today is not None:
         st.metric('Obs High Today', str(obs_high_today)+' F', delta='floor active')
@@ -1684,49 +1334,30 @@ with col4:
     if ensemble_mean is not None:
         n_members = len(ensemble_members) if ensemble_members else 0
         gfs_weight_pct = int(GFS_CITY_WEIGHT.get(city, 0.20) * 100)
-        gap_str = ''
-        if nws_forecast is not None:
-            gap_val = round(nws_forecast - ensemble_mean, 1)
-            gap_str = f' | NWS gap: {gap_val:+.1f}F'
+        gap_str = f' | NWS gap: {round(nws_forecast - ensemble_mean, 1):+.1f}F' if nws_forecast is not None else ''
         st.metric('GFS Ensemble', str(ensemble_mean)+' F', delta=str(n_members)+' members')
         st.caption(f'Weight: {gfs_weight_pct}%{gap_str}')
-    elif ensemble_suspect:
-        st.metric('GFS Ensemble', 'Discarded')
-        st.caption('Failed sanity check (>8F from NWS)')
-    else:
-        st.metric('GFS Ensemble', 'Unavailable')
+    elif ensemble_suspect: st.metric('GFS Ensemble', 'Discarded'); st.caption('Failed sanity check (>8F from NWS)')
+    else: st.metric('GFS Ensemble', 'Unavailable')
 
 if nbm_percentiles:
     nbm_p50 = nbm_percentiles.get('p50', nbm_percentiles.get('p25', '—'))
-    nbm_p10 = nbm_percentiles.get('p10', '—')
-    nbm_p90 = nbm_percentiles.get('p90', '—')
-    st.success(f'✅ NBM active — p10:{nbm_p10}F | p50:{nbm_p50}F | p90:{nbm_p90}F | bracket probs from real percentile distribution')
+    st.success(f'✅ NBM active — p10:{nbm_percentiles.get("p10","—")}F | p50:{nbm_p50}F | p90:{nbm_percentiles.get("p90","—")}F | bracket probs from real percentile distribution')
 else:
     st.warning('⚠️ NBM unavailable — using sigma/normal distribution fallback')
 
-for w in sanity_warnings:
-    st.error('⚠️ ' + w)
+for w in sanity_warnings: st.error('⚠️ ' + w)
 
-if nws_forecast is None:
-    st.error('NWS forecast unavailable — cannot run model.')
+if nws_forecast is None: st.error('NWS forecast unavailable — cannot run model.')
 elif high_uncertainty and source_gap is not None:
     st.warning(f'HIGH UNCERTAINTY: NWS ({nws_forecast}F) vs GFS ({ensemble_mean}F) gap = {round(source_gap, 1)}F. Green signals suppressed.')
 elif source_gap is not None and source_gap > 2.5:
     st.info(f'Source gap: NWS vs Ensemble = {round(source_gap, 1)}F — moderate divergence.')
 
-# V5.2: Cold front warning (with and without obs high)
 cold_front_warning = check_cold_front_warning(obs_high_raw, noaa_obs, nws_forecast, local_hour)
-if cold_front_warning:
-    st.warning(cold_front_warning)
-
-# V5.2: Morning suppression warning
-if morning_warning:
-    st.error(morning_warning)
-
-# V5.2: Market conviction warning
-if conviction_result:
-    _, _, _, conv_warning = conviction_result
-    st.warning(conv_warning)
+if cold_front_warning: st.warning(cold_front_warning)
+if morning_warning: st.error(morning_warning)
+if conviction_result: st.warning(conviction_result[3])
 
 if obs_high_today is not None:
     for label, lo, hi in parse_ladder(ladder_text):
@@ -1735,14 +1366,10 @@ if obs_high_today is not None:
 
 with st.expander('Override weather inputs', expanded=False):
     ov1, ov2, ov3, ov4 = st.columns(4)
-    with ov1:
-        override_fc = st.number_input('Forecast High F', min_value=0.0, max_value=130.0, value=0.0, step=0.5, key='ov_fc')
-    with ov2:
-        override_cur = st.number_input('Current Temp F', min_value=0.0, max_value=130.0, value=0.0, step=0.5, key='ov_cur')
-    with ov3:
-        override_noaa = st.number_input('NOAA Obs F', min_value=0.0, max_value=130.0, value=0.0, step=0.5, key='ov_noaa')
-    with ov4:
-        override_obs_high = st.number_input('Obs High Override F', min_value=0.0, max_value=130.0, value=0.0, step=0.5, key='ov_obs')
+    with ov1: override_fc = st.number_input('Forecast High F', min_value=0.0, max_value=130.0, value=0.0, step=0.5, key='ov_fc')
+    with ov2: override_cur = st.number_input('Current Temp F', min_value=0.0, max_value=130.0, value=0.0, step=0.5, key='ov_cur')
+    with ov3: override_noaa = st.number_input('NOAA Obs F', min_value=0.0, max_value=130.0, value=0.0, step=0.5, key='ov_noaa')
+    with ov4: override_obs_high = st.number_input('Obs High Override F', min_value=0.0, max_value=130.0, value=0.0, step=0.5, key='ov_obs')
 
 if override_fc > 0 or override_cur > 0 or override_obs_high > 0:
     st.info('Using manual overrides — set back to 0.0 to use auto values')
@@ -1756,41 +1383,30 @@ if forecast is not None and current is not None:
     consensus_raw = compute_consensus(forecast, current, noaa_final, city, obs_high=obs_high_final)
     consensus = round(consensus_raw + bias_correction, 1)
 
-    boundary_warnings = check_bracket_boundary(consensus, ladder_text)
-    for bw in boundary_warnings:
-        st.warning(bw)
+    for bw in check_bracket_boundary(consensus, ladder_text): st.warning(bw)
 
-    prob_rows, prob_label, used_nbm = bracket_probs_nbm(
-        consensus, ladder_text, city, nbm_percentiles,
-        obs_high=obs_high_final, forecast=forecast
-    )
+    prob_rows, prob_label, used_nbm = bracket_probs_nbm(consensus, ladder_text, city, nbm_percentiles, obs_high=obs_high_final, forecast=forecast)
     _, sigma = bracket_probs(consensus, ladder_text, city, obs_high=obs_high_final, forecast=forecast)
     call = two_degree_call(consensus, ladder_text, obs_high=obs_high_final)
 
-    save_ok = sb_upsert_prediction(
-        city=city, consensus=consensus, forecast=forecast,
-        ensemble_mean=ensemble_mean, source_gap=source_gap,
-        high_uncertainty=high_uncertainty, obs_high=obs_high_final,
-        bias_correction=bias_correction,
-    )
-    if not save_ok:
-        st.caption('⚠️ Could not save prediction to database')
+    save_ok = sb_upsert_prediction(city=city, consensus=consensus, forecast=forecast,
+                                    ensemble_mean=ensemble_mean, source_gap=source_gap,
+                                    high_uncertainty=high_uncertainty, obs_high=obs_high_final,
+                                    bias_correction=bias_correction)
+    if not save_ok: st.caption('⚠️ Could not save prediction to database')
 
     st.subheader('Model Output')
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         st.metric('Consensus High', str(round(consensus, 1))+' F')
         st.caption('Saved to DB ✓' if save_ok else 'DB save failed')
-    with c2:
-        st.metric('2 Degree Call', call or 'none')
+    with c2: st.metric('2 Degree Call', call or 'none')
     with c3:
         if used_nbm:
             p50 = nbm_percentiles.get('p50', nbm_percentiles.get('p25', '—'))
-            st.metric('NBM p50', str(p50)+' F')
-            st.caption('Bracket probs from NBM percentiles')
+            st.metric('NBM p50', str(p50)+' F'); st.caption('Bracket probs from NBM percentiles')
         else:
-            st.metric('Sigma', str(round(sigma, 2))+' F')
-            st.caption('Fallback: sigma/normal distribution')
+            st.metric('Sigma', str(round(sigma, 2))+' F'); st.caption('Fallback: sigma/normal distribution')
     with c4:
         if obs_high_final is not None:
             st.metric('Obs Floor', str(obs_high_final)+' F',
@@ -1805,126 +1421,88 @@ if forecast is not None and current is not None:
         effective_weight = int(gfs_weight_pct * 0.5) if used_nbm else gfs_weight_pct
         st.caption(f'GFS ensemble: {ensemble_mean}F | {len(ensemble_members)} members | weight {effective_weight}%' +
                    (' (halved — NBM active)' if used_nbm else ''))
-    if high_uncertainty:
-        st.caption('High uncertainty mode — green signals suppressed')
-    if morning_suppressed:
-        st.caption('⚠️ Morning suppression active — no obs high + temp well below forecast')
+    if high_uncertainty: st.caption('High uncertainty mode — green signals suppressed')
+    if morning_suppressed: st.caption('⚠️ Morning suppression active — no obs high + temp well below forecast')
 
     import pandas as pd
     yes_rows = []
     no_rows = []
-    best_bet = None
-    best_edge = -999
-    best_no_bet = None
-    best_no_edge = -999
+    best_bet = best_no_bet = None
+    best_edge = best_no_edge = -999
 
     for label, base_prob in prob_rows:
-        ens_prob = None
-        for lbl, lo, hi in parse_ladder(ladder_text):
-            if labels_match(lbl, label):
-                ens_prob = ensemble_bracket_prob(ensemble_members, lo, hi)
-                break
+        ens_prob = next((ensemble_bracket_prob(ensemble_members, lo, hi)
+                         for lbl, lo, hi in parse_ladder(ladder_text) if labels_match(lbl, label)), None)
         final_prob = blend_probs(base_prob, ens_prob, ensemble_members, city, nbm_active=used_nbm)
         fair = round(final_prob * 100)
         yes_ask = no_ask = None
         if kalshi_markets:
             match = next((m for m in kalshi_markets if labels_match(m[0], label)), None)
-            if match:
-                yes_ask, no_ask = match[1], match[2]
-
+            if match: yes_ask, no_ask = match[1], match[2]
         e = edge_cents(final_prob, yes_ask)
-
-        busted = False
-        if obs_high_final is not None:
-            for lbl, lo, hi in parse_ladder(ladder_text):
-                if labels_match(lbl, label) and hi is not None and obs_high_final > hi + 0.4:
-                    busted = True
-
-        # V5.2: Check conviction conflict per bracket
-        conviction_conflict = False
-        if conviction_result:
-            _, c_lo, c_hi, _ = conviction_result
-            conviction_conflict = is_conflicting_with_conviction(label, c_lo, c_hi, ladder_text)
-
+        busted = obs_high_final is not None and any(
+            labels_match(lbl, label) and hi is not None and obs_high_final > hi + 0.4
+            for lbl, lo, hi in parse_ladder(ladder_text))
+        conviction_conflict = (conviction_result and
+                               is_conflicting_with_conviction(label, conviction_result[1], conviction_result[2], ladder_text))
         signal_icon, signal_text = edge_signal(e, high_uncertainty, morning_suppressed, conviction_conflict)
         kelly = kelly_bet(final_prob, yes_ask, bankroll) if yes_ask else 0.0
-
         no_e = no_edge_cents(final_prob, no_ask)
-        no_icon, no_text = no_signal(no_e, busted=busted, model_prob=final_prob,
-                                     no_ask=no_ask, high_uncertainty=high_uncertainty,
-                                     morning_suppressed=morning_suppressed,
+        no_icon, no_text = no_signal(no_e, busted=busted, model_prob=final_prob, no_ask=no_ask,
+                                     high_uncertainty=high_uncertainty, morning_suppressed=morning_suppressed,
                                      conviction_conflict=conviction_conflict)
         kelly_no = kelly_bet_no(final_prob, no_ask, bankroll) if no_ask and no_icon == '🟢' else 0.0
-
         ens_conf = ensemble_confidence(ens_prob) if ens_prob is not None else ''
         edge_str = ('+'+str(e)+'c') if e and e > 0 else (str(e)+'c' if e is not None else 'none')
         no_edge_str = ('+'+str(no_e)+'c') if no_e and no_e > 0 else (str(no_e)+'c' if no_e is not None else 'none')
 
-        yes_rows.append({
-            'Signal': signal_icon + ' ' + signal_text if signal_text else '',
-            'Bracket': label + (' BUSTED' if busted else ''),
-            'Model %': str(round(final_prob*100, 1))+'%',
-            'Mkt Implied %': str(round(yes_ask, 1))+'%' if yes_ask else '—',
-            'Fair': str(fair)+'c',
-            'YES ask': str(yes_ask)+'c' if yes_ask is not None else '—',
-            'Edge': edge_str,
-            'Kelly': ('$'+str(kelly)) if kelly > 0 else '—',
-            'Ensemble': ens_conf,
-        })
-
-        no_rows.append({
-            'NO Signal': (no_icon + ' ' + no_text) if no_icon and no_text else '—',
-            'Bracket': label + (' BUSTED' if busted else ''),
-            'Model %': str(round(final_prob*100, 1))+'%',
-            'Mkt Implied %': str(round(no_ask, 1))+'%' if no_ask else '—',
-            'NO ask': str(no_ask)+'c' if no_ask is not None else '—',
-            'NO Edge': no_edge_str,
-            'Kelly NO': ('$'+str(kelly_no)) if kelly_no > 0 else '—',
-            'Ensemble': ens_conf,
-        })
+        yes_rows.append({'Signal': signal_icon + ' ' + signal_text if signal_text else '',
+                         'Bracket': label + (' BUSTED' if busted else ''),
+                         'Model %': str(round(final_prob*100, 1))+'%',
+                         'Mkt Implied %': str(round(yes_ask, 1))+'%' if yes_ask else '—',
+                         'Fair': str(fair)+'c', 'YES ask': str(yes_ask)+'c' if yes_ask is not None else '—',
+                         'Edge': edge_str, 'Kelly': ('$'+str(kelly)) if kelly > 0 else '—', 'Ensemble': ens_conf})
+        no_rows.append({'NO Signal': (no_icon + ' ' + no_text) if no_icon and no_text else '—',
+                        'Bracket': label + (' BUSTED' if busted else ''),
+                        'Model %': str(round(final_prob*100, 1))+'%',
+                        'Mkt Implied %': str(round(no_ask, 1))+'%' if no_ask else '—',
+                        'NO ask': str(no_ask)+'c' if no_ask is not None else '—',
+                        'NO Edge': no_edge_str, 'Kelly NO': ('$'+str(kelly_no)) if kelly_no > 0 else '—',
+                        'Ensemble': ens_conf})
 
         if e is not None and e > best_edge and not busted and signal_icon == '🟢':
             best_edge = e
             best_bet = {'label': label, 'edge': e, 'kelly': kelly, 'uncertain': high_uncertainty}
-
         if busted and no_ask is not None and no_ask <= 5:
             no_e_for_rank = no_e if no_e is not None else 95
             if no_e_for_rank > best_no_edge:
                 best_no_edge = no_e_for_rank
-                best_no_bet = {'label': label, 'edge': no_e_for_rank, 'kelly': kelly_no,
-                               'busted': True, 'no_ask': no_ask}
+                best_no_bet = {'label': label, 'edge': no_e_for_rank, 'kelly': kelly_no, 'busted': True, 'no_ask': no_ask}
         elif no_e is not None and no_e > best_no_edge and no_icon == '🟢':
             best_no_edge = no_e
-            best_no_bet = {'label': label, 'edge': no_e, 'kelly': kelly_no,
-                           'busted': False, 'no_ask': no_ask}
+            best_no_bet = {'label': label, 'edge': no_e, 'kelly': kelly_no, 'busted': False, 'no_ask': no_ask}
 
     prob_source = '(NBM percentiles)' if used_nbm else '(sigma/normal fallback)'
     st.markdown(f'#### 🟢 YES Signals {prob_source}')
     st.dataframe(pd.DataFrame(yes_rows), use_container_width=True, hide_index=True)
 
     if best_bet and best_bet['edge'] >= MIN_EDGE and not best_bet['uncertain']:
-        st.success('🟢 Best YES Bet: **' + best_bet['label'] + '** | Edge: +' +
-                   str(best_bet['edge']) + 'c | Kelly: $' + str(best_bet['kelly']))
+        st.success('🟢 Best YES Bet: **' + best_bet['label'] + '** | Edge: +' + str(best_bet['edge']) + 'c | Kelly: $' + str(best_bet['kelly']))
     elif best_bet and best_bet['edge'] >= MIN_EDGE and best_bet['uncertain']:
-        st.warning('Best YES edge: **' + best_bet['label'] + '** (+' + str(best_bet['edge']) +
-                   'c) but HIGH UNCERTAINTY — consider skipping.')
+        st.warning('Best YES edge: **' + best_bet['label'] + '** (+' + str(best_bet['edge']) + 'c) but HIGH UNCERTAINTY — consider skipping.')
     elif best_bet:
-        st.warning('No YES bracket meets the ' + str(MIN_EDGE) + 'c minimum. Best: ' +
-                   best_bet['label'] + ' (+' + str(best_bet['edge']) + 'c)')
+        st.warning('No YES bracket meets the ' + str(MIN_EDGE) + 'c minimum. Best: ' + best_bet['label'] + ' (+' + str(best_bet['edge']) + 'c)')
     else:
-        st.warning('No green YES signals — morning suppression or conviction conflict active.')
+        st.warning('No green YES signals — suppression or conviction conflict active.')
 
     st.markdown(f'#### 🔴 NO Signals {prob_source}')
     st.dataframe(pd.DataFrame(no_rows), use_container_width=True, hide_index=True)
 
     if best_no_bet:
         if best_no_bet['busted']:
-            st.success('🟢 Best NO Bet: **' + best_no_bet['label'] + ' NO** | BUSTED bracket | ' +
-                       'NO ask: ' + str(best_no_bet['no_ask']) + 'c | Kelly: $' + str(best_no_bet['kelly']))
+            st.success('🟢 Best NO Bet: **' + best_no_bet['label'] + ' NO** | BUSTED bracket | NO ask: ' + str(best_no_bet['no_ask']) + 'c | Kelly: $' + str(best_no_bet['kelly']))
         else:
-            st.success('🟢 Best NO Bet: **' + best_no_bet['label'] + ' NO** | Edge: +' +
-                       str(best_no_bet['edge']) + 'c | NO ask: ' + str(best_no_bet['no_ask']) +
-                       'c | Kelly: $' + str(best_no_bet['kelly']))
+            st.success('🟢 Best NO Bet: **' + best_no_bet['label'] + ' NO** | Edge: +' + str(best_no_bet['edge']) + 'c | NO ask: ' + str(best_no_bet['no_ask']) + 'c | Kelly: $' + str(best_no_bet['kelly']))
 
     parsed = parse_ladder(ladder_text)
     top_b = next((b for b in parsed if b[2] is None), None)
@@ -1933,10 +1511,8 @@ if forecast is not None and current is not None:
         st.warning('Ladder does not cover consensus of '+str(round(consensus, 1))+'F — update brackets.')
 
 else:
-    if forecast is None:
-        st.error('NWS forecast unavailable. Use manual override or try refreshing.')
-    else:
-        st.error('Current temperature unavailable — cannot compute consensus.')
+    st.error('NWS forecast unavailable. Use manual override or try refreshing.' if forecast is None
+             else 'Current temperature unavailable — cannot compute consensus.')
 
 # ── Calibration Panel ─────────────────────────────────────────────────────────
 st.markdown('---')
@@ -1946,46 +1522,34 @@ with st.expander('View history for ' + city, expanded=False):
     rows = sb_fetch_city(city)
     complete = [r for r in rows if r.get('actual') is not None]
     pending = [r for r in rows if r.get('actual') is None]
-
     if complete:
         import pandas as pd
         errors = [r['error'] for r in complete if r.get('error') is not None]
         mae = round(sum(abs(e) for e in errors) / len(errors), 2) if errors else None
         avg_err = round(sum(errors) / len(errors), 2) if errors else None
         within_2 = round(100 * sum(1 for e in errors if abs(e) <= 2.0) / len(errors)) if errors else None
-
         m1, m2, m3, m4 = st.columns(4)
-        with m1:
-            st.metric('Settled Days', len(complete))
-        with m2:
-            st.metric('MAE', str(mae)+'F' if mae else 'n/a')
+        with m1: st.metric('Settled Days', len(complete))
+        with m2: st.metric('MAE', str(mae)+'F' if mae else 'n/a')
         with m3:
             st.metric('Avg Error', ('+' if avg_err and avg_err > 0 else '')+str(avg_err)+'F' if avg_err else 'n/a',
                       delta='warm bias' if avg_err and avg_err < -0.5 else 'cold bias' if avg_err and avg_err > 0.5 else 'calibrated')
-        with m4:
-            st.metric('Within ±2F', str(within_2)+'%' if within_2 else 'n/a')
-
+        with m4: st.metric('Within ±2F', str(within_2)+'%' if within_2 else 'n/a')
         hist_df = pd.DataFrame([{
-            'Date': r['date'],
-            'Consensus': r.get('consensus'),
-            'Actual': r.get('actual'),
+            'Date': r['date'], 'Consensus': r.get('consensus'), 'Actual': r.get('actual'),
             'Error': ('+' if r['error'] > 0 else '') + str(r['error']) + 'F' if r.get('error') is not None else '',
-            'Ensemble': r.get('ensemble_mean'),
-            'Uncertain': '⚠️' if r.get('high_uncertainty') else '',
+            'Ensemble': r.get('ensemble_mean'), 'Uncertain': '⚠️' if r.get('high_uncertainty') else '',
         } for r in sorted(complete, key=lambda x: x['date'], reverse=True)])
         st.dataframe(hist_df, use_container_width=True, hide_index=True)
     else:
         st.info('No settled history yet for ' + city + '.')
-
     if pending:
-        st.caption(str(len(pending)) + ' prediction(s) pending settlement: ' +
-                   ', '.join(r['date'] for r in pending))
+        st.caption(str(len(pending)) + ' prediction(s) pending: ' + ', '.join(r['date'] for r in pending))
 
 # ── All Cities Summary Panel ──────────────────────────────────────────────────
 st.markdown('---')
 with st.expander('All Cities — Today\'s Predictions', expanded=True):
     import pandas as pd
-
     all_rows = sb_fetch_all()
     today_rows = [r for r in all_rows if r.get('date') == today_str]
     saved_cities = {r['city'] for r in today_rows}
@@ -2001,22 +1565,15 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
                 consensus, save_ok = save_city_prediction(c, weather, saved_ladders)
                 if save_ok and consensus is not None:
                     bc, _ = compute_bias_correction_db(c)
-                    today_rows.append({
-                        'city': c, 'date': today_str,
-                        'consensus': consensus,
-                        'forecast': weather['nws_fc'],
-                        'ensemble_mean': weather['ensemble_mean'],
-                        'source_gap': weather['source_gap'],
-                        'high_uncertainty': weather['high_uncertainty'],
-                        'bias_correction': bc,
-                    })
+                    today_rows.append({'city': c, 'date': today_str, 'consensus': consensus,
+                                       'forecast': weather['nws_fc'], 'ensemble_mean': weather['ensemble_mean'],
+                                       'source_gap': weather['source_gap'], 'high_uncertainty': weather['high_uncertainty'],
+                                       'bias_correction': bc})
                     newly_saved.append(c)
-            except Exception:
-                pass
+            except Exception: pass
             time.sleep(0.4)
         fill_status.empty()
-        if newly_saved:
-            st.caption(f'✅ Filled in {len(newly_saved)} missing cities: {", ".join(newly_saved)}')
+        if newly_saved: st.caption(f'✅ Filled in {len(newly_saved)} missing cities: {", ".join(newly_saved)}')
 
     if today_rows:
         summary_rows = []
@@ -2028,11 +1585,7 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
             obs_h = r.get('obs_high')
             high_unc = r.get('high_uncertainty', False)
             bc_val = r.get('bias_correction', 0.0)
-
-            members = None
-            nbm_pcts = None
-            c_temp = None
-            c_fc = None
+            members = nbm_pcts = c_temp = c_fc = None
             c_hour = 12
             try:
                 cached_wx = fetch_city_weather(c)
@@ -2042,37 +1595,26 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
                     c_temp = cached_wx.get('current_temp')
                     c_fc = cached_wx.get('nws_fc')
                     c_hour = cached_wx.get('local_hour', 12)
-            except Exception:
-                pass
+            except Exception: pass
 
             ens_key = ensemble_overall_confidence(members, consensus_val, ladder)
             nbm_status = '✅ NBM' if nbm_pcts else '📊 Sigma'
-
             best_yes, best_no = get_city_best_signals(
-                c, consensus_val, ladder, members,
-                cached_markets, obs_h, high_unc, bankroll,
-                nbm_percentiles=nbm_pcts,
-                current_temp=c_temp, nws_forecast=c_fc, local_hour=c_hour
-            )
-
+                c, consensus_val, ladder, members, cached_markets, obs_h, high_unc, bankroll,
+                nbm_percentiles=nbm_pcts, current_temp=c_temp, nws_forecast=c_fc, local_hour=c_hour)
             bias_str = ('+' if bc_val and bc_val > 0 else '') + str(bc_val) + 'F' if bc_val and bc_val != 0.0 else '—'
 
             summary_rows.append({
-                'City': c,
-                'Consensus': str(consensus_val)+'F' if consensus_val else '—',
+                'City': c, 'Consensus': str(consensus_val)+'F' if consensus_val else '—',
                 'NWS': str(r.get('forecast', ''))+'F' if r.get('forecast') else '—',
                 'GFS': str(r.get('ensemble_mean', ''))+'F' if r.get('ensemble_mean') else '—',
                 'Gap': str(round(r['source_gap'], 1))+'F' if r.get('source_gap') else '—',
                 '⚠️': '⚠️' if r.get('high_uncertainty') else '✅',
-                'Ens Key': ens_key if ens_key else '—',
-                'Prob Src': nbm_status,
-                'Bias Adj': bias_str,
-                'Best YES': best_yes,
-                'Best NO': best_no,
+                'Ens Key': ens_key if ens_key else '—', 'Prob Src': nbm_status,
+                'Bias Adj': bias_str, 'Best YES': best_yes, 'Best NO': best_no,
             })
 
-        summary_df = pd.DataFrame(summary_rows)
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
         n_saved_total = len(today_rows)
         n_yes = sum(1 for r in summary_rows if r['Best YES'] != '—')
         n_no = sum(1 for r in summary_rows if r['Best NO'] != '—')
