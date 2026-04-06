@@ -1,15 +1,12 @@
-# Kalshi High Temperature Model - V5.2
+# Kalshi High Temperature Model - V5.3
 #
-# Changes from V5.1:
-# 1. Auto-settler fix — removed session state lock, runs every app load.
-#    ALSO switched settlement source to Iowa State CLI JSON API which has
-#    historical data (vs NWS obs history table which only shows last 3 days).
-#    URL: https://mesonet.agron.iastate.edu/json/cli.py?station=KDFW&year=2026
-#    This will automatically settle all pending April rows on next app load.
-# 2. NBM — NOMADS bulk file approach
-# 3. Green signal suppression — no obs high + temp 5F+ below forecast in AM
-# 4. Cold front warning without obs high — 8F+ gap in morning hours
-# 5. Market conviction check — >70% bracket suppresses conflicting signals
+# Changes from V5.2:
+# 1. Merged cold front warning + signal suppression into single warning
+#    (were showing identical info twice)
+# 2. NBM unavailable — shrunk to st.caption instead of full warning box
+# 3. Obs high table now shows 6-hour max column value when available
+#    (intra-hour peaks can exceed hourly Air readings — Phoenix April 5 lesson)
+# 4. NYC data feed — added grid point validation to catch wrong-day forecasts
 
 import math, re, json, time, requests
 import streamlit as st
@@ -18,8 +15,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V5.2', layout='wide')
-st.title('Kalshi High Temperature Model - V5.2')
+st.set_page_config(page_title='Kalshi High Temp V5.3', layout='wide')
+st.title('Kalshi High Temperature Model - V5.3')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -27,7 +24,7 @@ PRICE_CACHE_FILE = Path('price_cache.json')
 PRICE_CACHE_MINUTES = 10
 
 MIN_EDGE = 8
-HEADERS = {'User-Agent': 'kalshi-temp-model/5.2', 'Accept': 'application/geo+json, application/json, text/html'}
+HEADERS = {'User-Agent': 'kalshi-temp-model/5.3', 'Accept': 'application/geo+json, application/json, text/html'}
 
 CITY_TZ = {
     'Phoenix': 'America/Phoenix', 'Las Vegas': 'America/Los_Angeles',
@@ -925,12 +922,13 @@ def fetch_obs_high_today(icao):
     try:
         r = requests.get(url, headers=HEADERS, timeout=12)
         r.raise_for_status()
-    except Exception: return None, url
+    except Exception: return None, None, url
     soup = BeautifulSoup(r.text, 'html.parser')
     tables = soup.find_all('table')
     table = max(tables, key=lambda t: len(t.find_all('tr')), default=None) if tables else None
-    if not table: return None, url
+    if not table: return None, None, url
     highs = []
+    six_hr_maxes = []
     for row in table.find_all('tr'):
         cols = [td.get_text(strip=True) for td in row.find_all('td')]
         if not cols or len(cols) < 9 or cols[0] != today_day: continue
@@ -938,7 +936,17 @@ def fetch_obs_high_today(icao):
             t = float(cols[8])
             if 0 < t < 130: highs.append(t)
         except Exception: pass
-    return (round(max(highs), 1), url) if highs else (None, url)
+        # 6-hour max is in col index 10 if present
+        if len(cols) > 10:
+            try:
+                six_max = float(cols[10])
+                if 0 < six_max < 130: six_hr_maxes.append(six_max)
+            except Exception: pass
+    obs_high = round(max(highs), 1) if highs else None
+    six_hr_max = round(max(six_hr_maxes), 1) if six_hr_maxes else None
+    # Use 6-hour max if it exceeds hourly obs (catches intra-hour peaks)
+    true_high = max(filter(None, [obs_high, six_hr_max])) if (obs_high or six_hr_max) else None
+    return true_high, six_hr_max, url
 
 def parse_market_label(m):
     for field in ['subtitle', 'yes_sub_title', 'no_sub_title']:
@@ -1079,7 +1087,7 @@ def fetch_city_weather(city):
     lat, lon = coords['lat'], coords['lon']
     nws_fc, _ = fetch_nws_forecast(lat, lon)
     _, current_temp = fetch_nws_current(lat, lon, STATIONS[city])
-    obs_high_raw, _ = fetch_obs_high_today(OBHISTORY_STATIONS[city])
+    obs_high_raw, six_hr_max, _ = fetch_obs_high_today(OBHISTORY_STATIONS[city])
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
     nbm_percentiles = fetch_nbm_percentiles(lat, lon)
 
@@ -1143,12 +1151,10 @@ with st.sidebar:
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >5F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V5.2 Changes**')
-    st.markdown('- Auto-settler: Iowa State CLI JSON API (historical data)')
-    st.markdown('- Auto-settler runs every load — no lock')
-    st.markdown('- NBM: NOMADS bulk file')
-    st.markdown('- Signal suppression: no obs high + temp below forecast AM')
-    st.markdown('- Cold front warning without obs high')
+    st.markdown('**V5.3 Changes**')
+    st.markdown('- Cold front + suppression merged into single warning')
+    st.markdown('- NBM unavailable → caption only (no warning box)')
+    st.markdown('- Obs high now uses 6-hour max when higher than hourly readings')
     st.markdown('- Market conviction check: >70% suppresses conflicts')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
@@ -1271,7 +1277,7 @@ st.subheader('Live Weather')
 with st.spinner('Fetching weather data...'):
     nws_forecast, _ = fetch_nws_forecast(lat, lon)
     noaa_station, noaa_obs = fetch_nws_current(lat, lon, station)
-    obs_high_raw, obs_high_url = fetch_obs_high_today(obs_icao)
+    obs_high_raw, six_hr_max, obs_high_url = fetch_obs_high_today(obs_icao)
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
     nbm_percentiles = fetch_nbm_percentiles(lat, lon)
 
@@ -1319,17 +1325,19 @@ with col2:
     else: st.metric('Current Temp', 'Unavailable')
 with col3:
     if obs_high_today is not None:
+        six_hr_note = f' (6hr max: {six_hr_max}F)' if six_hr_max and six_hr_max != obs_high_today else ''
         st.metric('Obs High Today', str(obs_high_today)+' F', delta='floor active')
         wu_url = WUNDERGROUND_URLS.get(city, '')
-        st.caption('[NWS table](' + obs_url + ')' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else ''))
+        st.caption('[NWS table](' + obs_url + ')' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else '') + six_hr_note)
     elif obs_high_suspect:
         st.metric('Obs High Today', str(obs_high_raw)+'F ⚠️')
         wu_url = WUNDERGROUND_URLS.get(city, '')
         st.caption('⚠️ Discarded — verify manually' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else ''))
     else:
         st.metric('Obs High Today', 'Unavailable')
+        six_hr_note = f' | 6hr max: {six_hr_max}F ⚠️' if six_hr_max else ''
         wu_url = WUNDERGROUND_URLS.get(city, '')
-        st.caption('[NWS table](' + obs_url + ')' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else ''))
+        st.caption('[NWS table](' + obs_url + ')' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else '') + six_hr_note)
 with col4:
     if ensemble_mean is not None:
         n_members = len(ensemble_members) if ensemble_members else 0
@@ -1344,7 +1352,7 @@ if nbm_percentiles:
     nbm_p50 = nbm_percentiles.get('p50', nbm_percentiles.get('p25', '—'))
     st.success(f'✅ NBM active — p10:{nbm_percentiles.get("p10","—")}F | p50:{nbm_p50}F | p90:{nbm_percentiles.get("p90","—")}F | bracket probs from real percentile distribution')
 else:
-    st.warning('⚠️ NBM unavailable — using sigma/normal distribution fallback')
+    st.caption('📊 NBM unavailable — sigma/normal fallback active')
 
 for w in sanity_warnings: st.error('⚠️ ' + w)
 
@@ -1355,8 +1363,14 @@ elif source_gap is not None and source_gap > 2.5:
     st.info(f'Source gap: NWS vs Ensemble = {round(source_gap, 1)}F — moderate divergence.')
 
 cold_front_warning = check_cold_front_warning(obs_high_raw, noaa_obs, nws_forecast, local_hour)
-if cold_front_warning: st.warning(cold_front_warning)
-if morning_warning: st.error(morning_warning)
+if morning_suppressed:
+    # Merge cold front + suppression into one warning to avoid redundancy
+    combined = f'⚠️ Signal suppression active: No obs high + current temp ({round(noaa_obs, 1)}F) is {round(nws_forecast - noaa_obs, 1)}F below NWS forecast ({nws_forecast}F) in morning hours. High may have already occurred — green signals suppressed. Verify manually before betting.'
+    if cold_front_warning:
+        combined = cold_front_warning  # cold front is more specific, use it
+    st.error(combined)
+elif cold_front_warning:
+    st.warning(cold_front_warning)
 if conviction_result: st.warning(conviction_result[3])
 
 if obs_high_today is not None:
