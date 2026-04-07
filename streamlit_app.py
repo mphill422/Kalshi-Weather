@@ -51,7 +51,7 @@ SERIES = {
     'New Orleans': 'KXHIGHTNOLA', 'Philadelphia': 'KXHIGHPHIL',
     'Boston': 'KXHIGHTBOS', 'Denver': 'KXHIGHDEN',
     'Oklahoma City': 'KXHIGHTOKC', 'Minneapolis': 'KXHIGHTMIN',
-    'Washington DC': 'KXHIGHTDC', 'Chicago': 'KXHIGHTCHI',
+    'Washington DC': 'KXHIGHTDC', 'Chicago': 'KXHIGHCHI',
 }
 
 STATIONS = {
@@ -1748,11 +1748,12 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
                 nbm_percentiles=nbm_pcts, current_temp=c_temp, nws_forecast=c_fc, local_hour=c_hour)
             bias_str = ('+' if bc_val and bc_val > 0 else '') + str(bc_val) + 'F' if bc_val and bc_val != 0.0 else '—'
 
-            # V5.7: MAE column — shows per-city calibration health
+            # V5.7: MAE column — rolling 14-day window to match bias correction
             city_rows = sb_fetch_city(c)
             city_complete = [row for row in city_rows if row.get('actual') is not None and row.get('error') is not None]
             if city_complete:
-                city_errors = [abs(row['error']) for row in city_complete]
+                recent_14 = city_complete[-14:]
+                city_errors = [abs(row['error']) for row in recent_14]
                 city_mae = round(sum(city_errors) / len(city_errors), 1)
                 mae_icon = '✅' if city_mae < 2.5 else '🟡' if city_mae < 4.0 else '🔴'
                 mae_str = f'{mae_icon} {city_mae}F'
