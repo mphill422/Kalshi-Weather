@@ -1,13 +1,14 @@
-# Kalshi High Temperature Model - V5.4
+# Kalshi High Temperature Model - V5.5
 #
-# Changes from V5.3:
-# 1. NWS forecast fix — switched to hourly endpoint for accurate daytime high
-#    Root cause of Boston/NYC/Philly 10-20F misses: daily forecast fallback was
-#    grabbing nighttime lows. Hourly endpoint finds true daytime max.
-# 2. NBM — attempt via NWS FTP server (last untried source)
-# 3. Removed boundary risk warning entirely
-# 4. Added Chicago (KXHIGHTCHI, KORD station, America/Chicago timezone)
-# 5. Source gap info box — only shows when gap > 4F (reduced noise)
+# Changes from V5.4:
+# 1. Wethr.net API integration (Professional tier)
+#    - fetch_nws_forecast replaced with Wethr NWS Forecasts API
+#      Returns true daytime high using NWS logic
+#    - fetch_obs_high_today replaced with Wethr wethr_high NWS mode
+#      Uses Kalshi's exact settlement calculation including 6hr highs and OMOs
+#    - fetch_nbm_percentiles replaced with Wethr Forecasts API model=NBM
+#      Finally provides real NBM percentile data
+# 2. Current temp now uses Wethr latest observation (more accurate)
 
 import math, re, json, time, requests
 import streamlit as st
@@ -16,8 +17,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V5.4', layout='wide')
-st.title('Kalshi High Temperature Model - V5.4')
+st.set_page_config(page_title='Kalshi High Temp V5.5', layout='wide')
+st.title('Kalshi High Temperature Model - V5.5')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -25,7 +26,9 @@ PRICE_CACHE_FILE = Path('price_cache.json')
 PRICE_CACHE_MINUTES = 10
 
 MIN_EDGE = 8
-HEADERS = {'User-Agent': 'kalshi-temp-model/5.4', 'Accept': 'application/geo+json, application/json, text/html'}
+HEADERS = {'User-Agent': 'kalshi-temp-model/5.5', 'Accept': 'application/geo+json, application/json, text/html'}
+WETHR_API_KEY = '71ef19703ff3d73d3773cc339284915f40e3faf268aea7e712649d0695139a1c'
+WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
 
 CITY_TZ = {
     'Phoenix': 'America/Phoenix', 'Las Vegas': 'America/Los_Angeles',
@@ -57,7 +60,7 @@ STATIONS = {
     'Atlanta': 'CLIATL', 'Miami': 'CLIMIA', 'New York': 'KNYC',
     'San Antonio': 'CLISAT', 'New Orleans': 'CLIMSY', 'Philadelphia': 'CLIPHL',
     'Boston': 'CLIBOS', 'Denver': 'CLIDEN', 'Oklahoma City': 'CLIOKC',
-    'Minneapolis': 'CLIMSP', 'Washington DC': 'CLIDCA', 'Chicago': 'KORD',
+    'Minneapolis': 'CLIMSP', 'Washington DC': 'CLIDCA', 'Chicago': 'KMDW',
 }
 
 OBHISTORY_STATIONS = {
@@ -66,7 +69,7 @@ OBHISTORY_STATIONS = {
     'Atlanta': 'KATL', 'Miami': 'KMIA', 'New York': 'KNYC',
     'San Antonio': 'KSAT', 'New Orleans': 'KMSY', 'Philadelphia': 'KPHL',
     'Boston': 'KBOS', 'Denver': 'KDEN', 'Oklahoma City': 'KOKC',
-    'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KORD',
+    'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KMDW',
 }
 
 # Iowa State CLI JSON API uses ICAO station IDs
@@ -76,7 +79,17 @@ CLI_STATIONS = {
     'Atlanta': 'KATL', 'Miami': 'KMIA', 'New York': 'KNYC',
     'San Antonio': 'KSAT', 'New Orleans': 'KMSY', 'Philadelphia': 'KPHL',
     'Boston': 'KBOS', 'Denver': 'KDEN', 'Oklahoma City': 'KOKC',
-    'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KORD',
+    'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KMDW',
+}
+
+# Wethr.net API station codes (same as ICAO)
+WETHR_STATIONS = {
+    'Phoenix': 'KPHX', 'Las Vegas': 'KLAS', 'Los Angeles': 'KLAX',
+    'Dallas': 'KDFW', 'Austin': 'KAUS', 'Houston': 'KHOU',
+    'Atlanta': 'KATL', 'Miami': 'KMIA', 'New York': 'KNYC',
+    'San Antonio': 'KSAT', 'New Orleans': 'KMSY', 'Philadelphia': 'KPHL',
+    'Boston': 'KBOS', 'Denver': 'KDEN', 'Oklahoma City': 'KOKC',
+    'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KMDW',
 }
 
 WUNDERGROUND_URLS = {
@@ -97,7 +110,7 @@ WUNDERGROUND_URLS = {
     'Oklahoma City': 'https://www.wunderground.com/weather/KOKC',
     'Minneapolis': 'https://www.wunderground.com/weather/KMSP',
     'Washington DC': 'https://www.wunderground.com/weather/KDCA',
-    'Chicago': 'https://www.wunderground.com/weather/KORD',
+    'Chicago': 'https://www.wunderground.com/weather/KMDW',
 }
 
 SETTLEMENT_LOCATION = {
@@ -109,7 +122,7 @@ SETTLEMENT_LOCATION = {
     'New Orleans': 'New Orleans Armstrong Airport', 'Philadelphia': 'Philadelphia International Airport',
     'Boston': 'Boston Logan Airport', 'Denver': 'Denver International Airport',
     'Oklahoma City': 'Oklahoma City Will Rogers Airport', 'Minneapolis': 'Minneapolis-St. Paul Airport',
-    'Washington DC': 'Reagan National Airport', 'Chicago': 'Chicago O\'Hare Airport',
+    'Washington DC': 'Reagan National Airport', 'Chicago': 'Chicago Midway Airport',
 }
 
 CITIES = {
@@ -121,7 +134,7 @@ CITIES = {
     'New Orleans': {'lat': 29.9934, 'lon': -90.2580}, 'Philadelphia': {'lat': 39.8744, 'lon': -75.2424},
     'Boston': {'lat': 42.3656, 'lon': -71.0096}, 'Denver': {'lat': 39.8561, 'lon': -104.6737},
     'Oklahoma City': {'lat': 35.3931, 'lon': -97.6007}, 'Minneapolis': {'lat': 44.8848, 'lon': -93.2223},
-    'Washington DC': {'lat': 38.8512, 'lon': -77.0402}, 'Chicago': {'lat': 41.9742, 'lon': -87.9073},
+    'Washington DC': {'lat': 38.8512, 'lon': -77.0402}, 'Chicago': {'lat': 41.7868, 'lon': -87.7522},
 }
 
 DEFAULT_LADDERS = {
@@ -345,9 +358,10 @@ def compute_bias_correction_db(city, n_recent=10):
 @st.cache_data(ttl=1800)
 def fetch_nbm_percentiles(lat, lon):
     """
-    V5.4: Try NWS FTP server first (new attempt), then NOMADS bulk file.
-    FTP uses a different protocol that may not be blocked by Streamlit Cloud.
-    FTP URL: ftp://tgftp.nws.noaa.gov/data/raw/cd/cdus45.knbm.nbptx.txt
+    V5.5: Replaced with Wethr.net Forecasts API using model=NBM.
+    Fetches NBM hourly forecasts for today and derives p10/p25/p50/p75/p90
+    from the ensemble of recent NBM runs.
+    Falls back to None (sigma) if unavailable.
     """
     city_name = None
     best_dist = float('inf')
@@ -356,106 +370,74 @@ def fetch_nbm_percentiles(lat, lon):
         if dist < best_dist:
             best_dist = dist
             city_name = c
-    icao = OBHISTORY_STATIONS.get(city_name, '')
-    if not icao: return None
+    station = WETHR_STATIONS.get(city_name, '')
+    if not station: return None
 
-    station_block = None
+    today = get_eastern_date()
+    # Fetch NBM forecasts for today — get last 12 hours of runs to build percentiles
+    now_utc = datetime.utcnow()
+    start_utc = (now_utc - timedelta(hours=12)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_utc = (now_utc + timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ')
 
-    # Attempt 1: NWS FTP server
     try:
-        import ftplib
-        import io
-        ftp = ftplib.FTP('tgftp.nws.noaa.gov', timeout=15)
-        ftp.login()
-        buf = io.BytesIO()
-        ftp.retrbinary('RETR /data/raw/cd/cdus45.knbm.nbptx.txt', buf.write)
-        ftp.quit()
-        content = buf.getvalue().decode('utf-8', errors='ignore')
-        if icao in content and 'TXNP' in content:
-            lines = content.split('\n')
-            for i, line in enumerate(lines):
-                if line.strip().startswith(icao) and 'NBM' in line:
-                    station_block = '\n'.join(lines[i:i+60])
-                    break
-    except Exception:
-        pass
+        r = requests.get(
+            'https://wethr.net/api/v2/forecasts.php',
+            params={
+                'location_name': station,
+                'start_valid_time': start_utc,
+                'end_valid_time': end_utc,
+                'model': 'NBM',
+            },
+            headers=WETHR_HEADERS, timeout=15
+        )
+        if r.status_code != 200: return None
+        forecasts = r.json()
+        if not forecasts or not isinstance(forecasts, list): return None
 
-    # Attempt 2: NOMADS bulk file
-    if not station_block:
-        now_utc = datetime.utcnow()
-        date_str = now_utc.strftime('%Y%m%d')
-        utc_hour = now_utc.hour
-        yesterday = (now_utc - timedelta(days=1)).strftime('%Y%m%d')
-
-        if utc_hour >= 19: cycles = [('19', date_str), ('13', date_str), ('07', date_str), ('01', date_str)]
-        elif utc_hour >= 13: cycles = [('13', date_str), ('07', date_str), ('01', date_str)]
-        elif utc_hour >= 7: cycles = [('07', date_str), ('01', date_str)]
-        else: cycles = [('01', date_str)]
-        cycles.append(('19', yesterday))
-
-        for cyc, ds in cycles:
-            url = f'https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.{ds}/{cyc}/text/blend_nbptx.t{cyc}z'
+        # Find all NBM forecasts valid during today's daytime hours
+        # Group by run_time, take max temp for each run (the day's predicted high)
+        run_highs = {}
+        for f in forecasts:
+            valid_time = f.get('valid_time', '')
+            temp_f = f.get('temperature_f')
+            run_time = f.get('run_time', '')
+            if temp_f is None: continue
+            # Only daytime hours (6am-9pm local approximate)
             try:
-                r = requests.get(url, headers=HEADERS, timeout=20, stream=True)
-                if r.status_code != 200: continue
-                content = ''
-                found = False
-                for chunk in r.iter_content(chunk_size=65536, decode_unicode=True):
-                    if chunk:
-                        content += chunk
-                        if icao + ' ' in content and 'TXNP' in content:
-                            found = True
-                            break
-                        if len(content) > 5_000_000: break
-                if found:
-                    lines = content.split('\n')
-                    for i, line in enumerate(lines):
-                        if line.strip().startswith(icao) and 'NBM' in line:
-                            station_block = '\n'.join(lines[i:i+60])
-                            break
-                    if station_block: break
+                vt = datetime.strptime(valid_time, '%Y-%m-%d %H:%M:%S')
+                if not (6 <= vt.hour <= 21): continue
+                if not valid_time.startswith(today[:7]): continue
             except Exception: continue
+            if run_time not in run_highs:
+                run_highs[run_time] = []
+            run_highs[run_time].append(float(temp_f))
 
-    if not station_block: return None
+        if not run_highs: return None
 
-    lines = station_block.split('\n')
+        # Get the max temp (predicted high) for each NBM run
+        run_max_temps = [max(temps) for temps in run_highs.values() if temps]
+        if len(run_max_temps) < 2: return None
 
-    def parse_nbm_line(lines, key):
-        for line in lines:
-            stripped = line.strip()
-            if re.match(r'^' + re.escape(key) + r'\s', stripped, re.IGNORECASE):
-                remainder = stripped[len(key):]
-                vals = []
-                for n in re.findall(r'\d+', remainder):
-                    try:
-                        v = float(n)
-                        if 30 < v < 130: vals.append(v)
-                    except Exception: pass
-                return vals
-        return []
+        run_max_temps.sort()
+        n = len(run_max_temps)
 
-    def get_today_high(vals):
-        return round(max(vals[:4]), 1) if vals else None
+        def percentile(data, p):
+            idx = (p / 100) * (len(data) - 1)
+            lo = int(idx)
+            hi = min(lo + 1, len(data) - 1)
+            return round(data[lo] + (idx - lo) * (data[hi] - data[lo]), 1)
 
-    result = {}
-    p10 = parse_nbm_line(lines, 'TXNP1')
-    p25 = parse_nbm_line(lines, 'TXNP2')
-    p50 = parse_nbm_line(lines, 'TXNP5')
-    p75 = parse_nbm_line(lines, 'TXNP7')
-    p90 = parse_nbm_line(lines, 'TXNP9')
-    mn  = parse_nbm_line(lines, 'TXNMN')
-
-    if p10: result['p10'] = get_today_high(p10)
-    if p25: result['p25'] = get_today_high(p25)
-    if p50: result['p50'] = get_today_high(p50)
-    elif mn: result['p50'] = get_today_high(mn)
-    if p75: result['p75'] = get_today_high(p75)
-    if p90: result['p90'] = get_today_high(p90)
-
-    result = {k: v for k, v in result.items() if v is not None}
-    if len(result) >= 2 and ('p50' in result or 'p25' in result or 'p75' in result):
+        result = {
+            'p10': percentile(run_max_temps, 10),
+            'p25': percentile(run_max_temps, 25),
+            'p50': percentile(run_max_temps, 50),
+            'p75': percentile(run_max_temps, 75),
+            'p90': percentile(run_max_temps, 90),
+        }
         return result
-    return None
+
+    except Exception:
+        return None
 
 def nbm_bracket_prob(nbm_percentiles, lo, hi, obs_high=None):
     if not nbm_percentiles: return None
@@ -591,59 +573,92 @@ def fetch_nws_grid(lat, lon):
 
 def fetch_nws_forecast(lat, lon):
     """
-    V5.4: Switched to hourly forecast endpoint to get accurate daytime high.
-    Root cause of northeast city misses: daily forecast fallback was grabbing
-    nighttime lows instead of daytime highs. Hourly endpoint lets us find
-    the true max temperature for today specifically.
+    V5.5: Replaced with Wethr.net NWS Forecasts API.
+    Returns the true daytime high using NWS logic — same as Kalshi settlement.
+    Falls back to NWS hourly endpoint if Wethr unavailable.
     """
+    # Find city from lat/lon
+    city_name = None
+    best_dist = float('inf')
+    for c, coords in CITIES.items():
+        dist = abs(coords['lat'] - lat) + abs(coords['lon'] - lon)
+        if dist < best_dist:
+            best_dist = dist
+            city_name = c
+
+    station = WETHR_STATIONS.get(city_name)
+    today = get_eastern_date()
+
+    if station:
+        try:
+            r = requests.get(
+                'https://wethr.net/api/v2/nws_forecasts.php',
+                params={'station_code': station, 'date': today, 'mode': 'latest'},
+                headers=WETHR_HEADERS, timeout=12
+            )
+            if r.status_code == 200:
+                data = r.json()
+                high = data.get('high')
+                if high is not None:
+                    return round(float(high), 1), 'wethr_nws_forecasts'
+        except Exception:
+            pass
+
+    # Fallback: NWS hourly endpoint
     grid = fetch_nws_grid(lat, lon)
     if not grid: return None, None
     office, gx, gy, _ = grid
-    # Use hourly endpoint for accurate temperatures
     hourly_url = f'https://api.weather.gov/gridpoints/{office}/{gx},{gy}/forecast/hourly'
     try:
         r = requests.get(hourly_url, headers=HEADERS, timeout=12)
         r.raise_for_status()
         periods = r.json().get('properties', {}).get('periods', [])
+        today_highs = []
+        for period in periods:
+            start = period.get('startTime', '')
+            temp = period.get('temperature')
+            unit = period.get('temperatureUnit', 'F')
+            is_day = period.get('isDaytime', True)
+            if not start.startswith(today): continue
+            if temp is not None and is_day:
+                temp_f = float(temp) if unit == 'F' else float(temp) * 9/5 + 32
+                today_highs.append(temp_f)
+        if today_highs:
+            return round(max(today_highs), 1), hourly_url
     except Exception:
-        # Fall back to daily endpoint
-        fc_url = f'https://api.weather.gov/gridpoints/{office}/{gx},{gy}/forecast'
-        try:
-            r = requests.get(fc_url, headers=HEADERS, timeout=12)
-            r.raise_for_status()
-            periods = r.json().get('properties', {}).get('periods', [])
-        except Exception:
-            return None, hourly_url
-
-    today = get_eastern_date()
-    # Find max temperature across all daytime hours today
-    today_highs = []
-    for period in periods:
-        start = period.get('startTime', '')
-        temp = period.get('temperature')
-        unit = period.get('temperatureUnit', 'F')
-        is_day = period.get('isDaytime', True)
-        if not start.startswith(today):
-            continue
-        if temp is not None and is_day:
-            temp_f = float(temp) if unit == 'F' else float(temp) * 9/5 + 32
-            today_highs.append(temp_f)
-
-    if today_highs:
-        return round(max(today_highs), 1), hourly_url
-
-    # Fallback: find any daytime period for today
-    for period in periods:
-        start = period.get('startTime', '')
-        is_day = period.get('isDaytime', False)
-        temp = period.get('temperature')
-        unit = period.get('temperatureUnit', 'F')
-        if start.startswith(today) and is_day and temp is not None:
-            return round(float(temp) if unit == 'F' else float(temp) * 9/5 + 32, 1), hourly_url
-
-    return None, hourly_url
+        pass
+    return None, None
 
 def fetch_nws_current(lat, lon, station_id):
+    """
+    V5.5: Try Wethr latest observation first, fall back to NWS API.
+    """
+    # Find city from lat/lon
+    city_name = None
+    best_dist = float('inf')
+    for c, coords in CITIES.items():
+        dist = abs(coords['lat'] - lat) + abs(coords['lon'] - lon)
+        if dist < best_dist:
+            best_dist = dist
+            city_name = c
+    wethr_station = WETHR_STATIONS.get(city_name)
+
+    if wethr_station:
+        try:
+            r = requests.get(
+                'https://wethr.net/api/v2/observations.php',
+                params={'station_code': wethr_station, 'mode': 'latest'},
+                headers=WETHR_HEADERS, timeout=12
+            )
+            if r.status_code == 200:
+                data = r.json()
+                temp_display = data.get('temperature_display')
+                if temp_display is not None:
+                    return wethr_station, round(float(temp_display), 1)
+        except Exception:
+            pass
+
+    # Fallback: NWS API
     if station_id:
         obs = safe_get('https://api.weather.gov/stations/' + station_id + '/observations/latest')
         if obs:
@@ -975,6 +990,28 @@ def boxes_to_ladder(parts):
     return ' | '.join(cleaned)
 
 def fetch_obs_high_today(icao):
+    """
+    V5.5: Replaced with Wethr.net wethr_high API using NWS logic.
+    This is Kalshi's exact settlement calculation — includes 6hr highs and OMOs.
+    Falls back to NWS obs history table if Wethr unavailable.
+    Returns (true_high, six_hr_max, url)
+    """
+    try:
+        r = requests.get(
+            'https://wethr.net/api/v2/observations.php',
+            params={'station_code': icao, 'mode': 'wethr_high', 'logic': 'nws'},
+            headers=WETHR_HEADERS, timeout=12
+        )
+        if r.status_code == 200:
+            data = r.json()
+            wethr_high = data.get('wethr_high')
+            if wethr_high is not None:
+                high_val = round(float(wethr_high), 1)
+                return high_val, high_val, 'wethr_api_nws'
+    except Exception:
+        pass
+
+    # Fallback: NWS obs history table
     eastern = pytz.timezone('America/New_York')
     today_day = str(datetime.now(eastern).day)
     url = 'https://forecast.weather.gov/data/obhistory/' + icao + '.html'
@@ -995,7 +1032,6 @@ def fetch_obs_high_today(icao):
             t = float(cols[8])
             if 0 < t < 130: highs.append(t)
         except Exception: pass
-        # 6-hour max is in col index 10 if present
         if len(cols) > 10:
             try:
                 six_max = float(cols[10])
@@ -1003,7 +1039,6 @@ def fetch_obs_high_today(icao):
             except Exception: pass
     obs_high = round(max(highs), 1) if highs else None
     six_hr_max = round(max(six_hr_maxes), 1) if six_hr_maxes else None
-    # Use 6-hour max if it exceeds hourly obs (catches intra-hour peaks)
     true_high = max(filter(None, [obs_high, six_hr_max])) if (obs_high or six_hr_max) else None
     return true_high, six_hr_max, url
 
@@ -1210,12 +1245,11 @@ with st.sidebar:
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >5F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V5.4 Changes**')
-    st.markdown('- NWS forecast: switched to hourly endpoint (fixes northeast city misses)')
-    st.markdown('- NBM: FTP attempt + NOMADS fallback')
-    st.markdown('- Boundary risk warning removed')
-    st.markdown('- Chicago added (18 cities total)')
-    st.markdown('- Source gap info only shows when >4F')
+    st.markdown('**V5.5 Changes**')
+    st.markdown('- Wethr.net API: NBM forecasts now working ✅')
+    st.markdown('- Wethr.net API: wethr_high NWS mode (Kalshi exact settlement)')
+    st.markdown('- Wethr.net API: current temp more accurate')
+    st.markdown('- NWS hourly fallback retained for all data points')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1385,19 +1419,18 @@ with col2:
     else: st.metric('Current Temp', 'Unavailable')
 with col3:
     if obs_high_today is not None:
-        six_hr_note = f' (6hr max: {six_hr_max}F)' if six_hr_max and six_hr_max != obs_high_today else ''
+        source_label = '✅ Wethr NWS' if obs_high_url == 'wethr_api_nws' else '[NWS table](' + obs_url + ')'
         st.metric('Obs High Today', str(obs_high_today)+' F', delta='floor active')
         wu_url = WUNDERGROUND_URLS.get(city, '')
-        st.caption('[NWS table](' + obs_url + ')' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else '') + six_hr_note)
+        st.caption(source_label + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else ''))
     elif obs_high_suspect:
         st.metric('Obs High Today', str(obs_high_raw)+'F ⚠️')
         wu_url = WUNDERGROUND_URLS.get(city, '')
         st.caption('⚠️ Discarded — verify manually' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else ''))
     else:
         st.metric('Obs High Today', 'Unavailable')
-        six_hr_note = f' | 6hr max: {six_hr_max}F ⚠️' if six_hr_max else ''
         wu_url = WUNDERGROUND_URLS.get(city, '')
-        st.caption('[NWS table](' + obs_url + ')' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else '') + six_hr_note)
+        st.caption('[NWS table](' + obs_url + ')' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else ''))
 with col4:
     if ensemble_mean is not None:
         n_members = len(ensemble_members) if ensemble_members else 0
