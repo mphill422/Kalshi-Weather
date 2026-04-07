@@ -1,14 +1,16 @@
-# Kalshi High Temperature Model - V5.5
+# Kalshi High Temperature Model - V5.6
 #
-# Changes from V5.4:
-# 1. Wethr.net API integration (Professional tier)
-#    - fetch_nws_forecast replaced with Wethr NWS Forecasts API
-#      Returns true daytime high using NWS logic
-#    - fetch_obs_high_today replaced with Wethr wethr_high NWS mode
-#      Uses Kalshi's exact settlement calculation including 6hr highs and OMOs
-#    - fetch_nbm_percentiles replaced with Wethr Forecasts API model=NBM
-#      Finally provides real NBM percentile data
-# 2. Current temp now uses Wethr latest observation (more accurate)
+# Changes from V5.5:
+# 1. NBM UTC→local hour fix: valid_time was being filtered in UTC, starving
+#    Phoenix/LA/San Antonio/Philadelphia/Washington DC of NBM data points.
+#    Now converts to city local time before applying 6am-9pm daytime filter.
+# 2. GFS weight reduced for northeast cities (NY/BOS/PHL/DC): 0.25 → 0.15
+#    GFS runs cold in spring for coastal northeast — reducing its influence.
+# 3. High uncertainty threshold widened for northeast/coastal cities:
+#    5.0F → 6.5F for NY, Boston, Philadelphia, DC, LA, Boston in months 3-5.
+#    Prevents routine spring GFS spread from suppressing all signals.
+# 4. Bias correction window increased from n_recent=10 to n_recent=14
+#    More data points = more stable correction, less sensitivity to single outliers.
 
 import math, re, json, time, requests
 import streamlit as st
@@ -17,8 +19,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V5.5', layout='wide')
-st.title('Kalshi High Temperature Model - V5.5')
+st.set_page_config(page_title='Kalshi High Temp V5.6', layout='wide')
+st.title('Kalshi High Temperature Model - V5.6')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -26,7 +28,7 @@ PRICE_CACHE_FILE = Path('price_cache.json')
 PRICE_CACHE_MINUTES = 10
 
 MIN_EDGE = 8
-HEADERS = {'User-Agent': 'kalshi-temp-model/5.5', 'Accept': 'application/geo+json, application/json, text/html'}
+HEADERS = {'User-Agent': 'kalshi-temp-model/5.6', 'Accept': 'application/geo+json, application/json, text/html'}
 WETHR_API_KEY = '71ef19703ff3d73d3773cc339284915f40e3faf268aea7e712649d0695139a1c'
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
 
@@ -72,7 +74,6 @@ OBHISTORY_STATIONS = {
     'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KMDW',
 }
 
-# Iowa State CLI JSON API uses ICAO station IDs
 CLI_STATIONS = {
     'Phoenix': 'KPHX', 'Las Vegas': 'KLAS', 'Los Angeles': 'KLAX',
     'Dallas': 'KDFW', 'Austin': 'KAUS', 'Houston': 'KHOU',
@@ -82,7 +83,6 @@ CLI_STATIONS = {
     'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KMDW',
 }
 
-# Wethr.net API station codes (same as ICAO)
 WETHR_STATIONS = {
     'Phoenix': 'KPHX', 'Las Vegas': 'KLAS', 'Los Angeles': 'KLAX',
     'Dallas': 'KDFW', 'Austin': 'KAUS', 'Houston': 'KHOU',
@@ -169,14 +169,19 @@ BASE_SIGMA = {
 DESERT_CITIES = {'Phoenix', 'Las Vegas'}
 FORECAST_HEAVY_CITIES = {'Dallas', 'Austin', 'Houston', 'San Antonio', 'Oklahoma City'}
 
+# V5.6: Northeast/coastal GFS weights reduced 0.25 → 0.15 (GFS runs cold in spring)
 GFS_CITY_WEIGHT = {
     'Phoenix': 0.10, 'Las Vegas': 0.10, 'Los Angeles': 0.12,
     'Miami': 0.18, 'Houston': 0.18, 'New Orleans': 0.18,
     'Dallas': 0.25, 'Austin': 0.25, 'San Antonio': 0.25, 'Oklahoma City': 0.25,
-    'Atlanta': 0.22, 'Washington DC': 0.22,
-    'New York': 0.25, 'Philadelphia': 0.25, 'Boston': 0.25,
-    'Denver': 0.22, 'Minneapolis': 0.22, 'Chicago': 0.22,
+    'Atlanta': 0.22, 'Denver': 0.22, 'Minneapolis': 0.22, 'Chicago': 0.22,
+    # V5.6: reduced from 0.25 → 0.15 for northeast/coastal cities
+    'New York': 0.15, 'Philadelphia': 0.15, 'Boston': 0.15, 'Washington DC': 0.15,
 }
+
+# V5.6: Cities that get a wider high-uncertainty threshold in spring (months 3-5)
+# GFS spread is routinely wider for these cities in spring, 5F threshold too tight
+SPRING_WIDE_THRESHOLD_CITIES = {'New York', 'Philadelphia', 'Boston', 'Washington DC', 'Los Angeles'}
 
 # ── Supabase ──────────────────────────────────────────────────────────────────
 _SB_URL = 'https://oirnfhhuyjuotkrlymxd.supabase.co'
@@ -261,18 +266,11 @@ def sb_upsert_prediction(city, consensus, forecast, ensemble_mean, source_gap,
     else: return sb_insert(row)
 
 # ── V5.2 Auto-Settlement — Iowa State CLI JSON API ────────────────────────────
-_CLI_CACHE = {}  # {station_year_key: {date_str: max_temp}}
+_CLI_CACHE = {}
 
 def fetch_cli_max_temp(city, target_date_str):
-    """
-    V5.2: Use Iowa State CLI JSON API for historical settlement data.
-    Replaces NWS obs history table (only last ~3 days).
-    API: https://mesonet.agron.iastate.edu/json/cli.py?station=KDFW&year=2026
-    Response: JSON with 'results' list, each has 'valid' (YYYY-MM-DD) and 'high' (F).
-    """
     station = CLI_STATIONS.get(city)
-    if not station:
-        return None
+    if not station: return None
     year = target_date_str[:4]
     cache_key = station + '_' + year
     if cache_key not in _CLI_CACHE:
@@ -289,12 +287,10 @@ def fetch_cli_max_temp(city, target_date_str):
                     try: lookup[valid] = float(high)
                     except Exception: pass
             _CLI_CACHE[cache_key] = lookup
-        except Exception:
-            return None
+        except Exception: return None
     return _CLI_CACHE.get(cache_key, {}).get(target_date_str)
 
 def fetch_obs_high_for_date(icao, target_date_str):
-    """Fallback: NWS obs history (last ~3 days only)."""
     url = 'https://forecast.weather.gov/data/obhistory/' + icao + '.html'
     try:
         r = requests.get(url, headers=HEADERS, timeout=12)
@@ -316,11 +312,6 @@ def fetch_obs_high_for_date(icao, target_date_str):
     return round(max(highs), 1) if highs else None
 
 def run_auto_settlement():
-    """
-    V5.2: No session state lock — runs every app load.
-    Iowa State CLI JSON API as primary (has historical data).
-    NWS obs history as fallback for very recent dates.
-    """
     unsettled = sb_fetch_unsettled()
     if not unsettled: return 0, []
     settled = []
@@ -331,9 +322,7 @@ def run_auto_settlement():
         city = row.get('city')
         icao = OBHISTORY_STATIONS.get(city)
         if not icao: continue
-        # Primary: Iowa State CLI JSON API
         actual = fetch_cli_max_temp(city, row_date)
-        # Fallback: NWS obs history
         if actual is None:
             actual = fetch_obs_high_for_date(icao, row_date)
         if actual is None: continue
@@ -345,7 +334,8 @@ def run_auto_settlement():
     return len(settled), settled
 
 # ── Bias Correction ───────────────────────────────────────────────────────────
-def compute_bias_correction_db(city, n_recent=10):
+# V5.6: increased n_recent from 10 → 14 for more stable correction
+def compute_bias_correction_db(city, n_recent=14):
     rows = sb_fetch_city(city)
     complete = [r for r in rows if r.get('actual') is not None and r.get('consensus') is not None]
     if len(complete) < 3: return 0.0, len(complete)
@@ -354,14 +344,27 @@ def compute_bias_correction_db(city, n_recent=10):
     mean_error = sum(errors) / len(errors)
     return round(max(-5.0, min(5.0, mean_error)), 2), len(recent)
 
-# ── V5.2 NBM — NOMADS bulk file ───────────────────────────────────────────────
+# ── High Uncertainty Threshold ────────────────────────────────────────────────
+def get_uncertainty_threshold(city):
+    """
+    V5.6: Wider threshold for northeast/coastal cities in spring (months 3-5).
+    GFS spread is routinely 5-7F wider for these cities in spring transition.
+    Using 6.5F instead of 5.0F prevents routine GFS variance from suppressing all signals.
+    """
+    month = datetime.now().month
+    if city in SPRING_WIDE_THRESHOLD_CITIES and 3 <= month <= 5:
+        return 6.5
+    if city in DESERT_CITIES:
+        return 6.0
+    return 5.0
+
+# ── NBM Fetcher ───────────────────────────────────────────────────────────────
 @st.cache_data(ttl=1800)
 def fetch_nbm_percentiles(lat, lon):
     """
-    V5.5: Replaced with Wethr.net Forecasts API using model=NBM.
-    Fetches NBM hourly forecasts for today and derives p10/p25/p50/p75/p90
-    from the ensemble of recent NBM runs.
-    Falls back to None (sigma) if unavailable.
+    V5.6 fix: Convert valid_time from UTC to city local time before applying
+    daytime hour filter (6am-9pm). Previously filtered in UTC, which starved
+    western/central cities of NBM data points and caused Sigma fallback.
     """
     city_name = None
     best_dist = float('inf')
@@ -373,8 +376,9 @@ def fetch_nbm_percentiles(lat, lon):
     station = WETHR_STATIONS.get(city_name, '')
     if not station: return None
 
-    today = get_eastern_date()
-    # Fetch NBM forecasts for today — get last 12 hours of runs to build percentiles
+    city_tz = pytz.timezone(CITY_TZ.get(city_name, 'America/New_York'))
+    today_local = datetime.now(city_tz).strftime('%Y-%m-%d')
+
     now_utc = datetime.utcnow()
     start_utc = (now_utc - timedelta(hours=12)).strftime('%Y-%m-%dT%H:%M:%SZ')
     end_utc = (now_utc + timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -394,19 +398,22 @@ def fetch_nbm_percentiles(lat, lon):
         forecasts = r.json()
         if not forecasts or not isinstance(forecasts, list): return None
 
-        # Find all NBM forecasts valid during today's daytime hours
-        # Group by run_time, take max temp for each run (the day's predicted high)
+        # V5.6 fix: convert valid_time (UTC) → city local time before hour filtering
         run_highs = {}
         for f in forecasts:
-            valid_time = f.get('valid_time', '')
+            valid_time_str = f.get('valid_time', '')
             temp_f = f.get('temperature_f')
             run_time = f.get('run_time', '')
             if temp_f is None: continue
-            # Only daytime hours (6am-9pm local approximate)
             try:
-                vt = datetime.strptime(valid_time, '%Y-%m-%d %H:%M:%S')
-                if not (6 <= vt.hour <= 21): continue
-                if not valid_time.startswith(today[:7]): continue
+                # Parse as UTC, convert to city local time
+                vt_utc = datetime.strptime(valid_time_str, '%Y-%m-%d %H:%M:%S')
+                vt_utc = pytz.utc.localize(vt_utc)
+                vt_local = vt_utc.astimezone(city_tz)
+                # Only keep daytime hours (6am-9pm) in city local time
+                if not (6 <= vt_local.hour <= 21): continue
+                # Only keep today's local date
+                if vt_local.strftime('%Y-%m-%d') != today_local: continue
             except Exception: continue
             if run_time not in run_highs:
                 run_highs[run_time] = []
@@ -414,12 +421,10 @@ def fetch_nbm_percentiles(lat, lon):
 
         if not run_highs: return None
 
-        # Get the max temp (predicted high) for each NBM run
         run_max_temps = [max(temps) for temps in run_highs.values() if temps]
         if len(run_max_temps) < 2: return None
 
         run_max_temps.sort()
-        n = len(run_max_temps)
 
         def percentile(data, p):
             idx = (p / 100) * (len(data) - 1)
@@ -427,14 +432,13 @@ def fetch_nbm_percentiles(lat, lon):
             hi = min(lo + 1, len(data) - 1)
             return round(data[lo] + (idx - lo) * (data[hi] - data[lo]), 1)
 
-        result = {
+        return {
             'p10': percentile(run_max_temps, 10),
             'p25': percentile(run_max_temps, 25),
             'p50': percentile(run_max_temps, 50),
             'p75': percentile(run_max_temps, 75),
             'p90': percentile(run_max_temps, 90),
         }
-        return result
 
     except Exception:
         return None
@@ -572,12 +576,6 @@ def fetch_nws_grid(lat, lon):
     except Exception: return None
 
 def fetch_nws_forecast(lat, lon):
-    """
-    V5.5: Replaced with Wethr.net NWS Forecasts API.
-    Returns the true daytime high using NWS logic — same as Kalshi settlement.
-    Falls back to NWS hourly endpoint if Wethr unavailable.
-    """
-    # Find city from lat/lon
     city_name = None
     best_dist = float('inf')
     for c, coords in CITIES.items():
@@ -630,10 +628,6 @@ def fetch_nws_forecast(lat, lon):
     return None, None
 
 def fetch_nws_current(lat, lon, station_id):
-    """
-    V5.5: Try Wethr latest observation first, fall back to NWS API.
-    """
-    # Find city from lat/lon
     city_name = None
     best_dist = float('inf')
     for c, coords in CITIES.items():
@@ -990,12 +984,6 @@ def boxes_to_ladder(parts):
     return ' | '.join(cleaned)
 
 def fetch_obs_high_today(icao):
-    """
-    V5.5: Replaced with Wethr.net wethr_high API using NWS logic.
-    This is Kalshi's exact settlement calculation — includes 6hr highs and OMOs.
-    Falls back to NWS obs history table if Wethr unavailable.
-    Returns (true_high, six_hr_max, url)
-    """
     try:
         r = requests.get(
             'https://wethr.net/api/v2/observations.php',
@@ -1199,10 +1187,12 @@ def fetch_city_weather(city):
     if ensemble_mean is not None and nws_fc is not None and abs(ensemble_mean - nws_fc) > 8.0:
         ensemble_members = None; ensemble_mean = None
 
+    # V5.6: use city-specific uncertainty threshold
     source_gap = None; high_uncertainty = False
     if nws_fc is not None and ensemble_mean is not None:
         source_gap = abs(nws_fc - ensemble_mean)
-        high_uncertainty = source_gap > (6.0 if city in DESERT_CITIES else 5.0)
+        threshold = get_uncertainty_threshold(city)
+        high_uncertainty = source_gap > threshold
 
     return {
         'nws_fc': nws_fc, 'current_temp': current_temp,
@@ -1242,21 +1232,20 @@ with st.sidebar:
     st.markdown('🟢 Edge >=8c — **BET**')
     st.markdown('🟡 Edge 3-7c — **SKIP**')
     st.markdown('🔴 Edge <3c — **AVOID**')
-    st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >5F')
+    st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble gap exceeded')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V5.5 Changes**')
-    st.markdown('- Wethr.net API: NBM forecasts now working ✅')
-    st.markdown('- Wethr.net API: wethr_high NWS mode (Kalshi exact settlement)')
-    st.markdown('- Wethr.net API: current temp more accurate')
-    st.markdown('- NWS hourly fallback retained for all data points')
+    st.markdown('**V5.6 Changes**')
+    st.markdown('- NBM UTC→local time fix (Philadelphia, Phoenix, San Antonio, DC now get NBM)')
+    st.markdown('- GFS weight reduced for NY/BOS/PHL/DC: 0.25 → 0.15')
+    st.markdown('- Uncertainty threshold widened for northeast/LA in spring: 5.0F → 6.5F')
+    st.markdown('- Bias correction window: 10 → 14 days')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
 today_str = get_eastern_date()
 last_sync_data = load_json(LAST_SYNC_FILE)
 
-# V5.2: Runs every load — Iowa State CLI API settles historical dates
 with st.spinner('Checking for unsettled predictions...'):
     n_settled, settled_rows = run_auto_settlement()
 if n_settled > 0:
@@ -1314,7 +1303,8 @@ if city in FORECAST_HEAVY_CITIES and local_hour < 16:
 bias_correction, bias_n = compute_bias_correction_db(city)
 if bias_n >= 3:
     direction = 'warm' if bias_correction > 0 else 'cold'
-    st.info(f'Bias correction active: +{bias_correction}F applied to consensus '
+    sign = '+' if bias_correction > 0 else ''
+    st.info(f'Bias correction active: {sign}{bias_correction}F applied to consensus '
             f'(model ran {direction} by avg {abs(bias_correction)}F over last {bias_n} days)')
 elif bias_n > 0:
     st.caption(f'Bias correction: {bias_n} settlement(s) logged — need 3+ for correction')
@@ -1398,10 +1388,12 @@ if ensemble_mean is not None and nws_forecast is not None and abs(ensemble_mean 
     sanity_warnings.append(f'GFS ensemble ({ensemble_mean}F) differs from NWS by {round(abs(ensemble_mean - nws_forecast), 1)}F — discarded.')
     ensemble_members = None; ensemble_mean = None
 
+# V5.6: city-specific uncertainty threshold
 high_uncertainty = False; source_gap = None
 if nws_forecast is not None and ensemble_mean is not None:
     source_gap = abs(nws_forecast - ensemble_mean)
-    high_uncertainty = source_gap > (6.0 if city in DESERT_CITIES else 5.0)
+    threshold = get_uncertainty_threshold(city)
+    high_uncertainty = source_gap > threshold
 
 morning_suppressed, morning_warning = check_morning_suppression(obs_high_today, noaa_obs, nws_forecast, local_hour)
 conviction_result = check_market_conviction(kalshi_markets, ladder_text)
@@ -1451,16 +1443,16 @@ for w in sanity_warnings: st.error('⚠️ ' + w)
 
 if nws_forecast is None: st.error('NWS forecast unavailable — cannot run model.')
 elif high_uncertainty and source_gap is not None:
-    st.warning(f'HIGH UNCERTAINTY: NWS ({nws_forecast}F) vs GFS ({ensemble_mean}F) gap = {round(source_gap, 1)}F. Green signals suppressed.')
+    threshold = get_uncertainty_threshold(city)
+    st.warning(f'HIGH UNCERTAINTY: NWS ({nws_forecast}F) vs GFS ({ensemble_mean}F) gap = {round(source_gap, 1)}F (threshold: {threshold}F). Green signals suppressed.')
 elif source_gap is not None and source_gap > 4.0:
     st.info(f'Source gap: NWS vs Ensemble = {round(source_gap, 1)}F — moderate divergence.')
 
 cold_front_warning = check_cold_front_warning(obs_high_raw, noaa_obs, nws_forecast, local_hour)
 if morning_suppressed:
-    # Merge cold front + suppression into one warning to avoid redundancy
     combined = f'⚠️ Signal suppression active: No obs high + current temp ({round(noaa_obs, 1)}F) is {round(nws_forecast - noaa_obs, 1)}F below NWS forecast ({nws_forecast}F) in morning hours. High may have already occurred — green signals suppressed. Verify manually before betting.'
     if cold_front_warning:
-        combined = cold_front_warning  # cold front is more specific, use it
+        combined = cold_front_warning
     st.error(combined)
 elif cold_front_warning:
     st.warning(cold_front_warning)
@@ -1526,7 +1518,9 @@ if forecast is not None and current is not None:
         effective_weight = int(gfs_weight_pct * 0.5) if used_nbm else gfs_weight_pct
         st.caption(f'GFS ensemble: {ensemble_mean}F | {len(ensemble_members)} members | weight {effective_weight}%' +
                    (' (halved — NBM active)' if used_nbm else ''))
-    if high_uncertainty: st.caption('High uncertainty mode — green signals suppressed')
+    if high_uncertainty:
+        threshold = get_uncertainty_threshold(city)
+        st.caption(f'High uncertainty mode — gap {round(source_gap,1)}F exceeds {threshold}F threshold — green signals suppressed')
     if morning_suppressed: st.caption('⚠️ Morning suppression active — no obs high + temp well below forecast')
 
     import pandas as pd
