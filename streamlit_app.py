@@ -1,12 +1,13 @@
-# Kalshi High Temperature Model - V5.3
+# Kalshi High Temperature Model - V5.4
 #
-# Changes from V5.2:
-# 1. Merged cold front warning + signal suppression into single warning
-#    (were showing identical info twice)
-# 2. NBM unavailable — shrunk to st.caption instead of full warning box
-# 3. Obs high table now shows 6-hour max column value when available
-#    (intra-hour peaks can exceed hourly Air readings — Phoenix April 5 lesson)
-# 4. NYC data feed — added grid point validation to catch wrong-day forecasts
+# Changes from V5.3:
+# 1. NWS forecast fix — switched to hourly endpoint for accurate daytime high
+#    Root cause of Boston/NYC/Philly 10-20F misses: daily forecast fallback was
+#    grabbing nighttime lows. Hourly endpoint finds true daytime max.
+# 2. NBM — attempt via NWS FTP server (last untried source)
+# 3. Removed boundary risk warning entirely
+# 4. Added Chicago (KXHIGHTCHI, KORD station, America/Chicago timezone)
+# 5. Source gap info box — only shows when gap > 4F (reduced noise)
 
 import math, re, json, time, requests
 import streamlit as st
@@ -15,8 +16,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V5.3', layout='wide')
-st.title('Kalshi High Temperature Model - V5.3')
+st.set_page_config(page_title='Kalshi High Temp V5.4', layout='wide')
+st.title('Kalshi High Temperature Model - V5.4')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -24,7 +25,7 @@ PRICE_CACHE_FILE = Path('price_cache.json')
 PRICE_CACHE_MINUTES = 10
 
 MIN_EDGE = 8
-HEADERS = {'User-Agent': 'kalshi-temp-model/5.3', 'Accept': 'application/geo+json, application/json, text/html'}
+HEADERS = {'User-Agent': 'kalshi-temp-model/5.4', 'Accept': 'application/geo+json, application/json, text/html'}
 
 CITY_TZ = {
     'Phoenix': 'America/Phoenix', 'Las Vegas': 'America/Los_Angeles',
@@ -35,7 +36,7 @@ CITY_TZ = {
     'New Orleans': 'America/Chicago', 'Philadelphia': 'America/New_York',
     'Boston': 'America/New_York', 'Denver': 'America/Denver',
     'Oklahoma City': 'America/Chicago', 'Minneapolis': 'America/Chicago',
-    'Washington DC': 'America/New_York',
+    'Washington DC': 'America/New_York', 'Chicago': 'America/Chicago',
 }
 
 SERIES = {
@@ -47,7 +48,7 @@ SERIES = {
     'New Orleans': 'KXHIGHTNOLA', 'Philadelphia': 'KXHIGHPHIL',
     'Boston': 'KXHIGHTBOS', 'Denver': 'KXHIGHDEN',
     'Oklahoma City': 'KXHIGHTOKC', 'Minneapolis': 'KXHIGHTMIN',
-    'Washington DC': 'KXHIGHTDC',
+    'Washington DC': 'KXHIGHTDC', 'Chicago': 'KXHIGHTCHI',
 }
 
 STATIONS = {
@@ -56,7 +57,7 @@ STATIONS = {
     'Atlanta': 'CLIATL', 'Miami': 'CLIMIA', 'New York': 'KNYC',
     'San Antonio': 'CLISAT', 'New Orleans': 'CLIMSY', 'Philadelphia': 'CLIPHL',
     'Boston': 'CLIBOS', 'Denver': 'CLIDEN', 'Oklahoma City': 'CLIOKC',
-    'Minneapolis': 'CLIMSP', 'Washington DC': 'CLIDCA',
+    'Minneapolis': 'CLIMSP', 'Washington DC': 'CLIDCA', 'Chicago': 'KORD',
 }
 
 OBHISTORY_STATIONS = {
@@ -65,7 +66,7 @@ OBHISTORY_STATIONS = {
     'Atlanta': 'KATL', 'Miami': 'KMIA', 'New York': 'KNYC',
     'San Antonio': 'KSAT', 'New Orleans': 'KMSY', 'Philadelphia': 'KPHL',
     'Boston': 'KBOS', 'Denver': 'KDEN', 'Oklahoma City': 'KOKC',
-    'Minneapolis': 'KMSP', 'Washington DC': 'KDCA',
+    'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KORD',
 }
 
 # Iowa State CLI JSON API uses ICAO station IDs
@@ -75,7 +76,7 @@ CLI_STATIONS = {
     'Atlanta': 'KATL', 'Miami': 'KMIA', 'New York': 'KNYC',
     'San Antonio': 'KSAT', 'New Orleans': 'KMSY', 'Philadelphia': 'KPHL',
     'Boston': 'KBOS', 'Denver': 'KDEN', 'Oklahoma City': 'KOKC',
-    'Minneapolis': 'KMSP', 'Washington DC': 'KDCA',
+    'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KORD',
 }
 
 WUNDERGROUND_URLS = {
@@ -96,6 +97,7 @@ WUNDERGROUND_URLS = {
     'Oklahoma City': 'https://www.wunderground.com/weather/KOKC',
     'Minneapolis': 'https://www.wunderground.com/weather/KMSP',
     'Washington DC': 'https://www.wunderground.com/weather/KDCA',
+    'Chicago': 'https://www.wunderground.com/weather/KORD',
 }
 
 SETTLEMENT_LOCATION = {
@@ -107,7 +109,7 @@ SETTLEMENT_LOCATION = {
     'New Orleans': 'New Orleans Armstrong Airport', 'Philadelphia': 'Philadelphia International Airport',
     'Boston': 'Boston Logan Airport', 'Denver': 'Denver International Airport',
     'Oklahoma City': 'Oklahoma City Will Rogers Airport', 'Minneapolis': 'Minneapolis-St. Paul Airport',
-    'Washington DC': 'Reagan National Airport',
+    'Washington DC': 'Reagan National Airport', 'Chicago': 'Chicago O\'Hare Airport',
 }
 
 CITIES = {
@@ -119,7 +121,7 @@ CITIES = {
     'New Orleans': {'lat': 29.9934, 'lon': -90.2580}, 'Philadelphia': {'lat': 39.8744, 'lon': -75.2424},
     'Boston': {'lat': 42.3656, 'lon': -71.0096}, 'Denver': {'lat': 39.8561, 'lon': -104.6737},
     'Oklahoma City': {'lat': 35.3931, 'lon': -97.6007}, 'Minneapolis': {'lat': 44.8848, 'lon': -93.2223},
-    'Washington DC': {'lat': 38.8512, 'lon': -77.0402},
+    'Washington DC': {'lat': 38.8512, 'lon': -77.0402}, 'Chicago': {'lat': 41.9742, 'lon': -87.9073},
 }
 
 DEFAULT_LADDERS = {
@@ -140,13 +142,15 @@ DEFAULT_LADDERS = {
     'Oklahoma City': '75 or below | 76-77 | 78-79 | 80-81 | 82-83 | 84 or above',
     'Minneapolis': '65 or below | 66-67 | 68-69 | 70-71 | 72-73 | 74 or above',
     'Washington DC': '76 or below | 77-78 | 79-80 | 81-82 | 83-84 | 85 or above',
+    'Chicago': '46 or below | 47-48 | 49-50 | 51-52 | 53-54 | 55 or above',
 }
 
 BASE_SIGMA = {
     'New York': 1.8, 'Philadelphia': 1.8, 'Washington DC': 1.9, 'Boston': 1.9,
     'Los Angeles': 1.7, 'Denver': 1.9, 'Miami': 2.0, 'Minneapolis': 2.1,
     'New Orleans': 2.1, 'Phoenix': 2.2, 'Las Vegas': 2.2, 'Atlanta': 2.3,
-    'Dallas': 2.3, 'Austin': 2.3, 'Houston': 2.3, 'San Antonio': 2.3, 'Oklahoma City': 2.5,
+    'Dallas': 2.3, 'Austin': 2.3, 'Houston': 2.3, 'San Antonio': 2.3,
+    'Oklahoma City': 2.5, 'Chicago': 2.1,
 }
 
 DESERT_CITIES = {'Phoenix', 'Las Vegas'}
@@ -158,7 +162,7 @@ GFS_CITY_WEIGHT = {
     'Dallas': 0.25, 'Austin': 0.25, 'San Antonio': 0.25, 'Oklahoma City': 0.25,
     'Atlanta': 0.22, 'Washington DC': 0.22,
     'New York': 0.25, 'Philadelphia': 0.25, 'Boston': 0.25,
-    'Denver': 0.22, 'Minneapolis': 0.22,
+    'Denver': 0.22, 'Minneapolis': 0.22, 'Chicago': 0.22,
 }
 
 # ── Supabase ──────────────────────────────────────────────────────────────────
@@ -340,6 +344,11 @@ def compute_bias_correction_db(city, n_recent=10):
 # ── V5.2 NBM — NOMADS bulk file ───────────────────────────────────────────────
 @st.cache_data(ttl=1800)
 def fetch_nbm_percentiles(lat, lon):
+    """
+    V5.4: Try NWS FTP server first (new attempt), then NOMADS bulk file.
+    FTP uses a different protocol that may not be blocked by Streamlit Cloud.
+    FTP URL: ftp://tgftp.nws.noaa.gov/data/raw/cd/cdus45.knbm.nbptx.txt
+    """
     city_name = None
     best_dist = float('inf')
     for c, coords in CITIES.items():
@@ -350,45 +359,65 @@ def fetch_nbm_percentiles(lat, lon):
     icao = OBHISTORY_STATIONS.get(city_name, '')
     if not icao: return None
 
-    now_utc = datetime.utcnow()
-    date_str = now_utc.strftime('%Y%m%d')
-    utc_hour = now_utc.hour
-    yesterday = (now_utc - timedelta(days=1)).strftime('%Y%m%d')
-
-    if utc_hour >= 19: cycles = [('19', date_str), ('13', date_str), ('07', date_str), ('01', date_str)]
-    elif utc_hour >= 13: cycles = [('13', date_str), ('07', date_str), ('01', date_str)]
-    elif utc_hour >= 7: cycles = [('07', date_str), ('01', date_str)]
-    else: cycles = [('01', date_str)]
-    cycles.append(('19', yesterday))
-
     station_block = None
-    for cyc, ds in cycles:
-        url = f'https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.{ds}/{cyc}/text/blend_nbptx.t{cyc}z'
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=20, stream=True)
-            if r.status_code != 200: continue
-            content = ''
-            found = False
-            for chunk in r.iter_content(chunk_size=65536, decode_unicode=True):
-                if chunk:
-                    content += chunk
-                    if icao + ' ' in content and 'TXNP' in content:
-                        found = True
-                        break
-                    if len(content) > 5_000_000: break
-            if found:
-                lines = content.split('\n')
-                start_idx = None
-                for i, line in enumerate(lines):
-                    if line.strip().startswith(icao) and 'NBM' in line:
-                        start_idx = i
-                        break
-                if start_idx is not None:
-                    station_block = '\n'.join(lines[start_idx:start_idx+60])
+
+    # Attempt 1: NWS FTP server
+    try:
+        import ftplib
+        import io
+        ftp = ftplib.FTP('tgftp.nws.noaa.gov', timeout=15)
+        ftp.login()
+        buf = io.BytesIO()
+        ftp.retrbinary('RETR /data/raw/cd/cdus45.knbm.nbptx.txt', buf.write)
+        ftp.quit()
+        content = buf.getvalue().decode('utf-8', errors='ignore')
+        if icao in content and 'TXNP' in content:
+            lines = content.split('\n')
+            for i, line in enumerate(lines):
+                if line.strip().startswith(icao) and 'NBM' in line:
+                    station_block = '\n'.join(lines[i:i+60])
                     break
-        except Exception: continue
+    except Exception:
+        pass
+
+    # Attempt 2: NOMADS bulk file
+    if not station_block:
+        now_utc = datetime.utcnow()
+        date_str = now_utc.strftime('%Y%m%d')
+        utc_hour = now_utc.hour
+        yesterday = (now_utc - timedelta(days=1)).strftime('%Y%m%d')
+
+        if utc_hour >= 19: cycles = [('19', date_str), ('13', date_str), ('07', date_str), ('01', date_str)]
+        elif utc_hour >= 13: cycles = [('13', date_str), ('07', date_str), ('01', date_str)]
+        elif utc_hour >= 7: cycles = [('07', date_str), ('01', date_str)]
+        else: cycles = [('01', date_str)]
+        cycles.append(('19', yesterday))
+
+        for cyc, ds in cycles:
+            url = f'https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.{ds}/{cyc}/text/blend_nbptx.t{cyc}z'
+            try:
+                r = requests.get(url, headers=HEADERS, timeout=20, stream=True)
+                if r.status_code != 200: continue
+                content = ''
+                found = False
+                for chunk in r.iter_content(chunk_size=65536, decode_unicode=True):
+                    if chunk:
+                        content += chunk
+                        if icao + ' ' in content and 'TXNP' in content:
+                            found = True
+                            break
+                        if len(content) > 5_000_000: break
+                if found:
+                    lines = content.split('\n')
+                    for i, line in enumerate(lines):
+                        if line.strip().startswith(icao) and 'NBM' in line:
+                            station_block = '\n'.join(lines[i:i+60])
+                            break
+                    if station_block: break
+            except Exception: continue
 
     if not station_block: return None
+
     lines = station_block.split('\n')
 
     def parse_nbm_line(lines, key):
@@ -561,28 +590,58 @@ def fetch_nws_grid(lat, lon):
     except Exception: return None
 
 def fetch_nws_forecast(lat, lon):
+    """
+    V5.4: Switched to hourly forecast endpoint to get accurate daytime high.
+    Root cause of northeast city misses: daily forecast fallback was grabbing
+    nighttime lows instead of daytime highs. Hourly endpoint lets us find
+    the true max temperature for today specifically.
+    """
     grid = fetch_nws_grid(lat, lon)
     if not grid: return None, None
-    _, _, _, fc_url = grid
+    office, gx, gy, _ = grid
+    # Use hourly endpoint for accurate temperatures
+    hourly_url = f'https://api.weather.gov/gridpoints/{office}/{gx},{gy}/forecast/hourly'
     try:
-        r = requests.get(fc_url, headers=HEADERS, timeout=12)
+        r = requests.get(hourly_url, headers=HEADERS, timeout=12)
         r.raise_for_status()
         periods = r.json().get('properties', {}).get('periods', [])
-    except Exception: return None, None
+    except Exception:
+        # Fall back to daily endpoint
+        fc_url = f'https://api.weather.gov/gridpoints/{office}/{gx},{gy}/forecast'
+        try:
+            r = requests.get(fc_url, headers=HEADERS, timeout=12)
+            r.raise_for_status()
+            periods = r.json().get('properties', {}).get('periods', [])
+        except Exception:
+            return None, hourly_url
+
     today = get_eastern_date()
+    # Find max temperature across all daytime hours today
+    today_highs = []
+    for period in periods:
+        start = period.get('startTime', '')
+        temp = period.get('temperature')
+        unit = period.get('temperatureUnit', 'F')
+        is_day = period.get('isDaytime', True)
+        if not start.startswith(today):
+            continue
+        if temp is not None and is_day:
+            temp_f = float(temp) if unit == 'F' else float(temp) * 9/5 + 32
+            today_highs.append(temp_f)
+
+    if today_highs:
+        return round(max(today_highs), 1), hourly_url
+
+    # Fallback: find any daytime period for today
     for period in periods:
         start = period.get('startTime', '')
         is_day = period.get('isDaytime', False)
         temp = period.get('temperature')
         unit = period.get('temperatureUnit', 'F')
         if start.startswith(today) and is_day and temp is not None:
-            return round(float(temp) if unit == 'F' else float(temp) * 9/5 + 32, 1), fc_url
-    for period in periods[:2]:
-        temp = period.get('temperature')
-        unit = period.get('temperatureUnit', 'F')
-        if temp is not None:
-            return round(float(temp) if unit == 'F' else float(temp) * 9/5 + 32, 1), fc_url
-    return None, None
+            return round(float(temp) if unit == 'F' else float(temp) * 9/5 + 32, 1), hourly_url
+
+    return None, hourly_url
 
 def fetch_nws_current(lat, lon, station_id):
     if station_id:
@@ -1151,11 +1210,12 @@ with st.sidebar:
     st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble >5F')
     st.markdown('🔵 Ensemble HIGH confidence')
     st.markdown('---')
-    st.markdown('**V5.3 Changes**')
-    st.markdown('- Cold front + suppression merged into single warning')
-    st.markdown('- NBM unavailable → caption only (no warning box)')
-    st.markdown('- Obs high now uses 6-hour max when higher than hourly readings')
-    st.markdown('- Market conviction check: >70% suppresses conflicts')
+    st.markdown('**V5.4 Changes**')
+    st.markdown('- NWS forecast: switched to hourly endpoint (fixes northeast city misses)')
+    st.markdown('- NBM: FTP attempt + NOMADS fallback')
+    st.markdown('- Boundary risk warning removed')
+    st.markdown('- Chicago added (18 cities total)')
+    st.markdown('- Source gap info only shows when >4F')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1359,7 +1419,7 @@ for w in sanity_warnings: st.error('⚠️ ' + w)
 if nws_forecast is None: st.error('NWS forecast unavailable — cannot run model.')
 elif high_uncertainty and source_gap is not None:
     st.warning(f'HIGH UNCERTAINTY: NWS ({nws_forecast}F) vs GFS ({ensemble_mean}F) gap = {round(source_gap, 1)}F. Green signals suppressed.')
-elif source_gap is not None and source_gap > 2.5:
+elif source_gap is not None and source_gap > 4.0:
     st.info(f'Source gap: NWS vs Ensemble = {round(source_gap, 1)}F — moderate divergence.')
 
 cold_front_warning = check_cold_front_warning(obs_high_raw, noaa_obs, nws_forecast, local_hour)
@@ -1396,8 +1456,6 @@ obs_high_final = override_obs_high if override_obs_high > 0 else obs_high_today
 if forecast is not None and current is not None:
     consensus_raw = compute_consensus(forecast, current, noaa_final, city, obs_high=obs_high_final)
     consensus = round(consensus_raw + bias_correction, 1)
-
-    for bw in check_bracket_boundary(consensus, ladder_text): st.warning(bw)
 
     prob_rows, prob_label, used_nbm = bracket_probs_nbm(consensus, ladder_text, city, nbm_percentiles, obs_high=obs_high_final, forecast=forecast)
     _, sigma = bracket_probs(consensus, ladder_text, city, obs_high=obs_high_final, forecast=forecast)
@@ -1633,7 +1691,7 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
         n_yes = sum(1 for r in summary_rows if r['Best YES'] != '—')
         n_no = sum(1 for r in summary_rows if r['Best NO'] != '—')
         n_nbm = sum(1 for r in summary_rows if '✅' in r.get('Prob Src', ''))
-        status_icon = '✅' if n_saved_total == 17 else '⏳'
-        st.caption(f'{status_icon} {n_saved_total}/17 cities | 🟢 {n_yes} YES signals | 🟢 {n_no} NO signals | ✅ {n_nbm} NBM active today')
+        status_icon = '✅' if n_saved_total == 18 else '⏳'
+        st.caption(f'{status_icon} {n_saved_total}/18 cities | 🟢 {n_yes} YES signals | 🟢 {n_no} NO signals | ✅ {n_nbm} NBM active today')
     else:
         st.info('Loading predictions for all cities — this panel fills itself in automatically.')
