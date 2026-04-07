@@ -1,16 +1,14 @@
-# Kalshi High Temperature Model - V5.6
+# Kalshi High Temperature Model - V5.7
 #
-# Changes from V5.5:
-# 1. NBM UTC→local hour fix: valid_time was being filtered in UTC, starving
-#    Phoenix/LA/San Antonio/Philadelphia/Washington DC of NBM data points.
-#    Now converts to city local time before applying 6am-9pm daytime filter.
-# 2. GFS weight reduced for northeast cities (NY/BOS/PHL/DC): 0.25 → 0.15
-#    GFS runs cold in spring for coastal northeast — reducing its influence.
-# 3. High uncertainty threshold widened for northeast/coastal cities:
-#    5.0F → 6.5F for NY, Boston, Philadelphia, DC, LA, Boston in months 3-5.
-#    Prevents routine spring GFS spread from suppressing all signals.
-# 4. Bias correction window increased from n_recent=10 to n_recent=14
-#    More data points = more stable correction, less sensitivity to single outliers.
+# Changes from V5.6:
+# 1. NBM minimum runs 2 → 1: accept single NBM run for Phoenix/San Antonio/DC
+# 2. LA uncertainty threshold 6.5F → 7.0F: marine layer causes routine GFS divergence
+# 3. MAE column in all-cities panel: shows per-city calibration health
+# 4. Late day floor multiplier increased for northeast cities:
+#    0.62/0.78 → 0.75/0.88 — catches warm surges earlier in the day
+# 5. NWS forecast trend check: stores previous NWS fetch in session state,
+#    flags and boosts consensus if NWS is trending up between fetches
+# 6. Chicago regional prior bias: uses Minneapolis avg error until 3 settlements exist
 
 import math, re, json, time, requests
 import streamlit as st
@@ -19,8 +17,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V5.6', layout='wide')
-st.title('Kalshi High Temperature Model - V5.6')
+st.set_page_config(page_title='Kalshi High Temp V5.7', layout='wide')
+st.title('Kalshi High Temperature Model - V5.7')
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -28,7 +26,7 @@ PRICE_CACHE_FILE = Path('price_cache.json')
 PRICE_CACHE_MINUTES = 10
 
 MIN_EDGE = 8
-HEADERS = {'User-Agent': 'kalshi-temp-model/5.6', 'Accept': 'application/geo+json, application/json, text/html'}
+HEADERS = {'User-Agent': 'kalshi-temp-model/5.7', 'Accept': 'application/geo+json, application/json, text/html'}
 WETHR_API_KEY = '71ef19703ff3d73d3773cc339284915f40e3faf268aea7e712649d0695139a1c'
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
 
@@ -183,6 +181,15 @@ GFS_CITY_WEIGHT = {
 # GFS spread is routinely wider for these cities in spring, 5F threshold too tight
 SPRING_WIDE_THRESHOLD_CITIES = {'New York', 'Philadelphia', 'Boston', 'Washington DC', 'Los Angeles'}
 
+# V5.7: Northeast cities get more aggressive late-day floor multipliers
+NORTHEAST_CITIES = {'New York', 'Philadelphia', 'Boston', 'Washington DC'}
+
+# V5.7: Regional prior bias — used for cities with < 3 settlements
+# Chicago inherits Minneapolis prior until it has its own data
+REGIONAL_PRIOR_BIAS = {
+    'Chicago': 'Minneapolis',
+}
+
 # ── Supabase ──────────────────────────────────────────────────────────────────
 _SB_URL = 'https://oirnfhhuyjuotkrlymxd.supabase.co'
 _SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9pcm5maGh1eWp1b3Rrcmx5bXhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDIzMDYyMjAsImV4cCI6MjA1NzgyNjIyMH0.3Mp81UjdxkpAYq_cuaOa-0Vqo1LkMgxawOM1gWF6TJ0'
@@ -335,10 +342,22 @@ def run_auto_settlement():
 
 # ── Bias Correction ───────────────────────────────────────────────────────────
 # V5.6: increased n_recent from 10 → 14 for more stable correction
+# V5.7: regional prior bias for cities with < 3 settlements
 def compute_bias_correction_db(city, n_recent=14):
     rows = sb_fetch_city(city)
     complete = [r for r in rows if r.get('actual') is not None and r.get('consensus') is not None]
-    if len(complete) < 3: return 0.0, len(complete)
+    if len(complete) < 3:
+        # V5.7: use regional prior if available
+        prior_city = REGIONAL_PRIOR_BIAS.get(city)
+        if prior_city:
+            prior_rows = sb_fetch_city(prior_city)
+            prior_complete = [r for r in prior_rows if r.get('actual') is not None and r.get('consensus') is not None]
+            if len(prior_complete) >= 3:
+                recent = prior_complete[-n_recent:]
+                errors = [r['actual'] - r['consensus'] for r in recent]
+                mean_error = sum(errors) / len(errors)
+                return round(max(-3.0, min(3.0, mean_error)), 2), len(complete)
+        return 0.0, len(complete)
     recent = complete[-n_recent:]
     errors = [r['actual'] - r['consensus'] for r in recent]
     mean_error = sum(errors) / len(errors)
@@ -348,10 +367,11 @@ def compute_bias_correction_db(city, n_recent=14):
 def get_uncertainty_threshold(city):
     """
     V5.6: Wider threshold for northeast/coastal cities in spring (months 3-5).
-    GFS spread is routinely 5-7F wider for these cities in spring transition.
-    Using 6.5F instead of 5.0F prevents routine GFS variance from suppressing all signals.
+    V5.7: LA gets 7.0F — marine layer causes routine GFS divergence, not real uncertainty.
     """
     month = datetime.now().month
+    if city == 'Los Angeles' and 3 <= month <= 5:
+        return 7.0
     if city in SPRING_WIDE_THRESHOLD_CITIES and 3 <= month <= 5:
         return 6.5
     if city in DESERT_CITIES:
@@ -422,7 +442,8 @@ def fetch_nbm_percentiles(lat, lon):
         if not run_highs: return None
 
         run_max_temps = [max(temps) for temps in run_highs.values() if temps]
-        if len(run_max_temps) < 2: return None
+        # V5.7: reduced from 2 → 1, accept single NBM run for cities with fewer runs available
+        if len(run_max_temps) < 1: return None
 
         run_max_temps.sort()
 
@@ -908,9 +929,13 @@ def choose_sigma(city, obs_high=None, forecast=None):
         elif gap < 4: s *= 0.90
     return max(1.30, min(2.80, s))
 
-def late_day_floor(fc, obs, local_hour):
+def late_day_floor(fc, obs, local_hour, city=''):
     gap = max(0.0, fc - obs)
-    frac = 0.45 if local_hour < 12 else 0.62 if local_hour < 14 else 0.78 if local_hour < 16 else 0.90
+    # V5.7: northeast cities get more aggressive floor — catches warm surges earlier
+    if city in NORTHEAST_CITIES:
+        frac = 0.50 if local_hour < 12 else 0.75 if local_hour < 14 else 0.88 if local_hour < 16 else 0.93
+    else:
+        frac = 0.45 if local_hour < 12 else 0.62 if local_hour < 14 else 0.78 if local_hour < 16 else 0.90
     return obs + frac * gap
 
 def compute_consensus(fc, cur, noaa, city, obs_high=None):
@@ -934,7 +959,7 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
         base = fc * 0.45 + cur * 0.25 + noaa * 0.30 if noaa is not None else fc * 0.60 + cur * 0.40
     if abs(base - fc) > 4.0: base = fc - 4.0 if base < fc else fc + 4.0
     obs = noaa if noaa is not None else cur
-    if obs is not None: consensus = max(base, late_day_floor(fc, obs, local_hour))
+    if obs is not None: consensus = max(base, late_day_floor(fc, obs, local_hour, city))
     else: consensus = base
     if obs_high is not None and obs_high > consensus: consensus = obs_high
     return consensus
@@ -1365,6 +1390,19 @@ with st.spinner('Fetching weather data...'):
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
     nbm_percentiles = fetch_nbm_percentiles(lat, lon)
 
+# V5.7: NWS forecast trend check
+# Store previous NWS fetch per city in session state, detect upward trend
+nws_trend_key = f'nws_prev_{city}_{get_eastern_date()}'
+nws_trend_up = False
+nws_trend_delta = None
+if nws_forecast is not None:
+    prev_nws = st.session_state.get(nws_trend_key)
+    if prev_nws is not None and nws_forecast > prev_nws + 1.0:
+        nws_trend_up = True
+        nws_trend_delta = round(nws_forecast - prev_nws, 1)
+    # Update stored value
+    st.session_state[nws_trend_key] = nws_forecast
+
 sanity_warnings = []
 obs_high_today = obs_high_raw
 obs_high_suspect = False
@@ -1441,6 +1479,10 @@ else:
 
 for w in sanity_warnings: st.error('⚠️ ' + w)
 
+# V5.7: NWS trend up warning
+if nws_trend_up and nws_trend_delta is not None:
+    st.info(f'📈 NWS forecast trending UP +{nws_trend_delta}F since last fetch — model will boost consensus accordingly.')
+
 if nws_forecast is None: st.error('NWS forecast unavailable — cannot run model.')
 elif high_uncertainty and source_gap is not None:
     threshold = get_uncertainty_threshold(city)
@@ -1480,7 +1522,10 @@ obs_high_final = override_obs_high if override_obs_high > 0 else obs_high_today
 
 if forecast is not None and current is not None:
     consensus_raw = compute_consensus(forecast, current, noaa_final, city, obs_high=obs_high_final)
-    consensus = round(consensus_raw + bias_correction, 1)
+    bias_correction, bias_n = compute_bias_correction_db(city)
+    # V5.7: if NWS is trending up, apply a partial boost to consensus
+    trend_boost = round(nws_trend_delta * 0.4, 1) if nws_trend_up and nws_trend_delta else 0.0
+    consensus = round(consensus_raw + bias_correction + trend_boost, 1)
 
     prob_rows, prob_label, used_nbm = bracket_probs_nbm(consensus, ladder_text, city, nbm_percentiles, obs_high=obs_high_final, forecast=forecast)
     _, sigma = bracket_probs(consensus, ladder_text, city, obs_high=obs_high_final, forecast=forecast)
@@ -1703,6 +1748,17 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
                 nbm_percentiles=nbm_pcts, current_temp=c_temp, nws_forecast=c_fc, local_hour=c_hour)
             bias_str = ('+' if bc_val and bc_val > 0 else '') + str(bc_val) + 'F' if bc_val and bc_val != 0.0 else '—'
 
+            # V5.7: MAE column — shows per-city calibration health
+            city_rows = sb_fetch_city(c)
+            city_complete = [row for row in city_rows if row.get('actual') is not None and row.get('error') is not None]
+            if city_complete:
+                city_errors = [abs(row['error']) for row in city_complete]
+                city_mae = round(sum(city_errors) / len(city_errors), 1)
+                mae_icon = '✅' if city_mae < 2.5 else '🟡' if city_mae < 4.0 else '🔴'
+                mae_str = f'{mae_icon} {city_mae}F'
+            else:
+                mae_str = '—'
+
             summary_rows.append({
                 'City': c, 'Consensus': str(consensus_val)+'F' if consensus_val else '—',
                 'NWS': str(r.get('forecast', ''))+'F' if r.get('forecast') else '—',
@@ -1710,7 +1766,8 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
                 'Gap': str(round(r['source_gap'], 1))+'F' if r.get('source_gap') else '—',
                 '⚠️': '⚠️' if r.get('high_uncertainty') else '✅',
                 'Ens Key': ens_key if ens_key else '—', 'Prob Src': nbm_status,
-                'Bias Adj': bias_str, 'Best YES': best_yes, 'Best NO': best_no,
+                'Bias Adj': bias_str, 'MAE': mae_str,
+                'Best YES': best_yes, 'Best NO': best_no,
             })
 
         st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
