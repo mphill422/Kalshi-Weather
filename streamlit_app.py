@@ -1,14 +1,11 @@
-# Kalshi High Temperature Model - V5.7
+# Kalshi High Temperature Model - V5.8
 #
-# Changes from V5.6:
-# 1. NBM minimum runs 2 → 1: accept single NBM run for Phoenix/San Antonio/DC
-# 2. LA uncertainty threshold 6.5F → 7.0F: marine layer causes routine GFS divergence
-# 3. MAE column in all-cities panel: shows per-city calibration health
-# 4. Late day floor multiplier increased for northeast cities:
-#    0.62/0.78 → 0.75/0.88 — catches warm surges earlier in the day
-# 5. NWS forecast trend check: stores previous NWS fetch in session state,
-#    flags and boosts consensus if NWS is trending up between fetches
-# 6. Chicago regional prior bias: uses Minneapolis avg error until 3 settlements exist
+# Changes from V5.7:
+# 1. Trading terminal UI — dark theme, green accents, Inter/JetBrains Mono fonts
+# 2. Hero header with live status indicator and version badge
+# 3. Live stats bar — cities loaded, ladders synced, settlements today, last sync
+# 4. Mobile-responsive layout — all stats bars wrap on small screens
+# 5. Cleaned section headers, styled buttons, metric cards, expanders
 
 import math, re, json, time, requests
 import streamlit as st
@@ -17,8 +14,249 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title='Kalshi High Temp V5.7', layout='wide')
-st.title('Kalshi High Temperature Model - V5.7')
+st.set_page_config(page_title='MPH Weather Model', layout='wide', page_icon='🌡️')
+
+# ── Custom CSS — V5.8 Trading Terminal Style ──────────────────────────────────
+st.markdown("""
+<style>
+/* ── Global ── */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif;
+}
+
+/* ── Hide default Streamlit chrome ── */
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+
+/* ── Main background ── */
+.stApp {
+    background: #0a0e1a;
+}
+
+/* ── Hero header ── */
+.mph-hero {
+    background: linear-gradient(135deg, #0d1b2a 0%, #1a2744 50%, #0d1b2a 100%);
+    border: 1px solid #1e3a5f;
+    border-radius: 12px;
+    padding: 24px 32px;
+    margin-bottom: 20px;
+    position: relative;
+    overflow: hidden;
+}
+.mph-hero::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, #00ff88, #00b4d8, #00ff88);
+}
+.mph-hero-title {
+    font-size: 28px;
+    font-weight: 700;
+    color: #ffffff;
+    letter-spacing: -0.5px;
+    margin: 0 0 4px 0;
+    font-family: 'Inter', sans-serif;
+}
+.mph-hero-sub {
+    font-size: 13px;
+    color: #64748b;
+    font-family: 'JetBrains Mono', monospace;
+    margin: 0;
+}
+.mph-version-badge {
+    display: inline-block;
+    background: #00ff8820;
+    border: 1px solid #00ff8840;
+    color: #00ff88;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 10px;
+    border-radius: 20px;
+    font-family: 'JetBrains Mono', monospace;
+    margin-left: 10px;
+    vertical-align: middle;
+}
+.mph-live-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    background: #00ff88;
+    border-radius: 50%;
+    margin-right: 6px;
+    animation: pulse 2s infinite;
+}
+@keyframes pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.3; }
+    100% { opacity: 1; }
+}
+
+/* ── Stats bar ── */
+.mph-stats-bar {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+}
+.mph-stat {
+    background: #0d1b2a;
+    border: 1px solid #1e3a5f;
+    border-radius: 8px;
+    padding: 12px 18px;
+    flex: 1;
+    min-width: 120px;
+    text-align: center;
+}
+.mph-stat-value {
+    font-size: 22px;
+    font-weight: 700;
+    color: #00ff88;
+    font-family: 'JetBrains Mono', monospace;
+    display: block;
+    line-height: 1.2;
+}
+.mph-stat-label {
+    font-size: 11px;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    display: block;
+    margin-top: 4px;
+}
+.mph-stat-warn .mph-stat-value { color: #f59e0b; }
+.mph-stat-alert .mph-stat-value { color: #ef4444; }
+.mph-stat-neutral .mph-stat-value { color: #94a3b8; }
+
+/* ── Section headers ── */
+.mph-section-header {
+    font-size: 13px;
+    font-weight: 600;
+    color: #94a3b8;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    padding: 0 0 8px 0;
+    border-bottom: 1px solid #1e3a5f;
+    margin-bottom: 16px;
+    font-family: 'Inter', sans-serif;
+}
+
+/* ── Metric cards ── */
+.stMetric {
+    background: #0d1b2a !important;
+    border: 1px solid #1e3a5f !important;
+    border-radius: 8px !important;
+    padding: 12px !important;
+}
+.stMetric label {
+    color: #64748b !important;
+    font-size: 11px !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.8px !important;
+}
+.stMetric [data-testid="stMetricValue"] {
+    color: #ffffff !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 20px !important;
+}
+
+/* ── Dataframe ── */
+.stDataFrame {
+    border: 1px solid #1e3a5f !important;
+    border-radius: 8px !important;
+    overflow: hidden !important;
+}
+
+/* ── Buttons ── */
+.stButton > button {
+    background: #1e3a5f !important;
+    color: #00ff88 !important;
+    border: 1px solid #00ff8840 !important;
+    border-radius: 6px !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.5px !important;
+    padding: 6px 16px !important;
+    transition: all 0.2s !important;
+}
+.stButton > button:hover {
+    background: #00ff8820 !important;
+    border-color: #00ff88 !important;
+}
+
+/* ── Selectbox ── */
+.stSelectbox > div > div {
+    background: #0d1b2a !important;
+    border: 1px solid #1e3a5f !important;
+    border-radius: 6px !important;
+    color: #ffffff !important;
+}
+
+/* ── Success/warning/info/error boxes ── */
+.stSuccess {
+    background: #00ff8810 !important;
+    border: 1px solid #00ff8840 !important;
+    border-radius: 6px !important;
+    color: #00ff88 !important;
+}
+.stWarning {
+    background: #f59e0b10 !important;
+    border: 1px solid #f59e0b40 !important;
+    border-radius: 6px !important;
+}
+.stInfo {
+    background: #00b4d810 !important;
+    border: 1px solid #00b4d840 !important;
+    border-radius: 6px !important;
+}
+.stError {
+    background: #ef444410 !important;
+    border: 1px solid #ef444440 !important;
+    border-radius: 6px !important;
+}
+
+/* ── Sidebar ── */
+[data-testid="stSidebar"] {
+    background: #0a0e1a !important;
+    border-right: 1px solid #1e3a5f !important;
+}
+[data-testid="stSidebar"] .stMarkdown {
+    color: #94a3b8 !important;
+}
+
+/* ── Expander ── */
+.streamlit-expanderHeader {
+    background: #0d1b2a !important;
+    border: 1px solid #1e3a5f !important;
+    border-radius: 6px !important;
+    color: #94a3b8 !important;
+    font-size: 13px !important;
+}
+
+/* ── Number input ── */
+.stNumberInput > div > div > input {
+    background: #0d1b2a !important;
+    border: 1px solid #1e3a5f !important;
+    color: #ffffff !important;
+    border-radius: 6px !important;
+    font-family: 'JetBrains Mono', monospace !important;
+}
+
+/* ── Mobile responsive ── */
+@media (max-width: 768px) {
+    .mph-hero { padding: 16px 20px; }
+    .mph-hero-title { font-size: 20px; }
+    .mph-stats-bar { gap: 8px; }
+    .mph-stat { padding: 10px 12px; min-width: 80px; }
+    .mph-stat-value { font-size: 18px; }
+    .mph-stat-label { font-size: 10px; }
+}
+</style>
+""", unsafe_allow_html=True)
 
 SAVE_FILE = Path('saved_ladders.json')
 LAST_SYNC_FILE = Path('last_sync.json')
@@ -1245,31 +1483,58 @@ def save_city_prediction(city, weather, saved_ladders):
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header('Kelly Settings')
-    bankroll = st.number_input('My Bankroll ($)', min_value=10.0, max_value=100000.0, value=500.0, step=10.0)
-    st.caption('Used to calculate optimal bet sizes.')
+    st.markdown('<div class="mph-section-header">⚙️ Kelly Settings</div>', unsafe_allow_html=True)
+    bankroll = st.number_input('Bankroll ($)', min_value=10.0, max_value=100000.0, value=500.0, step=10.0)
     st.markdown('---')
-    st.markdown('**Edge threshold:** ' + str(MIN_EDGE) + 'c minimum to bet')
+    st.markdown(f'**Edge threshold:** {MIN_EDGE}c minimum')
     st.markdown('**Kelly fraction:** 15% (conservative)')
     st.markdown('**Max per trade:** min(5% bankroll, $100)')
     st.markdown('---')
-    st.markdown('**Signal Key**')
-    st.markdown('🟢 Edge >=8c — **BET**')
-    st.markdown('🟡 Edge 3-7c — **SKIP**')
-    st.markdown('🔴 Edge <3c — **AVOID**')
-    st.markdown('🟡 SKIP (uncertain) — NWS vs Ensemble gap exceeded')
-    st.markdown('🔵 Ensemble HIGH confidence')
+    st.markdown('<div class="mph-section-header">📊 Signal Key</div>', unsafe_allow_html=True)
+    st.markdown('🟢 **BET** — Edge ≥8c')
+    st.markdown('🟡 **SKIP** — Edge 3-7c')
+    st.markdown('🔴 **AVOID** — Edge <3c')
+    st.markdown('⚪ **No price** — Unpriced bracket')
+    st.markdown('🔵 **HIGH** — Ensemble confident')
     st.markdown('---')
-    st.markdown('**V5.6 Changes**')
-    st.markdown('- NBM UTC→local time fix (Philadelphia, Phoenix, San Antonio, DC now get NBM)')
-    st.markdown('- GFS weight reduced for NY/BOS/PHL/DC: 0.25 → 0.15')
-    st.markdown('- Uncertainty threshold widened for northeast/LA in spring: 5.0F → 6.5F')
-    st.markdown('- Bias correction window: 10 → 14 days')
+    st.markdown('<div class="mph-section-header">🔬 MAE Guide</div>', unsafe_allow_html=True)
+    st.markdown('✅ **<2.5F** — Well calibrated')
+    st.markdown('🟡 **2.5-4F** — Acceptable')
+    st.markdown('🔴 **>4F** — Needs attention')
+    st.markdown('---')
+    st.markdown('<div class="mph-section-header">🚀 V5.8</div>', unsafe_allow_html=True)
+    st.markdown('- Trading terminal UI')
+    st.markdown('- Mobile-optimized layout')
+    st.markdown('- Live stats dashboard header')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
 today_str = get_eastern_date()
 last_sync_data = load_json(LAST_SYNC_FILE)
+
+# ── Hero Header ───────────────────────────────────────────────────────────────
+st.markdown(f"""
+<div class="mph-hero">
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+        <div>
+            <div class="mph-hero-title">
+                🌡️ MPH Weather Model
+                <span class="mph-version-badge">V5.8</span>
+            </div>
+            <div class="mph-hero-sub">
+                <span class="mph-live-dot"></span>
+                LIVE · Kalshi High Temperature · {today_str}
+            </div>
+        </div>
+        <div style="text-align:right;">
+            <div style="font-size:11px; color:#64748b; font-family:'JetBrains Mono',monospace;">
+                SETTLEMENT SOURCE<br>
+                <span style="color:#94a3b8; font-size:13px;">Iowa State CLI + Wethr.net</span>
+            </div>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 with st.spinner('Checking for unsettled predictions...'):
     n_settled, settled_rows = run_auto_settlement()
@@ -1301,6 +1566,35 @@ else:
             st.success('Re-synced ' + str(len(results.get('synced', []))) + '/' + str(len(SERIES)) + ' city ladders')
             if results.get('failed'): st.warning('Could not fetch: ' + ', '.join(results['failed']))
             st.rerun()
+
+# ── Live Stats Bar ────────────────────────────────────────────────────────────
+_all_rows_stats = sb_fetch_all()
+_today_rows_stats = [r for r in _all_rows_stats if r.get('date') == today_str]
+_n_cities = len(_today_rows_stats)
+_synced_count = len(last_sync_data.get('synced', []))
+_last_sync_time = last_sync_data.get('date', '—')
+_nbm_count = 0  # will be updated after weather fetch, show placeholder
+
+st.markdown(f"""
+<div class="mph-stats-bar">
+    <div class="mph-stat">
+        <span class="mph-stat-value">{_n_cities}/18</span>
+        <span class="mph-stat-label">Cities Live</span>
+    </div>
+    <div class="mph-stat {'mph-stat-neutral' if _synced_count < 18 else ''}">
+        <span class="mph-stat-value">{_synced_count}</span>
+        <span class="mph-stat-label">Ladders Synced</span>
+    </div>
+    <div class="mph-stat">
+        <span class="mph-stat-value" style="color:#00b4d8">{n_settled}</span>
+        <span class="mph-stat-label">Settled Today</span>
+    </div>
+    <div class="mph-stat mph-stat-neutral">
+        <span class="mph-stat-value" style="font-size:14px">{_last_sync_time}</span>
+        <span class="mph-stat-label">Last Sync</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 city_list = list(CITIES.keys())
 default_idx = city_list.index('New York')
@@ -1351,7 +1645,7 @@ if kalshi_markets is None:
             save_json(SAVE_FILE, saved_ladders)
             fetched_at = time.time()
 
-st.subheader('Kalshi Ladder')
+st.markdown('<div class="mph-section-header">📋 Kalshi Ladder</div>', unsafe_allow_html=True)
 if kalshi_markets:
     age_min = round((time.time() - fetched_at) / 60) if fetched_at else 0
     age_str = 'just now' if age_min < 1 else str(age_min) + ' min ago'
@@ -1382,7 +1676,7 @@ with st.expander('Edit Brackets', expanded=False):
 ladder_text = saved_ladders[city]
 st.caption('Current ladder: ' + ladder_text)
 
-st.subheader('Live Weather')
+st.markdown('<div class="mph-section-header">🌤️ Live Weather</div>', unsafe_allow_html=True)
 with st.spinner('Fetching weather data...'):
     nws_forecast, _ = fetch_nws_forecast(lat, lon)
     noaa_station, noaa_obs = fetch_nws_current(lat, lon, station)
@@ -1537,7 +1831,7 @@ if forecast is not None and current is not None:
                                     bias_correction=bias_correction)
     if not save_ok: st.caption('⚠️ Could not save prediction to database')
 
-    st.subheader('Model Output')
+    st.markdown('<div class="mph-section-header">🎯 Model Output</div>', unsafe_allow_html=True)
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         st.metric('Consensus High', str(round(consensus, 1))+' F')
@@ -1660,7 +1954,7 @@ else:
 
 # ── Calibration Panel ─────────────────────────────────────────────────────────
 st.markdown('---')
-st.subheader('Calibration & Settlement History')
+st.markdown('<div class="mph-section-header">📈 Calibration & Settlement History</div>', unsafe_allow_html=True)
 
 with st.expander('View history for ' + city, expanded=False):
     rows = sb_fetch_city(city)
