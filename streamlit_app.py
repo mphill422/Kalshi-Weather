@@ -2037,9 +2037,25 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
 
             ens_key = ensemble_overall_confidence(members, consensus_val, ladder)
             nbm_status = '✅ NBM' if nbm_pcts else '📊 Sigma'
-            best_yes, best_no = get_city_best_signals(
-                c, consensus_val, ladder, members, cached_markets, obs_h, high_unc, bankroll,
-                nbm_percentiles=nbm_pcts, current_temp=c_temp, nws_forecast=c_fc, local_hour=c_hour)
+
+            # V5.8: Check price cache age — grey out signals if prices are stale (>2 hours)
+            _, price_fetched_at = get_cached_prices(c)
+            price_age_min = round((time.time() - price_fetched_at) / 60) if price_fetched_at else 999
+            prices_stale = price_age_min > 120  # 2 hours
+
+            if prices_stale:
+                best_yes = f'⚪ stale ({price_age_min}m)'
+                best_no = f'⚪ stale ({price_age_min}m)'
+            else:
+                best_yes, best_no = get_city_best_signals(
+                    c, consensus_val, ladder, members, cached_markets, obs_h, high_unc, bankroll,
+                    nbm_percentiles=nbm_pcts, current_temp=c_temp, nws_forecast=c_fc, local_hour=c_hour)
+
+            # Add price age indicator to signal if fresh
+            if not prices_stale and price_fetched_at:
+                age_str = f'{price_age_min}m ago' if price_age_min > 0 else 'just now'
+            else:
+                age_str = None
             bias_str = ('+' if bc_val and bc_val > 0 else '') + str(bc_val) + 'F' if bc_val and bc_val != 0.0 else '—'
 
             # V5.7: MAE column — rolling 14-day window to match bias correction
@@ -2062,15 +2078,18 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
                 '⚠️': '⚠️' if r.get('high_uncertainty') else '✅',
                 'Ens Key': ens_key if ens_key else '—', 'Prob Src': nbm_status,
                 'Bias Adj': bias_str, 'MAE': mae_str,
+                'Prices': f'⚠️ {price_age_min}m' if prices_stale else (age_str or '—'),
                 'Best YES': best_yes, 'Best NO': best_no,
             })
 
         st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
         n_saved_total = len(today_rows)
-        n_yes = sum(1 for r in summary_rows if r['Best YES'] != '—')
-        n_no = sum(1 for r in summary_rows if r['Best NO'] != '—')
+        n_yes = sum(1 for r in summary_rows if r['Best YES'] != '—' and '⚪' not in r['Best YES'])
+        n_no = sum(1 for r in summary_rows if r['Best NO'] != '—' and '⚪' not in r['Best NO'])
         n_nbm = sum(1 for r in summary_rows if '✅' in r.get('Prob Src', ''))
+        n_stale = sum(1 for r in summary_rows if '⚠️' in r.get('Prices', ''))
         status_icon = '✅' if n_saved_total == 18 else '⏳'
-        st.caption(f'{status_icon} {n_saved_total}/18 cities | 🟢 {n_yes} YES signals | 🟢 {n_no} NO signals | ✅ {n_nbm} NBM active today')
+        stale_str = f' | ⚠️ {n_stale} stale prices' if n_stale > 0 else ''
+        st.caption(f'{status_icon} {n_saved_total}/18 cities | 🟢 {n_yes} YES signals | 🟢 {n_no} NO signals | ✅ {n_nbm} NBM active today{stale_str}')
     else:
         st.info('Loading predictions for all cities — this panel fills itself in automatically.')
