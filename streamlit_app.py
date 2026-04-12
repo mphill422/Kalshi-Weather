@@ -983,7 +983,14 @@ def kelly_bet_no(model_prob, no_ask_cents, bankroll, fractional=0.15, max_pct=0.
 
 def get_city_best_signals(city, consensus, ladder_text, ensemble_members, kalshi_markets_data,
                           obs_high, high_uncertainty, bankroll, nbm_percentiles=None,
-                          current_temp=None, nws_forecast=None, local_hour=12):
+                          current_temp=None, nws_forecast=None, local_hour=12,
+                          min_prob=0.10):
+    """
+    V5.8: Added min_prob threshold (default 10%).
+    Brackets where model probability < 10% are excluded from signal consideration
+    regardless of edge size. Eliminates phantom signals on near-impossible brackets
+    (e.g. Minneapolis 79 or below when consensus is 80F).
+    """
     if consensus is None or not ladder_text: return '—', '—'
     try:
         prob_rows, _, used_nbm = bracket_probs_nbm(consensus, ladder_text, city, nbm_percentiles, obs_high=obs_high)
@@ -996,6 +1003,10 @@ def get_city_best_signals(city, consensus, ladder_text, ensemble_members, kalshi
             ens_prob = next((ensemble_bracket_prob(ensemble_members, lo, hi)
                              for lbl, lo, hi in parse_ladder(ladder_text) if labels_match(lbl, label)), None)
             final_prob = blend_probs(base_prob, ens_prob, ensemble_members, city, nbm_active=used_nbm)
+
+            # V5.8: Skip brackets where model probability is too low — not a real signal
+            if final_prob < min_prob: continue
+
             yes_ask = no_ask = None
             if kalshi_markets_data:
                 match = next((m for m in kalshi_markets_data if labels_match(m[0], label)), None)
@@ -1011,6 +1022,11 @@ def get_city_best_signals(city, consensus, ladder_text, ensemble_members, kalshi
                 best_yes_edge = e
                 kelly = kelly_bet(final_prob, yes_ask, bankroll) if yes_ask else 0.0
                 best_yes = f'🟢 {label} | +{e}c | ${kelly}'
+
+            # V5.8: For NO signals, also require model prob of being ABOVE bracket > 10%
+            no_model_prob = 1.0 - final_prob
+            if no_model_prob < min_prob: continue
+
             no_e = no_edge_cents(final_prob, no_ask)
             no_icon, _ = no_signal(no_e, busted=busted, model_prob=final_prob, no_ask=no_ask,
                                    high_uncertainty=high_uncertainty, morning_suppressed=morning_suppressed,
@@ -1908,7 +1924,7 @@ if forecast is not None and current is not None:
                         'NO Edge': no_edge_str, 'Kelly NO': ('$'+str(kelly_no)) if kelly_no > 0 else '—',
                         'Ensemble': ens_conf})
 
-        if e is not None and e > best_edge and not busted and signal_icon == '🟢':
+        if e is not None and e > best_edge and not busted and signal_icon == '🟢' and final_prob >= 0.10:
             best_edge = e
             best_bet = {'label': label, 'edge': e, 'kelly': kelly, 'uncertain': high_uncertainty}
         if busted and no_ask is not None and no_ask <= 5:
@@ -1916,7 +1932,7 @@ if forecast is not None and current is not None:
             if no_e_for_rank > best_no_edge:
                 best_no_edge = no_e_for_rank
                 best_no_bet = {'label': label, 'edge': no_e_for_rank, 'kelly': kelly_no, 'busted': True, 'no_ask': no_ask}
-        elif no_e is not None and no_e > best_no_edge and no_icon == '🟢':
+        elif no_e is not None and no_e > best_no_edge and no_icon == '🟢' and (1.0 - final_prob) >= 0.10:
             best_no_edge = no_e
             best_no_bet = {'label': label, 'edge': no_e, 'kelly': kelly_no, 'busted': False, 'no_ask': no_ask}
 
