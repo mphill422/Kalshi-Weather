@@ -265,7 +265,7 @@ PRICE_CACHE_MINUTES = 10
 
 MIN_EDGE = 8
 HEADERS = {'User-Agent': 'kalshi-temp-model/5.7', 'Accept': 'application/geo+json, application/json, text/html'}
-WETHR_API_KEY = '71ef19703ff3d73d3773cc339284915f40e3faf268aea7e712649d0695139a1c'
+WETHR_API_KEY = st.secrets.get('wethr', {}).get('api_key', '71ef19703ff3d73d3773cc339284915f40e3faf268aea7e712649d0695139a1c')
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
 
 CITY_TZ = {
@@ -2308,7 +2308,7 @@ if settled_bets:
 
 if pending_bets:
     st.caption(f'⏳ {len(pending_bets)} pending bet(s) awaiting settlement: ' +
-               ', '.join(f"{b["city"]} {b["bracket"]} {b["direction"]}" for b in pending_bets))
+               ', '.join(b.get('city','') + ' ' + b.get('bracket','') + ' ' + b.get('direction','') for b in pending_bets))
 
 if not paper_bets:
     st.info('No paper bets logged yet. Use the form above to log your first paper bet.')
