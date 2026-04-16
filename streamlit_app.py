@@ -265,7 +265,12 @@ PRICE_CACHE_MINUTES = 10
 
 MIN_EDGE = 8
 HEADERS = {'User-Agent': 'kalshi-temp-model/5.7', 'Accept': 'application/geo+json, application/json, text/html'}
-WETHR_API_KEY = st.secrets.get('wethr', {}).get('api_key', '71ef19703ff3d73d3773cc339284915f40e3faf268aea7e712649d0695139a1c')
+try:
+    WETHR_API_KEY = (st.secrets.get('wethr_key') or 
+                     st.secrets.get('wethr', {}).get('api_key') or 
+                     '71ef19703ff3d73d3773cc339284915f40e3faf268aea7e712649d0695139a1c')
+except Exception:
+    WETHR_API_KEY = '71ef19703ff3d73d3773cc339284915f40e3faf268aea7e712649d0695139a1c'
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
 
 CITY_TZ = {
@@ -433,13 +438,13 @@ _SB_URL = 'https://oirnfhhuyjuotkrlymxd.supabase.co'
 _SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9pcm5maGh1eWp1b3Rrcmx5bXhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDIzMDYyMjAsImV4cCI6MjA1NzgyNjIyMH0.3Mp81UjdxkpAYq_cuaOa-0Vqo1LkMgxawOM1gWF6TJ0'
 
 def get_sb_headers():
-    try: key = st.secrets['supabase']['key']
+    try: key = st.secrets.get('supabase_key') or st.secrets.get('supabase', {}).get('key') or _SB_KEY
     except Exception: key = _SB_KEY
     return {'apikey': key, 'Authorization': 'Bearer ' + key,
             'Content-Type': 'application/json', 'Prefer': 'return=representation'}
 
 def sb_url(table):
-    try: url = st.secrets['supabase']['url']
+    try: url = st.secrets.get('supabase_url') or st.secrets.get('supabase', {}).get('url') or _SB_URL
     except Exception: url = _SB_URL
     return url + '/rest/v1/' + table
 
