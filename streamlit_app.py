@@ -502,9 +502,21 @@ def sb_upsert_prediction(city, consensus, forecast, ensemble_mean, source_gap,
             r = requests.patch(sb_url('settlements') + '?id=eq.' + str(existing['id']),
                                headers=get_sb_headers(),
                                json={k: v for k, v in row.items() if k not in ('date', 'city')}, timeout=10)
+            if r.status_code not in (200, 204):
+                st.error(f'DB PATCH failed: {r.status_code} — {r.text[:200]}')
             return r.status_code in (200, 204)
-        except Exception: return False
-    else: return sb_insert(row)
+        except Exception as e:
+            st.error(f'DB PATCH exception: {str(e)[:200]}')
+            return False
+    else:
+        try:
+            r = requests.post(sb_url('settlements'), headers=get_sb_headers(), json=row, timeout=10)
+            if r.status_code not in (200, 201):
+                st.error(f'DB INSERT failed: {r.status_code} — {r.text[:200]}')
+            return r.status_code in (200, 201)
+        except Exception as e:
+            st.error(f'DB INSERT exception: {str(e)[:200]}')
+            return False
 
 # ── V5.2 Auto-Settlement — Iowa State CLI JSON API ────────────────────────────
 _CLI_CACHE = {}
@@ -2127,184 +2139,3 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
         st.caption(f'{status_icon} {n_saved_total}/18 cities | 🟢 {n_yes} YES signals | 🟢 {n_no} NO signals | ✅ {n_nbm} NBM active today{stale_str}')
     else:
         st.info('Loading predictions for all cities — this panel fills itself in automatically.')
-
-# ── Paper Trading Tracker ─────────────────────────────────────────────────────
-st.markdown('---')
-st.markdown('<div class="mph-section-header">📝 Paper Trading Tracker</div>', unsafe_allow_html=True)
-
-def sb_fetch_paper_bets():
-    try:
-        r = requests.get(sb_url('paper_bets'), headers=get_sb_headers(),
-                         params={'order': 'date.desc,created_at.desc', 'limit': '200'}, timeout=10)
-        return r.json() if r.status_code == 200 else []
-    except Exception: return []
-
-def sb_insert_paper_bet(bet):
-    try:
-        r = requests.post(sb_url('paper_bets'), headers=get_sb_headers(), json=bet, timeout=10)
-        return r.status_code in (200, 201)
-    except Exception: return False
-
-def sb_update_paper_bet(bet_id, actual, won, pnl):
-    try:
-        r = requests.patch(sb_url('paper_bets') + '?id=eq.' + str(bet_id),
-                           headers=get_sb_headers(),
-                           json={'actual': actual, 'won': won, 'pnl': round(pnl, 2)}, timeout=10)
-        return r.status_code in (200, 204)
-    except Exception: return False
-
-def settle_paper_bets():
-    """Auto-settle paper bets using Iowa State CLI data."""
-    try:
-        bets = sb_fetch_paper_bets()
-        unsettled = [b for b in bets if b.get('actual') is None and b.get('date', '') < get_eastern_date()]
-        settled_count = 0
-        for bet in unsettled:
-            city = bet.get('city')
-            date = bet.get('date')
-            actual = fetch_cli_max_temp(city, date)
-            if actual is None:
-                icao = OBHISTORY_STATIONS.get(city)
-                if icao: actual = fetch_obs_high_for_date(icao, date)
-            if actual is None: continue
-
-            # Determine win/loss
-            bracket = bet.get('bracket', '')
-            direction = bet.get('direction', 'YES')
-            lo, hi = label_to_numeric_key(bracket)
-            in_bracket = (
-                (lo is None or actual >= lo - 0.4) and
-                (hi is None or actual <= hi + 0.4)
-            )
-            won = in_bracket if direction == 'YES' else not in_bracket
-
-            # Calculate P&L
-            amount = bet.get('amount', 25.0)
-            ask = bet.get('ask', 50)
-            if won:
-                pnl = round(amount * (100 - ask) / ask, 2)
-            else:
-                pnl = -amount
-
-            ok = sb_update_paper_bet(bet['id'], actual, won, pnl)
-            if ok: settled_count += 1
-        return settled_count
-    except Exception: return 0
-
-# Auto-settle paper bets
-with st.spinner('Settling paper bets...'):
-    paper_settled = settle_paper_bets()
-if paper_settled > 0:
-    st.success(f'✅ Auto-settled {paper_settled} paper bet(s)')
-
-# ── Log New Paper Bet ─────────────────────────────────────────────────────────
-with st.expander('📝 Log a Paper Bet', expanded=False):
-    st.caption('Only log bets before 2pm ET on 🟢 signals with fresh prices. Same rules as real betting.')
-    pb1, pb2, pb3 = st.columns(3)
-    with pb1:
-        pb_city = st.selectbox('City', list(CITIES.keys()), key='pb_city')
-        pb_direction = st.radio('Direction', ['YES', 'NO'], horizontal=True, key='pb_dir')
-    with pb2:
-        pb_bracket = st.text_input('Bracket (e.g. 79-80)', key='pb_bracket')
-        pb_ask = st.number_input('Ask price (cents)', min_value=1, max_value=99, value=30, key='pb_ask')
-    with pb3:
-        pb_edge = st.number_input('Edge (cents)', min_value=0.0, max_value=99.0, value=10.0, step=0.5, key='pb_edge')
-        pb_amount = st.number_input('Paper bet ($)', min_value=1.0, max_value=500.0, value=25.0, step=5.0, key='pb_amount')
-
-    pb_notes = st.text_input('Notes (optional)', key='pb_notes', placeholder='e.g. NBM p50 = 79.5F, NWS = 80F')
-
-    if st.button('✅ Log Paper Bet', key='log_paper_bet'):
-        if not pb_bracket:
-            st.error('Enter a bracket first')
-        else:
-            # Validate time — warn if after 2pm ET
-            et_hour = get_local_hour('New York')
-            if et_hour >= 14:
-                st.warning('⚠️ It\'s after 2pm ET — paper bets logged this late may not reflect real betting conditions')
-            bet_row = {
-                'date': get_eastern_date(),
-                'city': pb_city,
-                'bracket': pb_bracket.strip(),
-                'direction': pb_direction,
-                'ask': pb_ask,
-                'edge': pb_edge,
-                'amount': pb_amount,
-                'notes': pb_notes,
-                'actual': None,
-                'won': None,
-                'pnl': None,
-            }
-            ok = sb_insert_paper_bet(bet_row)
-            if ok:
-                st.success(f'✅ Paper bet logged: {pb_direction} {pb_bracket} ({pb_city}) at {pb_ask}c | ${pb_amount}')
-            else:
-                st.error('Failed to log bet — check Supabase paper_bets table exists')
-
-# ── Paper Trading Summary ─────────────────────────────────────────────────────
-paper_bets = sb_fetch_paper_bets()
-settled_bets = [b for b in paper_bets if b.get('actual') is not None]
-pending_bets = [b for b in paper_bets if b.get('actual') is None]
-
-if settled_bets:
-    import pandas as pd
-    total_bets = len(settled_bets)
-    wins = sum(1 for b in settled_bets if b.get('won'))
-    losses = total_bets - wins
-    win_rate = round(100 * wins / total_bets) if total_bets > 0 else 0
-    total_pnl = sum(b.get('pnl', 0) for b in settled_bets)
-    total_wagered = sum(b.get('amount', 0) for b in settled_bets)
-    roi = round(100 * total_pnl / total_wagered, 1) if total_wagered > 0 else 0
-
-    # Stats bar
-    pnl_color = '#00ff88' if total_pnl >= 0 else '#ef4444'
-    st.markdown(f"""
-    <div class="mph-stats-bar">
-        <div class="mph-stat">
-            <span class="mph-stat-value">{total_bets}</span>
-            <span class="mph-stat-label">Total Bets</span>
-        </div>
-        <div class="mph-stat">
-            <span class="mph-stat-value" style="color:#00ff88">{wins}</span>
-            <span class="mph-stat-label">Wins</span>
-        </div>
-        <div class="mph-stat">
-            <span class="mph-stat-value" style="color:#ef4444">{losses}</span>
-            <span class="mph-stat-label">Losses</span>
-        </div>
-        <div class="mph-stat">
-            <span class="mph-stat-value">{win_rate}%</span>
-            <span class="mph-stat-label">Win Rate</span>
-        </div>
-        <div class="mph-stat">
-            <span class="mph-stat-value" style="color:{pnl_color}">${round(total_pnl, 2):+}</span>
-            <span class="mph-stat-label">Paper P&L</span>
-        </div>
-        <div class="mph-stat">
-            <span class="mph-stat-value" style="color:{pnl_color}">{roi:+}%</span>
-            <span class="mph-stat-label">ROI</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # Bet history table
-    history_df = pd.DataFrame([{
-        'Date': b['date'],
-        'City': b['city'],
-        'Bracket': b['bracket'],
-        'Dir': b['direction'],
-        'Ask': str(b.get('ask', ''))+'c',
-        'Edge': '+'+str(b.get('edge', ''))+'c',
-        'Amount': '$'+str(b.get('amount', '')),
-        'Actual': str(b.get('actual', ''))+'F' if b.get('actual') else '—',
-        'Result': '✅ WIN' if b.get('won') else '❌ LOSS',
-        'P&L': ('$+' if b.get('pnl', 0) >= 0 else '$') + str(round(b.get('pnl', 0), 2)),
-        'Notes': b.get('notes', ''),
-    } for b in sorted(settled_bets, key=lambda x: x['date'], reverse=True)])
-    st.dataframe(history_df, use_container_width=True, hide_index=True)
-
-if pending_bets:
-    st.caption(f'⏳ {len(pending_bets)} pending bet(s) awaiting settlement: ' +
-               ', '.join(b.get('city','') + ' ' + b.get('bracket','') + ' ' + b.get('direction','') for b in pending_bets))
-
-if not paper_bets:
-    st.info('No paper bets logged yet. Use the form above to log your first paper bet.')
