@@ -1690,33 +1690,40 @@ def window_status(cutoff_et_hour):
 
 def get_phase_label(tz_key, et_hour):
     """Return phase label based on current ET hour for each timezone group."""
-    phases = {
-        'ET': [(9, 10, '⏳ EARLY', '#94a3b8', 'Open, limited obs'),
-               (10, 1130, '🟢 BET NOW', '#00ff88', 'Sweet spot'),
-               (1130, 13, '👁 MONITOR', '#f59e0b', 'Edges shrinking'),
-               (13, 14, '⏭ SKIP', '#ef4444', 'Edge gone'),
-               (14, 16, '🌡️ PEAK', '#00b4d8', 'Peak heat hours')],
-        'CT': [(10, 11, '⏳ EARLY', '#94a3b8', 'Open, limited obs'),
-               (11, 1230, '🟢 BET NOW', '#00ff88', 'Sweet spot'),
-               (1230, 14, '👁 MONITOR', '#f59e0b', 'Edges shrinking'),
-               (14, 15, '⏭ SKIP', '#ef4444', 'Edge gone'),
-               (15, 17, '🌡️ PEAK', '#00b4d8', 'Peak heat hours')],
-        'MT': [(11, 12, '⏳ EARLY', '#94a3b8', 'Open, limited obs'),
-               (12, 1330, '🟢 BET NOW', '#00ff88', 'Sweet spot'),
-               (1330, 15, '👁 MONITOR', '#f59e0b', 'Edges shrinking'),
-               (15, 16, '⏭ SKIP', '#ef4444', 'Edge gone'),
-               (16, 18, '🌡️ PEAK', '#00b4d8', 'Peak heat hours')],
-        'PT': [(12, 13, '⏳ EARLY', '#94a3b8', 'Open, limited obs'),
-               (13, 1430, '🟢 BET NOW', '#00ff88', 'Sweet spot'),
-               (1430, 16, '👁 MONITOR', '#f59e0b', 'Edges shrinking'),
-               (16, 17, '⏭ SKIP', '#ef4444', 'Edge gone'),
-               (17, 19, '🌡️ PEAK', '#00b4d8', 'Peak heat hours')],
-    }
-    # Convert et_hour to HHMM int for comparison (e.g. 11.5 hours = 1130)
     now_et = datetime.now(pytz.timezone('America/New_York'))
     et_hhmm = now_et.hour * 100 + now_et.minute
-    for start, end, label, color, desc in phases.get(tz_key, []):
-        if start * 100 <= et_hhmm < end * 100 if end > 100 else start <= now_et.hour < end:
+
+    phase_times = {
+        'ET': {
+            'early':   (900,  1000, '⏳ EARLY', '#94a3b8', 'Open, limited obs — wait for 10:00 AM ET'),
+            'bet':     (1000, 1130, '🟢 BET NOW', '#00ff88', 'Sweet spot 10:00–11:30 AM ET'),
+            'peak':    (1400, 1600, '🌡️ PEAK HEAT', '#00b4d8', 'Peak heat hours 2:00–4:00 PM ET'),
+            'closed':  (1400, 9999, None, None, None),
+        },
+        'CT': {
+            'early':   (1000, 1100, '⏳ EARLY', '#94a3b8', 'Open, limited obs — wait for 11:00 AM ET'),
+            'bet':     (1100, 1230, '🟢 BET NOW', '#00ff88', 'Sweet spot 11:00 AM–12:30 PM ET'),
+            'peak':    (1500, 1700, '🌡️ PEAK HEAT', '#00b4d8', 'Peak heat hours 3:00–5:00 PM ET'),
+            'closed':  (1500, 9999, None, None, None),
+        },
+        'MT': {
+            'early':   (1100, 1200, '⏳ EARLY', '#94a3b8', 'Open, limited obs — wait for 12:00 PM ET'),
+            'bet':     (1200, 1330, '🟢 BET NOW', '#00ff88', 'Sweet spot 12:00–1:30 PM ET'),
+            'peak':    (1600, 1800, '🌡️ PEAK HEAT', '#00b4d8', 'Peak heat hours 4:00–6:00 PM ET'),
+            'closed':  (1600, 9999, None, None, None),
+        },
+        'PT': {
+            'early':   (1200, 1300, '⏳ EARLY', '#94a3b8', 'Open, limited obs — wait for 1:00 PM ET'),
+            'bet':     (1300, 1430, '🟢 BET NOW', '#00ff88', 'Sweet spot 1:00–2:30 PM ET'),
+            'peak':    (1700, 1900, '🌡️ PEAK HEAT', '#00b4d8', 'Peak heat hours 5:00–7:00 PM ET'),
+            'closed':  (1700, 9999, None, None, None),
+        },
+    }
+
+    times = phase_times.get(tz_key, {})
+    for phase_key in ['bet', 'peak', 'early']:
+        start, end, label, color, desc = times.get(phase_key, (0, 0, None, None, None))
+        if start <= et_hhmm < end:
             return label, color, desc
     return '', '#64748b', ''
 
