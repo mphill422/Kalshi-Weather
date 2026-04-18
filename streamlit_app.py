@@ -1688,18 +1688,52 @@ def window_status(cutoff_et_hour):
     if mins <= 30: return f'⚠️ CLOSING in {mins}m', '#f59e0b'
     return f'✅ OPEN — {mins}m left', '#00ff88'
 
+def get_phase_label(tz_key, et_hour):
+    """Return phase label based on current ET hour for each timezone group."""
+    phases = {
+        'ET': [(9, 10, '⏳ EARLY', '#94a3b8', 'Open, limited obs'),
+               (10, 1130, '🟢 BET NOW', '#00ff88', 'Sweet spot'),
+               (1130, 13, '👁 MONITOR', '#f59e0b', 'Edges shrinking'),
+               (13, 14, '⏭ SKIP', '#ef4444', 'Edge gone'),
+               (14, 16, '🌡️ PEAK', '#00b4d8', 'Peak heat hours')],
+        'CT': [(10, 11, '⏳ EARLY', '#94a3b8', 'Open, limited obs'),
+               (11, 1230, '🟢 BET NOW', '#00ff88', 'Sweet spot'),
+               (1230, 14, '👁 MONITOR', '#f59e0b', 'Edges shrinking'),
+               (14, 15, '⏭ SKIP', '#ef4444', 'Edge gone'),
+               (15, 17, '🌡️ PEAK', '#00b4d8', 'Peak heat hours')],
+        'MT': [(11, 12, '⏳ EARLY', '#94a3b8', 'Open, limited obs'),
+               (12, 1330, '🟢 BET NOW', '#00ff88', 'Sweet spot'),
+               (1330, 15, '👁 MONITOR', '#f59e0b', 'Edges shrinking'),
+               (15, 16, '⏭ SKIP', '#ef4444', 'Edge gone'),
+               (16, 18, '🌡️ PEAK', '#00b4d8', 'Peak heat hours')],
+        'PT': [(12, 13, '⏳ EARLY', '#94a3b8', 'Open, limited obs'),
+               (13, 1430, '🟢 BET NOW', '#00ff88', 'Sweet spot'),
+               (1430, 16, '👁 MONITOR', '#f59e0b', 'Edges shrinking'),
+               (16, 17, '⏭ SKIP', '#ef4444', 'Edge gone'),
+               (17, 19, '🌡️ PEAK', '#00b4d8', 'Peak heat hours')],
+    }
+    # Convert et_hour to HHMM int for comparison (e.g. 11.5 hours = 1130)
+    now_et = datetime.now(pytz.timezone('America/New_York'))
+    et_hhmm = now_et.hour * 100 + now_et.minute
+    for start, end, label, color, desc in phases.get(tz_key, []):
+        if start * 100 <= et_hhmm < end * 100 if end > 100 else start <= now_et.hour < end:
+            return label, color, desc
+    return '', '#64748b', ''
+
 st.markdown('<div class="mph-section-header">🎯 Best Bets By Timezone Window</div>', unsafe_allow_html=True)
 
 _all_rows_banner = sb_fetch_all()
 _today_rows_banner = {r['city']: r for r in _all_rows_banner if r.get('date') == today_str}
+_et_hour_now = get_et_hour()
 
 for tz_key, tz_info in TIMEZONE_GROUPS.items():
     status_text, status_color = window_status(tz_info['cutoff_et_hour'])
     mins_left = minutes_until_close(tz_info['cutoff_et_hour'])
     is_closed = mins_left <= 0
+    phase_label, phase_color, phase_desc = get_phase_label(tz_key, _et_hour_now)
 
-    best_yes_all = best_no_all = None
-    best_yes_edge = best_no_edge = -999
+    yes_signals = []
+    no_signals = []
 
     for c in tz_info['cities']:
         row = _today_rows_banner.get(c)
@@ -1731,41 +1765,45 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
         if b_yes and b_yes != '—' and '+' in b_yes:
             try:
                 edge_val = float(b_yes.split('+')[1].split('c')[0])
-                if edge_val > best_yes_edge:
-                    best_yes_edge = edge_val
-                    best_yes_all = f'{c}: {b_yes}'
+                yes_signals.append((edge_val, f'{c}: {b_yes}'))
             except Exception: pass
 
         if b_no and b_no != '—' and '+' in b_no:
             try:
                 edge_val = float(b_no.split('+')[1].split('c')[0])
-                if edge_val > best_no_edge:
-                    best_no_edge = edge_val
-                    best_no_all = f'{c}: {b_no}'
+                no_signals.append((edge_val, f'{c}: {b_no}'))
             except Exception: pass
 
-    yes_display = best_yes_all if best_yes_all else '— No green YES signal'
-    no_display = best_no_all if best_no_all else '— No green NO signal'
-    yes_color = '#00ff88' if best_yes_all else '#64748b'
-    no_color = '#00ff88' if best_no_all else '#64748b'
+    yes_signals.sort(key=lambda x: x[0], reverse=True)
+    no_signals.sort(key=lambda x: x[0], reverse=True)
 
     city_list_str = ' · '.join(tz_info['cities'])
 
+    if is_closed:
+        yes_html = '<div style="color:#ef4444; font-size:12px;">🔴 Window Closed</div>'
+        no_html = '<div style="color:#ef4444; font-size:12px;">🔴 Window Closed</div>'
+    else:
+        yes_html = ''.join([f'<div style="color:#00ff88; font-size:12px; font-family:\'JetBrains Mono\',monospace; margin-bottom:3px;">🟢 {sig}</div>' for _, sig in yes_signals]) or '<div style="color:#64748b; font-size:12px;">— No green YES signal</div>'
+        no_html = ''.join([f'<div style="color:#00ff88; font-size:12px; font-family:\'JetBrains Mono\',monospace; margin-bottom:3px;">🟢 {sig}</div>' for _, sig in no_signals]) or '<div style="color:#64748b; font-size:12px;">— No green NO signal</div>'
+
+    phase_html = f'<span style="color:{phase_color}; font-size:11px; font-weight:600; font-family:\'JetBrains Mono\',monospace;">{phase_label}</span> <span style="color:#64748b; font-size:11px;">— {phase_desc}</span>' if phase_label else ''
+
     st.markdown(f"""
 <div style="background:#0d1b2a; border:1px solid #1e3a5f; border-radius:10px; padding:14px 18px; margin-bottom:12px;">
-    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:6px;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; flex-wrap:wrap; gap:6px;">
         <span style="color:#ffffff; font-weight:700; font-size:14px; font-family:'Inter',sans-serif;">{tz_info['label']} — closes {tz_info['closes']}</span>
         <span style="color:{status_color}; font-size:12px; font-family:'JetBrains Mono',monospace;">{status_text}</span>
     </div>
+    <div style="margin-bottom:6px;">{phase_html}</div>
     <div style="color:#64748b; font-size:11px; margin-bottom:10px; font-family:'JetBrains Mono',monospace;">{city_list_str}</div>
-    <div style="display:flex; gap:12px; flex-wrap:wrap;">
+    <div style="display:flex; gap:16px; flex-wrap:wrap;">
         <div style="flex:1; min-width:200px;">
-            <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:4px;">Best YES</div>
-            <div style="color:{yes_color}; font-size:13px; font-family:'JetBrains Mono',monospace;">{'🔴 Window Closed' if is_closed else yes_display}</div>
+            <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:6px;">YES Signals</div>
+            {yes_html}
         </div>
         <div style="flex:1; min-width:200px;">
-            <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:4px;">Best NO</div>
-            <div style="color:{no_color}; font-size:13px; font-family:'JetBrains Mono',monospace;">{'🔴 Window Closed' if is_closed else no_display}</div>
+            <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:6px;">NO Signals</div>
+            {no_html}
         </div>
     </div>
 </div>
