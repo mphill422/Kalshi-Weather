@@ -1,11 +1,10 @@
-# Kalshi High Temperature Model - V5.8
+# Kalshi High Temperature Model - V5.9
 #
-# Changes from V5.7:
-# 1. Trading terminal UI — dark theme, green accents, Inter/JetBrains Mono fonts
-# 2. Hero header with live status indicator and version badge
-# 3. Live stats bar — cities loaded, ladders synced, settlements today, last sync
-# 4. Mobile-responsive layout — all stats bars wrap on small screens
-# 5. Cleaned section headers, styled buttons, metric cards, expanders
+# Changes from V5.8:
+# 1. Timezone-grouped best signal banner (ET/CT/MT/PT blocks) with time remaining
+# 2. Auto-refresh every 10 minutes
+# 3. Mac/iPhone view toggle
+# 4. Betting window status per city shown in ET
 
 import math, re, json, time, requests
 import streamlit as st
@@ -1540,10 +1539,11 @@ with st.sidebar:
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.8</div>', unsafe_allow_html=True)
-    st.markdown('- Trading terminal UI')
-    st.markdown('- Mobile-optimized layout')
-    st.markdown('- Live stats dashboard header')
+    st.markdown('<div class="mph-section-header">🚀 V5.9</div>', unsafe_allow_html=True)
+    st.markdown('- Timezone-grouped best signal banner')
+    st.markdown('- ET/CT/MT/PT betting windows')
+    st.markdown('- Auto-refresh every 10 minutes')
+    st.markdown('- Mac/iPhone view toggle')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1557,7 +1557,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.8</span>
+                <span class="mph-version-badge">V5.9</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -1633,6 +1633,145 @@ st.markdown(f"""
     </div>
 </div>
 """, unsafe_allow_html=True)
+
+# ── V5.9: Auto-refresh every 10 minutes ──────────────────────────────────────
+import streamlit.components.v1 as components
+components.html('<script>setTimeout(function(){window.location.reload();}, 600000);</script>', height=0)
+
+# ── V5.9: Mac/iPhone View Toggle ─────────────────────────────────────────────
+view_mode = st.radio('View', ['📊 Mac', '📱 iPhone'], horizontal=True, label_visibility='collapsed')
+is_mobile = view_mode == '📱 iPhone'
+
+# ── V5.9: Timezone Best Signal Banner ────────────────────────────────────────
+TIMEZONE_GROUPS = {
+    'ET': {
+        'cities': ['New York', 'Boston', 'Philadelphia', 'Washington DC', 'Atlanta', 'Miami'],
+        'cutoff_et_hour': 14,
+        'label': '🕙 ET Cities',
+        'closes': '2:00 PM ET',
+    },
+    'CT': {
+        'cities': ['Chicago', 'Dallas', 'Austin', 'Houston', 'San Antonio', 'New Orleans', 'Oklahoma City', 'Minneapolis'],
+        'cutoff_et_hour': 15,
+        'label': '🕙 CT Cities',
+        'closes': '3:00 PM ET',
+    },
+    'MT': {
+        'cities': ['Denver'],
+        'cutoff_et_hour': 16,
+        'label': '🕙 MT Cities',
+        'closes': '4:00 PM ET',
+    },
+    'PT': {
+        'cities': ['Phoenix', 'Las Vegas', 'Los Angeles'],
+        'cutoff_et_hour': 17,
+        'label': '🕙 PT Cities',
+        'closes': '5:00 PM ET',
+    },
+}
+
+def get_et_hour():
+    return datetime.now(pytz.timezone('America/New_York')).hour
+
+def get_et_time_str():
+    return datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p ET')
+
+def minutes_until_close(cutoff_et_hour):
+    now_et = datetime.now(pytz.timezone('America/New_York'))
+    close_et = now_et.replace(hour=cutoff_et_hour, minute=0, second=0, microsecond=0)
+    diff = (close_et - now_et).total_seconds() / 60
+    return int(diff)
+
+def window_status(cutoff_et_hour):
+    mins = minutes_until_close(cutoff_et_hour)
+    if mins <= 0: return '🔴 CLOSED', '#ef4444'
+    if mins <= 30: return f'⚠️ CLOSING in {mins}m', '#f59e0b'
+    return f'✅ OPEN — {mins}m left', '#00ff88'
+
+st.markdown('<div class="mph-section-header">🎯 Best Bets By Timezone Window</div>', unsafe_allow_html=True)
+
+_all_rows_banner = sb_fetch_all()
+_today_rows_banner = {r['city']: r for r in _all_rows_banner if r.get('date') == today_str}
+
+for tz_key, tz_info in TIMEZONE_GROUPS.items():
+    status_text, status_color = window_status(tz_info['cutoff_et_hour'])
+    mins_left = minutes_until_close(tz_info['cutoff_et_hour'])
+    is_closed = mins_left <= 0
+
+    best_yes_all = best_no_all = None
+    best_yes_edge = best_no_edge = -999
+
+    for c in tz_info['cities']:
+        row = _today_rows_banner.get(c)
+        if not row: continue
+        consensus_val = row.get('consensus')
+        ladder = saved_ladders.get(c, DEFAULT_LADDERS.get(c, ''))
+        cached_markets, _ = get_cached_prices(c)
+        obs_h = row.get('obs_high')
+        high_unc = row.get('high_uncertainty', False)
+        try:
+            cached_wx = fetch_city_weather(c)
+            members = cached_wx.get('ensemble_members') if cached_wx else None
+            nbm_pcts = cached_wx.get('nbm_percentiles') if cached_wx else None
+            c_temp = cached_wx.get('current_temp') if cached_wx else None
+            c_fc = cached_wx.get('nws_fc') if cached_wx else None
+            c_hour = cached_wx.get('local_hour', 12) if cached_wx else 12
+        except Exception:
+            members = nbm_pcts = c_temp = c_fc = None
+            c_hour = 12
+
+        _, price_fetched_at = get_cached_prices(c)
+        price_age_min = round((time.time() - price_fetched_at) / 60) if price_fetched_at else 999
+        if price_age_min > 120: continue
+
+        b_yes, b_no = get_city_best_signals(
+            c, consensus_val, ladder, members, cached_markets, obs_h, high_unc, 500,
+            nbm_percentiles=nbm_pcts, current_temp=c_temp, nws_forecast=c_fc, local_hour=c_hour)
+
+        if b_yes and b_yes != '—' and '+' in b_yes:
+            try:
+                edge_val = float(b_yes.split('+')[1].split('c')[0])
+                if edge_val > best_yes_edge:
+                    best_yes_edge = edge_val
+                    best_yes_all = f'{c}: {b_yes}'
+            except Exception: pass
+
+        if b_no and b_no != '—' and '+' in b_no:
+            try:
+                edge_val = float(b_no.split('+')[1].split('c')[0])
+                if edge_val > best_no_edge:
+                    best_no_edge = edge_val
+                    best_no_all = f'{c}: {b_no}'
+            except Exception: pass
+
+    yes_display = best_yes_all if best_yes_all else '— No green YES signal'
+    no_display = best_no_all if best_no_all else '— No green NO signal'
+    yes_color = '#00ff88' if best_yes_all else '#64748b'
+    no_color = '#00ff88' if best_no_all else '#64748b'
+
+    city_list_str = ' · '.join(tz_info['cities'])
+
+    st.markdown(f"""
+<div style="background:#0d1b2a; border:1px solid #1e3a5f; border-radius:10px; padding:14px 18px; margin-bottom:12px;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:6px;">
+        <span style="color:#ffffff; font-weight:700; font-size:14px; font-family:'Inter',sans-serif;">{tz_info['label']} — closes {tz_info['closes']}</span>
+        <span style="color:{status_color}; font-size:12px; font-family:'JetBrains Mono',monospace;">{status_text}</span>
+    </div>
+    <div style="color:#64748b; font-size:11px; margin-bottom:10px; font-family:'JetBrains Mono',monospace;">{city_list_str}</div>
+    <div style="display:flex; gap:12px; flex-wrap:wrap;">
+        <div style="flex:1; min-width:200px;">
+            <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:4px;">Best YES</div>
+            <div style="color:{yes_color}; font-size:13px; font-family:'JetBrains Mono',monospace;">{'🔴 Window Closed' if is_closed else yes_display}</div>
+        </div>
+        <div style="flex:1; min-width:200px;">
+            <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:4px;">Best NO</div>
+            <div style="color:{no_color}; font-size:13px; font-family:'JetBrains Mono',monospace;">{'🔴 Window Closed' if is_closed else no_display}</div>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown('---')
 
 city_list = list(CITIES.keys())
 default_idx = city_list.index('New York')
