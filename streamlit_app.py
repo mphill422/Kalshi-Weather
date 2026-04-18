@@ -1688,44 +1688,35 @@ def window_status(cutoff_et_hour):
     if mins <= 30: return f'⚠️ CLOSING in {mins}m', '#f59e0b'
     return f'✅ OPEN — {mins}m left', '#00ff88'
 
+TIMEZONE_STATIC_INFO = {
+    'ET': {'sweet_spot': '10:00–11:30 AM ET', 'peak_heat': '2:00–4:00 PM ET'},
+    'CT': {'sweet_spot': '11:00 AM–12:30 PM ET', 'peak_heat': '3:00–5:00 PM ET'},
+    'MT': {'sweet_spot': '12:00–1:30 PM ET', 'peak_heat': '4:00–6:00 PM ET'},
+    'PT': {'sweet_spot': '1:00–2:30 PM ET', 'peak_heat': '5:00–7:00 PM ET'},
+}
+
 def get_phase_label(tz_key, et_hour):
-    """Return phase label based on current ET hour for each timezone group."""
+    """Return phase label only during active windows — empty outside them."""
     now_et = datetime.now(pytz.timezone('America/New_York'))
     et_hhmm = now_et.hour * 100 + now_et.minute
 
     phase_times = {
-        'ET': {
-            'early':   (900,  1000, '⏳ EARLY', '#94a3b8', 'Open, limited obs — wait for 10:00 AM ET'),
-            'bet':     (1000, 1130, '🟢 BET NOW', '#00ff88', 'Sweet spot 10:00–11:30 AM ET'),
-            'peak':    (1400, 1600, '🌡️ PEAK HEAT', '#00b4d8', 'Peak heat hours 2:00–4:00 PM ET'),
-            'closed':  (1400, 9999, None, None, None),
-        },
-        'CT': {
-            'early':   (1000, 1100, '⏳ EARLY', '#94a3b8', 'Open, limited obs — wait for 11:00 AM ET'),
-            'bet':     (1100, 1230, '🟢 BET NOW', '#00ff88', 'Sweet spot 11:00 AM–12:30 PM ET'),
-            'peak':    (1500, 1700, '🌡️ PEAK HEAT', '#00b4d8', 'Peak heat hours 3:00–5:00 PM ET'),
-            'closed':  (1500, 9999, None, None, None),
-        },
-        'MT': {
-            'early':   (1100, 1200, '⏳ EARLY', '#94a3b8', 'Open, limited obs — wait for 12:00 PM ET'),
-            'bet':     (1200, 1330, '🟢 BET NOW', '#00ff88', 'Sweet spot 12:00–1:30 PM ET'),
-            'peak':    (1600, 1800, '🌡️ PEAK HEAT', '#00b4d8', 'Peak heat hours 4:00–6:00 PM ET'),
-            'closed':  (1600, 9999, None, None, None),
-        },
-        'PT': {
-            'early':   (1200, 1300, '⏳ EARLY', '#94a3b8', 'Open, limited obs — wait for 1:00 PM ET'),
-            'bet':     (1300, 1430, '🟢 BET NOW', '#00ff88', 'Sweet spot 1:00–2:30 PM ET'),
-            'peak':    (1700, 1900, '🌡️ PEAK HEAT', '#00b4d8', 'Peak heat hours 5:00–7:00 PM ET'),
-            'closed':  (1700, 9999, None, None, None),
-        },
+        'ET': {'bet': (1000, 1130), 'peak': (1400, 1600)},
+        'CT': {'bet': (1100, 1230), 'peak': (1500, 1700)},
+        'MT': {'bet': (1200, 1330), 'peak': (1600, 1800)},
+        'PT': {'bet': (1300, 1430), 'peak': (1700, 1900)},
     }
-
     times = phase_times.get(tz_key, {})
-    for phase_key in ['bet', 'peak', 'early']:
-        start, end, label, color, desc = times.get(phase_key, (0, 0, None, None, None))
-        if start <= et_hhmm < end:
-            return label, color, desc
-    return '', '#64748b', ''
+    bet_start, bet_end = times.get('bet', (0, 0))
+    peak_start, peak_end = times.get('peak', (0, 0))
+
+    if bet_start <= et_hhmm < bet_end:
+        return '🟢 BET NOW', '#00ff88'
+    if peak_start <= et_hhmm < peak_end:
+        return '🌡️ PEAK HEAT', '#00b4d8'
+    if et_hhmm < bet_start:
+        return '⏳ EARLY', '#94a3b8'
+    return '', '#64748b'
 
 st.markdown('<div class="mph-section-header">🎯 Best Bets By Timezone Window</div>', unsafe_allow_html=True)
 
@@ -1785,6 +1776,11 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
     no_signals.sort(key=lambda x: x[0], reverse=True)
 
     city_list_str = ' · '.join(tz_info['cities'])
+    static = TIMEZONE_STATIC_INFO.get(tz_key, {})
+    sweet_spot_str = static.get('sweet_spot', '')
+    peak_heat_str = static.get('peak_heat', '')
+    phase_label, phase_color = get_phase_label(tz_key, _et_hour_now)
+    phase_html = f'<span style="color:{phase_color}; font-size:12px; font-weight:700; font-family:\'JetBrains Mono\',monospace;">{phase_label}</span>' if phase_label else ''
 
     if is_closed:
         yes_html = '<div style="color:#ef4444; font-size:12px;">🔴 Window Closed</div>'
@@ -1793,15 +1789,15 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
         yes_html = ''.join([f'<div style="color:#00ff88; font-size:12px; font-family:\'JetBrains Mono\',monospace; margin-bottom:3px;">🟢 {sig}</div>' for _, sig in yes_signals]) or '<div style="color:#64748b; font-size:12px;">— No green YES signal</div>'
         no_html = ''.join([f'<div style="color:#00ff88; font-size:12px; font-family:\'JetBrains Mono\',monospace; margin-bottom:3px;">🟢 {sig}</div>' for _, sig in no_signals]) or '<div style="color:#64748b; font-size:12px;">— No green NO signal</div>'
 
-    phase_html = f'<span style="color:{phase_color}; font-size:11px; font-weight:600; font-family:\'JetBrains Mono\',monospace;">{phase_label}</span> <span style="color:#64748b; font-size:11px;">— {phase_desc}</span>' if phase_label else ''
-
     st.markdown(f"""
 <div style="background:#0d1b2a; border:1px solid #1e3a5f; border-radius:10px; padding:14px 18px; margin-bottom:12px;">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; flex-wrap:wrap; gap:6px;">
         <span style="color:#ffffff; font-weight:700; font-size:14px; font-family:'Inter',sans-serif;">{tz_info['label']} — closes {tz_info['closes']}</span>
         <span style="color:{status_color}; font-size:12px; font-family:'JetBrains Mono',monospace;">{status_text}</span>
     </div>
-    <div style="margin-bottom:6px;">{phase_html}</div>
+    <div style="margin-bottom:2px;">{phase_html}</div>
+    <div style="color:#94a3b8; font-size:11px; margin-bottom:2px; font-family:'JetBrains Mono',monospace;">🟢 Sweet spot: {sweet_spot_str}</div>
+    <div style="color:#00b4d8; font-size:11px; margin-bottom:8px; font-family:'JetBrains Mono',monospace;">🌡️ Peak heat: {peak_heat_str}</div>
     <div style="color:#64748b; font-size:11px; margin-bottom:10px; font-family:'JetBrains Mono',monospace;">{city_list_str}</div>
     <div style="display:flex; gap:16px; flex-wrap:wrap;">
         <div style="flex:1; min-width:200px;">
