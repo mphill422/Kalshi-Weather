@@ -1728,7 +1728,7 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
     status_text, status_color = window_status(tz_info['cutoff_et_hour'])
     mins_left = minutes_until_close(tz_info['cutoff_et_hour'])
     is_closed = mins_left <= 0
-    phase_label, phase_color, phase_desc = get_phase_label(tz_key, _et_hour_now)
+    phase_label, phase_color = get_phase_label(tz_key, _et_hour_now)
 
     yes_signals = []
     no_signals = []
@@ -1779,7 +1779,7 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
     static = TIMEZONE_STATIC_INFO.get(tz_key, {})
     sweet_spot_str = static.get('sweet_spot', '')
     peak_heat_str = static.get('peak_heat', '')
-    phase_label, phase_color = get_phase_label(tz_key, _et_hour_now)
+    phase_label, phase_color = get_phase_label(tz_key, _et_hour_now)  # V5.10: 2 return values
     phase_html = f'<span style="color:{phase_color}; font-size:12px; font-weight:700; font-family:\'JetBrains Mono\',monospace;">{phase_label}</span>' if phase_label else ''
 
     if is_closed:
