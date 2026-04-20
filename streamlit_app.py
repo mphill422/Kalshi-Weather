@@ -2367,7 +2367,7 @@ def save_bet_log(log):
     BET_LOG_FILE.write_text(json.dumps(log, indent=2))
 
 _bet_log_pw = st.text_input('Enter password to access bet log', type='password', key='bet_log_pw')
-_correct_pw = st.secrets.get('bet_log_password', 'mph422')
+_correct_pw = '2974'
 
 if _bet_log_pw == _correct_pw:
     with st.expander('📒 Log a Bet', expanded=False):
