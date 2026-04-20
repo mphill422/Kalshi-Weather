@@ -1,11 +1,18 @@
-# Kalshi High Temperature Model - V5.11
+# Kalshi High Temperature Model - V5.12
 #
-# Changes from V5.10:
-# 1. Red MAE flag in timezone banner — ⚠️ next to any signal with MAE >4F
-# 2. Not ready flag — cities with <3 settled days suppressed in banner
-# 3. Consensus vs NWS gap warning — flag if gap >3F next to signal
-# 4. Personal bet log — track bets placed, P&L, win rate
-# 5. Version bump to V5.11
+# Changes from V5.11:
+# 1. Auto-settlement for personal bet log — when the auto-settler fills in an
+#    actual high for a city/date, any Pending bets matching that city/date are
+#    automatically marked Won or Lost based on whether the bracket hit.
+# 2. New 'actual' and 'settled_at' fields added to bet log entries.
+# 3. Bet log table now displays the Actual high for settled bets.
+# 4. Version bump to V5.12
+#
+# All V5.11 logic retained unchanged:
+# - Red MAE flag in timezone banner
+# - Not ready city suppression (< 3 settled days)
+# - Consensus vs NWS gap warning
+# - Password-protected bet log
 
 import math, re, json, time, requests
 import streamlit as st
@@ -1520,6 +1527,84 @@ def save_city_prediction(city, weather, saved_ladders):
                                     bias_correction=bias_correction)
     return consensus, save_ok
 
+# ── V5.12: Bet Log Auto-Settlement ────────────────────────────────────────────
+BET_LOG_FILE = Path('bet_log.json')
+
+def load_bet_log():
+    if BET_LOG_FILE.exists():
+        try: return json.loads(BET_LOG_FILE.read_text())
+        except Exception: return []
+    return []
+
+def save_bet_log(log):
+    BET_LOG_FILE.write_text(json.dumps(log, indent=2))
+
+def bracket_hits(actual_temp, lo, hi):
+    """
+    V5.12: Decide whether an actual settled high falls within a bracket.
+    Uses Kalshi-style rounding: .5 rounds up (math.floor(x + 0.5)).
+    CLI returns whole numbers already; fallback NWS obs table can return decimals.
+    """
+    if actual_temp is None: return None
+    rounded = int(math.floor(float(actual_temp) + 0.5))
+    if lo is None and hi is not None:   # "X or below"
+        return rounded <= hi
+    if hi is None and lo is not None:   # "X or above"
+        return rounded >= lo
+    if lo is not None and hi is not None:  # "X-Y"
+        return lo <= rounded <= hi
+    return None
+
+def settle_bet_log(settled_rows):
+    """
+    V5.12: For each city/date that just settled, find Pending bets in the log
+    and mark them Won/Lost based on whether the bracket hit.
+    Returns list of bets that were just settled this run.
+    """
+    if not settled_rows: return []
+    bet_log = load_bet_log()
+    if not bet_log: return []
+    now_iso = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d %H:%M:%S ET')
+    just_settled = []
+    changed = False
+    for s in settled_rows:
+        s_city = s.get('city')
+        s_date = s.get('date')
+        s_actual = s.get('actual')
+        if s_city is None or s_date is None or s_actual is None: continue
+        for b in bet_log:
+            if b.get('result') != 'Pending': continue
+            if b.get('city') != s_city: continue
+            if b.get('date') != s_date: continue
+            bracket_str = b.get('bracket', '')
+            lo, hi = label_to_numeric_key(bracket_str)
+            if lo is None and hi is None:
+                # Couldn't parse bracket — leave pending and skip silently
+                continue
+            hit = bracket_hits(s_actual, lo, hi)
+            if hit is None: continue
+            direction = (b.get('direction') or 'YES').upper()
+            won = hit if direction == 'YES' else (not hit)
+            b['result'] = 'Won' if won else 'Lost'
+            amount = float(b.get('amount', 0) or 0)
+            price = float(b.get('price', 0) or 0)
+            if won and price > 0:
+                b['profit'] = round(amount * (100 - price) / price, 2)
+                b['payout'] = b['profit']
+            else:
+                b['profit'] = -amount
+                b['payout'] = 0.0
+            b['actual'] = s_actual
+            b['settled_at'] = now_iso
+            just_settled.append({
+                'city': s_city, 'date': s_date, 'bracket': bracket_str,
+                'direction': direction, 'actual': s_actual, 'won': won,
+                'amount': amount, 'profit': b['profit'],
+            })
+            changed = True
+    if changed: save_bet_log(bet_log)
+    return just_settled
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<div class="mph-section-header">⚙️ Kelly Settings</div>', unsafe_allow_html=True)
@@ -1541,11 +1626,9 @@ with st.sidebar:
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.11</div>', unsafe_allow_html=True)
-    st.markdown('- Red MAE flag in timezone banner')
-    st.markdown('- Not ready city suppression')
-    st.markdown('- Consensus vs NWS gap warning')
-    st.markdown('- Personal bet log')
+    st.markdown('<div class="mph-section-header">🚀 V5.12</div>', unsafe_allow_html=True)
+    st.markdown('- Auto-settle personal bet log')
+    st.markdown('- V5.11 features retained')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1559,7 +1642,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.11</span>
+                <span class="mph-version-badge">V5.12</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -1578,6 +1661,9 @@ st.markdown(f"""
 
 with st.spinner('Checking for unsettled predictions...'):
     n_settled, settled_rows = run_auto_settlement()
+    # V5.12: after model settlements, cascade into the personal bet log
+    bet_log_just_settled = settle_bet_log(settled_rows)
+
 if n_settled > 0:
     for s in settled_rows:
         direction = '✅' if abs(s['error']) <= 1.5 else '⚠️'
@@ -1587,6 +1673,15 @@ else:
     pending_past = [r for r in unsettled_check if r.get('date', '') < today_str]
     if pending_past:
         st.caption(f'⏳ {len(pending_past)} past predictions still pending — Iowa State CLI data may not be available yet.')
+
+# V5.12: Surface any personal bet log settlements from this run
+if bet_log_just_settled:
+    for b in bet_log_just_settled:
+        icon = '✅' if b['won'] else '❌'
+        result_word = 'WON' if b['won'] else 'LOST'
+        pnl_str = ('+' if b['profit'] >= 0 else '') + f"${b['profit']:.2f}"
+        st.success(f"{icon} Bet {result_word}: {b['city']} {b['bracket']} {b['direction']} "
+                   f"(${b['amount']:.0f}) — actual {b['actual']}F | {pnl_str}")
 
 if last_sync_data.get('date') != today_str:
     saved_ladders, results = sync_all_ladders(saved_ladders)
@@ -2352,20 +2447,10 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
     else:
         st.info('Loading predictions for all cities — this panel fills itself in automatically.')
 
-# ── V5.11: Personal Bet Log ───────────────────────────────────────────────────
+# ── V5.12: Personal Bet Log ───────────────────────────────────────────────────
+# (load_bet_log / save_bet_log defined near top with settle_bet_log)
 st.markdown('---')
 st.markdown('<div class="mph-section-header">📒 Personal Bet Log</div>', unsafe_allow_html=True)
-
-BET_LOG_FILE = Path('bet_log.json')
-
-def load_bet_log():
-    if BET_LOG_FILE.exists():
-        try: return json.loads(BET_LOG_FILE.read_text())
-        except Exception: return []
-    return []
-
-def save_bet_log(log):
-    BET_LOG_FILE.write_text(json.dumps(log, indent=2))
 
 _bet_log_pw = st.text_input('Enter password to access bet log', type='password', key='bet_log_pw')
 _correct_pw = '2974'
@@ -2395,6 +2480,9 @@ if _bet_log_pw == _correct_pw:
                 'result': log_result,
                 'payout': round(log_amount * (100 - log_price) / log_price, 2) if log_result == 'Won' else 0.0,
                 'profit': round(log_amount * (100 - log_price) / log_price, 2) if log_result == 'Won' else -log_amount if log_result == 'Lost' else 0.0,
+                # V5.12: new fields populated by auto-settler
+                'actual': None,
+                'settled_at': None,
             })
             save_bet_log(bet_log)
             st.success(f'Logged: {log_city} {log_bracket} {log_direction} ${log_amount} @ {log_price}c — {log_result}')
@@ -2418,10 +2506,12 @@ if _bet_log_pw == _correct_pw:
             with m4: st.metric('Total P&L', f'{"+" if total_profit >= 0 else ""}{round(total_profit, 2)}')
             with m5: st.metric('Pending', len([b for b in bet_log if b['result'] == 'Pending']))
 
+            # V5.12: show Actual high column so you can see what settled each bet
             log_df = pd.DataFrame([{
                 'Date': b['date'], 'City': b['city'], 'Bracket': b['bracket'],
                 'Dir': b['direction'], 'Amount': f"${b['amount']}",
                 'Price': f"{b['price']}c", 'Result': b['result'],
+                'Actual': (f"{b.get('actual')}F" if b.get('actual') is not None else '—'),
                 'P&L': ('+' if b['profit'] >= 0 else '') + f"${round(b['profit'], 2)}" if b['result'] != 'Pending' else '—'
             } for b in reversed(bet_log)])
             st.dataframe(log_df, use_container_width=True, hide_index=True)
@@ -2429,6 +2519,7 @@ if _bet_log_pw == _correct_pw:
             pending = [b for b in bet_log if b['result'] == 'Pending']
             if pending:
                 st.markdown('**Update pending bets:**')
+                st.caption('💡 V5.12: Bets auto-settle when the morning auto-settler runs. Manual override below if needed.')
                 for i, b in enumerate(bet_log):
                     if b['result'] != 'Pending': continue
                     uc1, uc2, uc3 = st.columns([3, 2, 1])
