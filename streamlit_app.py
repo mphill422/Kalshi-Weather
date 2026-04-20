@@ -2366,75 +2366,80 @@ def load_bet_log():
 def save_bet_log(log):
     BET_LOG_FILE.write_text(json.dumps(log, indent=2))
 
-with st.expander('📒 Log a Bet', expanded=False):
-    bl1, bl2, bl3 = st.columns(3)
-    with bl1:
-        log_city = st.selectbox('City', list(CITIES.keys()), key='log_city')
-        log_direction = st.radio('Direction', ['YES', 'NO'], horizontal=True, key='log_dir')
-    with bl2:
-        log_bracket = st.text_input('Bracket (e.g. 77-78)', key='log_bracket')
-        log_amount = st.number_input('Amount ($)', min_value=1.0, max_value=500.0, value=25.0, step=1.0, key='log_amount')
-    with bl3:
-        log_price = st.number_input('Price paid (cents)', min_value=1, max_value=99, value=40, key='log_price')
-        log_result = st.radio('Result', ['Pending', 'Won', 'Lost'], horizontal=True, key='log_result')
+_bet_log_pw = st.text_input('Enter password to access bet log', type='password', key='bet_log_pw')
+_correct_pw = st.secrets.get('bet_log_password', 'mph422')
 
-    if st.button('Log Bet'):
+if _bet_log_pw == _correct_pw:
+    with st.expander('📒 Log a Bet', expanded=False):
+        bl1, bl2, bl3 = st.columns(3)
+        with bl1:
+            log_city = st.selectbox('City', list(CITIES.keys()), key='log_city')
+            log_direction = st.radio('Direction', ['YES', 'NO'], horizontal=True, key='log_dir')
+        with bl2:
+            log_bracket = st.text_input('Bracket (e.g. 77-78)', key='log_bracket')
+            log_amount = st.number_input('Amount ($)', min_value=1.0, max_value=500.0, value=25.0, step=1.0, key='log_amount')
+        with bl3:
+            log_price = st.number_input('Price paid (cents)', min_value=1, max_value=99, value=40, key='log_price')
+            log_result = st.radio('Result', ['Pending', 'Won', 'Lost'], horizontal=True, key='log_result')
+
+        if st.button('Log Bet'):
+            bet_log = load_bet_log()
+            bet_log.append({
+                'date': get_eastern_date(),
+                'city': log_city,
+                'bracket': log_bracket,
+                'direction': log_direction,
+                'amount': log_amount,
+                'price': log_price,
+                'result': log_result,
+                'payout': round(log_amount * (100 - log_price) / log_price, 2) if log_result == 'Won' else 0.0,
+                'profit': round(log_amount * (100 - log_price) / log_price, 2) if log_result == 'Won' else -log_amount if log_result == 'Lost' else 0.0,
+            })
+            save_bet_log(bet_log)
+            st.success(f'Logged: {log_city} {log_bracket} {log_direction} ${log_amount} @ {log_price}c — {log_result}')
+            st.rerun()
+
+    with st.expander('📊 Bet Log History', expanded=False):
         bet_log = load_bet_log()
-        bet_log.append({
-            'date': get_eastern_date(),
-            'city': log_city,
-            'bracket': log_bracket,
-            'direction': log_direction,
-            'amount': log_amount,
-            'price': log_price,
-            'result': log_result,
-            'payout': round(log_amount * (100 - log_price) / log_price, 2) if log_result == 'Won' else 0.0,
-            'profit': round(log_amount * (100 - log_price) / log_price, 2) if log_result == 'Won' else -log_amount if log_result == 'Lost' else 0.0,
-        })
-        save_bet_log(bet_log)
-        st.success(f'Logged: {log_city} {log_bracket} {log_direction} ${log_amount} @ {log_price}c — {log_result}')
-        st.rerun()
+        if bet_log:
+            import pandas as pd
+            total_bets = len(bet_log)
+            settled = [b for b in bet_log if b['result'] != 'Pending']
+            won = [b for b in settled if b['result'] == 'Won']
+            total_wagered = sum(b['amount'] for b in settled)
+            total_profit = sum(b['profit'] for b in settled)
+            win_rate = round(100 * len(won) / len(settled)) if settled else 0
 
-with st.expander('📊 Bet Log History', expanded=False):
-    bet_log = load_bet_log()
-    if bet_log:
-        import pandas as pd
-        total_bets = len(bet_log)
-        settled = [b for b in bet_log if b['result'] != 'Pending']
-        won = [b for b in settled if b['result'] == 'Won']
-        total_wagered = sum(b['amount'] for b in settled)
-        total_profit = sum(b['profit'] for b in settled)
-        win_rate = round(100 * len(won) / len(settled)) if settled else 0
+            m1, m2, m3, m4, m5 = st.columns(5)
+            with m1: st.metric('Total Bets', total_bets)
+            with m2: st.metric('Win Rate', f'{win_rate}%')
+            with m3: st.metric('Total Wagered', f'${round(total_wagered, 2)}')
+            with m4: st.metric('Total P&L', f'{"+" if total_profit >= 0 else ""}{round(total_profit, 2)}')
+            with m5: st.metric('Pending', len([b for b in bet_log if b['result'] == 'Pending']))
 
-        m1, m2, m3, m4, m5 = st.columns(5)
-        with m1: st.metric('Total Bets', total_bets)
-        with m2: st.metric('Win Rate', f'{win_rate}%')
-        with m3: st.metric('Total Wagered', f'${round(total_wagered, 2)}')
-        with m4: st.metric('Total P&L', f'{"+" if total_profit >= 0 else ""}{round(total_profit, 2)}')
-        with m5: st.metric('Pending', len([b for b in bet_log if b['result'] == 'Pending']))
+            log_df = pd.DataFrame([{
+                'Date': b['date'], 'City': b['city'], 'Bracket': b['bracket'],
+                'Dir': b['direction'], 'Amount': f"${b['amount']}",
+                'Price': f"{b['price']}c", 'Result': b['result'],
+                'P&L': ('+' if b['profit'] >= 0 else '') + f"${round(b['profit'], 2)}" if b['result'] != 'Pending' else '—'
+            } for b in reversed(bet_log)])
+            st.dataframe(log_df, use_container_width=True, hide_index=True)
 
-        log_df = pd.DataFrame([{
-            'Date': b['date'], 'City': b['city'], 'Bracket': b['bracket'],
-            'Dir': b['direction'], 'Amount': f"${b['amount']}",
-            'Price': f"{b['price']}c", 'Result': b['result'],
-            'P&L': ('+' if b['profit'] >= 0 else '') + f"${round(b['profit'], 2)}" if b['result'] != 'Pending' else '—'
-        } for b in reversed(bet_log)])
-        st.dataframe(log_df, use_container_width=True, hide_index=True)
-
-        # Update result for pending bets
-        pending = [b for b in bet_log if b['result'] == 'Pending']
-        if pending:
-            st.markdown('**Update pending bets:**')
-            for i, b in enumerate(bet_log):
-                if b['result'] != 'Pending': continue
-                uc1, uc2, uc3 = st.columns([3, 2, 1])
-                with uc1: st.caption(f"{b['date']} — {b['city']} {b['bracket']} {b['direction']} ${b['amount']}")
-                with uc2: new_result = st.radio('', ['Pending', 'Won', 'Lost'], key=f'update_{i}', horizontal=True, index=0)
-                with uc3:
-                    if st.button('Update', key=f'upd_btn_{i}') and new_result != 'Pending':
-                        bet_log[i]['result'] = new_result
-                        bet_log[i]['profit'] = round(b['amount'] * (100 - b['price']) / b['price'], 2) if new_result == 'Won' else -b['amount']
-                        save_bet_log(bet_log)
-                        st.rerun()
-    else:
-        st.info('No bets logged yet. Use the form above to log your first bet.')
+            pending = [b for b in bet_log if b['result'] == 'Pending']
+            if pending:
+                st.markdown('**Update pending bets:**')
+                for i, b in enumerate(bet_log):
+                    if b['result'] != 'Pending': continue
+                    uc1, uc2, uc3 = st.columns([3, 2, 1])
+                    with uc1: st.caption(f"{b['date']} — {b['city']} {b['bracket']} {b['direction']} ${b['amount']}")
+                    with uc2: new_result = st.radio('', ['Pending', 'Won', 'Lost'], key=f'update_{i}', horizontal=True, index=0)
+                    with uc3:
+                        if st.button('Update', key=f'upd_btn_{i}') and new_result != 'Pending':
+                            bet_log[i]['result'] = new_result
+                            bet_log[i]['profit'] = round(b['amount'] * (100 - b['price']) / b['price'], 2) if new_result == 'Won' else -b['amount']
+                            save_bet_log(bet_log)
+                            st.rerun()
+        else:
+            st.info('No bets logged yet. Use the form above to log your first bet.')
+elif _bet_log_pw:
+    st.error('Incorrect password.')
