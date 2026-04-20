@@ -1,18 +1,15 @@
-# Kalshi High Temperature Model - V5.12
+# Kalshi High Temperature Model - V5.13
 #
-# Changes from V5.11:
-# 1. Auto-settlement for personal bet log — when the auto-settler fills in an
-#    actual high for a city/date, any Pending bets matching that city/date are
-#    automatically marked Won or Lost based on whether the bracket hit.
-# 2. New 'actual' and 'settled_at' fields added to bet log entries.
-# 3. Bet log table now displays the Actual high for settled bets.
-# 4. Version bump to V5.12
+# Changes from V5.12:
+# 1. SECURITY: Wethr API key and Supabase service_role key moved out of code
+#    and into Streamlit secrets (st.secrets). Fixes GitGuardian alert from
+#    April 20 — leaked JWT was rotated on Supabase side and legacy keys disabled.
+#    New Supabase key uses sb_secret_ format and lives in Streamlit secrets only.
+# 2. Version bump to V5.13
 #
-# All V5.11 logic retained unchanged:
-# - Red MAE flag in timezone banner
-# - Not ready city suppression (< 3 settled days)
-# - Consensus vs NWS gap warning
-# - Password-protected bet log
+# All V5.12 logic retained unchanged:
+# - Auto-settlement for personal bet log (Won/Lost filled in automatically)
+# - All V5.11 features (MAE flags, not-ready suppression, gap warnings, bet log)
 
 import math, re, json, time, requests
 import streamlit as st
@@ -272,7 +269,14 @@ PRICE_CACHE_MINUTES = 10
 
 MIN_EDGE = 8
 HEADERS = {'User-Agent': 'kalshi-temp-model/5.7', 'Accept': 'application/geo+json, application/json, text/html'}
-WETHR_API_KEY = '71ef19703ff3d73d3773cc339284915f40e3faf268aea7e712649d0695139a1c'
+# V5.13: read Wethr API key from Streamlit secrets (no longer hardcoded)
+try:
+    WETHR_API_KEY = st.secrets['wethr']['api_key']
+except Exception:
+    try:
+        WETHR_API_KEY = st.secrets['api_keys']['WETHR_API_KEY']
+    except Exception:
+        WETHR_API_KEY = ''
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
 
 CITY_TZ = {
@@ -437,8 +441,13 @@ REGIONAL_PRIOR_BIAS = {
 
 # ── Supabase ──────────────────────────────────────────────────────────────────
 # ── Supabase ──────────────────────────────────────────────────────────────────
-_SB_URL = 'https://oirnfhhuyjuotkrlymxd.supabase.co'
-_SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9pcm5maGh1eWp1b3Rrcmx5bXhkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDQ4NTk1NiwiZXhwIjoyMDkwMDYxOTU2fQ.ZzDSQbafOmlOirQpaFg5xRDc6S1f6rxRsH4lHdKaS88'
+# V5.13: read Supabase credentials from Streamlit secrets (no longer hardcoded)
+try:
+    _SB_URL = st.secrets['supabase']['url']
+    _SB_KEY = st.secrets['supabase']['key']
+except Exception:
+    _SB_URL = 'https://oirnfhhuyjuotkrlymxd.supabase.co'
+    _SB_KEY = ''
 
 def get_sb_headers():
     return {'apikey': _SB_KEY, 'Authorization': 'Bearer ' + _SB_KEY,
@@ -1626,9 +1635,9 @@ with st.sidebar:
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.12</div>', unsafe_allow_html=True)
-    st.markdown('- Auto-settle personal bet log')
-    st.markdown('- V5.11 features retained')
+    st.markdown('<div class="mph-section-header">🚀 V5.13</div>', unsafe_allow_html=True)
+    st.markdown('- Keys moved to st.secrets (security)')
+    st.markdown('- V5.12 auto-settle bet log retained')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1642,7 +1651,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.12</span>
+                <span class="mph-version-badge">V5.13</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
