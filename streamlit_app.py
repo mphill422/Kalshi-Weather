@@ -1,10 +1,11 @@
-# Kalshi High Temperature Model - V5.9
+# Kalshi High Temperature Model - V5.11
 #
-# Changes from V5.8:
-# 1. Timezone-grouped best signal banner (ET/CT/MT/PT blocks) with time remaining
-# 2. Auto-refresh every 10 minutes
-# 3. Mac/iPhone view toggle
-# 4. Betting window status per city shown in ET
+# Changes from V5.10:
+# 1. Red MAE flag in timezone banner — ⚠️ next to any signal with MAE >4F
+# 2. Not ready flag — cities with <3 settled days suppressed in banner
+# 3. Consensus vs NWS gap warning — flag if gap >3F next to signal
+# 4. Personal bet log — track bets placed, P&L, win rate
+# 5. Version bump to V5.11
 
 import math, re, json, time, requests
 import streamlit as st
@@ -1539,11 +1540,11 @@ with st.sidebar:
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.9</div>', unsafe_allow_html=True)
-    st.markdown('- Timezone-grouped best signal banner')
-    st.markdown('- ET/CT/MT/PT betting windows')
-    st.markdown('- Auto-refresh every 10 minutes')
-    st.markdown('- Mac/iPhone view toggle')
+    st.markdown('<div class="mph-section-header">🚀 V5.11</div>', unsafe_allow_html=True)
+    st.markdown('- Red MAE flag in timezone banner')
+    st.markdown('- Not ready city suppression')
+    st.markdown('- Consensus vs NWS gap warning')
+    st.markdown('- Personal bet log')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1557,7 +1558,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.9</span>
+                <span class="mph-version-badge">V5.11</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -1752,6 +1753,25 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
             members = nbm_pcts = c_temp = c_fc = None
             c_hour = 12
 
+        # V5.11: Get city MAE and settled days for flags
+        city_hist = sb_fetch_city(c)
+        city_complete = [r for r in city_hist if r.get('actual') is not None and r.get('error') is not None]
+        settled_days = len(city_complete)
+        if settled_days < 3:
+            # Not ready — suppress from banner
+            continue
+        city_mae = None
+        if city_complete:
+            recent_14 = city_complete[-14:]
+            city_errors = [abs(r['error']) for r in recent_14]
+            city_mae = round(sum(city_errors) / len(city_errors), 1)
+        red_mae = city_mae is not None and city_mae >= 4.0
+
+        # V5.11: Consensus vs NWS gap warning
+        c_nws = row.get('forecast')
+        consensus_nws_gap = abs(consensus_val - c_nws) if consensus_val and c_nws else None
+        big_gap = consensus_nws_gap is not None and consensus_nws_gap > 3.0
+
         _, price_fetched_at = get_cached_prices(c)
         price_age_min = round((time.time() - price_fetched_at) / 60) if price_fetched_at else 999
         if price_age_min > 120: continue
@@ -1760,16 +1780,21 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
             c, consensus_val, ladder, members, cached_markets, obs_h, high_unc, 500,
             nbm_percentiles=nbm_pcts, current_temp=c_temp, nws_forecast=c_fc, local_hour=c_hour)
 
+        # Build flag suffix
+        flags = ''
+        if red_mae: flags += f' ⚠️MAE:{city_mae}F'
+        if big_gap: flags += f' ⚠️Gap:{round(consensus_nws_gap,1)}F'
+
         if b_yes and b_yes != '—' and '+' in b_yes:
             try:
                 edge_val = float(b_yes.split('+')[1].split('c')[0])
-                yes_signals.append((edge_val, f'{c}: {b_yes}'))
+                yes_signals.append((edge_val, f'{c}: {b_yes}{flags}', red_mae))
             except Exception: pass
 
         if b_no and b_no != '—' and '+' in b_no:
             try:
                 edge_val = float(b_no.split('+')[1].split('c')[0])
-                no_signals.append((edge_val, f'{c}: {b_no}'))
+                no_signals.append((edge_val, f'{c}: {b_no}{flags}', red_mae))
             except Exception: pass
 
     yes_signals.sort(key=lambda x: x[0], reverse=True)
@@ -1786,8 +1811,14 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
         yes_html = '<div style="color:#ef4444; font-size:12px;">🔴 Window Closed</div>'
         no_html = '<div style="color:#ef4444; font-size:12px;">🔴 Window Closed</div>'
     else:
-        yes_html = ''.join([f'<div style="color:#00ff88; font-size:12px; font-family:\'JetBrains Mono\',monospace; margin-bottom:3px;">🟢 {sig}</div>' for _, sig in yes_signals]) or '<div style="color:#64748b; font-size:12px;">— No green YES signal</div>'
-        no_html = ''.join([f'<div style="color:#00ff88; font-size:12px; font-family:\'JetBrains Mono\',monospace; margin-bottom:3px;">🟢 {sig}</div>' for _, sig in no_signals]) or '<div style="color:#64748b; font-size:12px;">— No green NO signal</div>'
+        yes_html = ''.join([
+            f'<div style="color:{"#f59e0b" if red_mae else "#00ff88"}; font-size:12px; font-family:\'JetBrains Mono\',monospace; margin-bottom:3px;">{"🟡" if red_mae else "🟢"} {sig}</div>'
+            for _, sig, red_mae in yes_signals
+        ]) or '<div style="color:#64748b; font-size:12px;">— No green YES signal</div>'
+        no_html = ''.join([
+            f'<div style="color:{"#f59e0b" if red_mae else "#00ff88"}; font-size:12px; font-family:\'JetBrains Mono\',monospace; margin-bottom:3px;">{"🟡" if red_mae else "🟢"} {sig}</div>'
+            for _, sig, red_mae in no_signals
+        ]) or '<div style="color:#64748b; font-size:12px;">— No green NO signal</div>'
 
     st.markdown(f"""
 <div style="background:#0d1b2a; border:1px solid #1e3a5f; border-radius:10px; padding:14px 18px; margin-bottom:12px;">
@@ -2319,3 +2350,91 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
         st.caption(f'{status_icon} {n_saved_total}/18 cities | 🟢 {n_yes} YES signals | 🟢 {n_no} NO signals | ✅ {n_nbm} NBM active today{stale_str}')
     else:
         st.info('Loading predictions for all cities — this panel fills itself in automatically.')
+
+# ── V5.11: Personal Bet Log ───────────────────────────────────────────────────
+st.markdown('---')
+st.markdown('<div class="mph-section-header">📒 Personal Bet Log</div>', unsafe_allow_html=True)
+
+BET_LOG_FILE = Path('bet_log.json')
+
+def load_bet_log():
+    if BET_LOG_FILE.exists():
+        try: return json.loads(BET_LOG_FILE.read_text())
+        except Exception: return []
+    return []
+
+def save_bet_log(log):
+    BET_LOG_FILE.write_text(json.dumps(log, indent=2))
+
+with st.expander('📒 Log a Bet', expanded=False):
+    bl1, bl2, bl3 = st.columns(3)
+    with bl1:
+        log_city = st.selectbox('City', list(CITIES.keys()), key='log_city')
+        log_direction = st.radio('Direction', ['YES', 'NO'], horizontal=True, key='log_dir')
+    with bl2:
+        log_bracket = st.text_input('Bracket (e.g. 77-78)', key='log_bracket')
+        log_amount = st.number_input('Amount ($)', min_value=1.0, max_value=500.0, value=25.0, step=1.0, key='log_amount')
+    with bl3:
+        log_price = st.number_input('Price paid (cents)', min_value=1, max_value=99, value=40, key='log_price')
+        log_result = st.radio('Result', ['Pending', 'Won', 'Lost'], horizontal=True, key='log_result')
+
+    if st.button('Log Bet'):
+        bet_log = load_bet_log()
+        bet_log.append({
+            'date': get_eastern_date(),
+            'city': log_city,
+            'bracket': log_bracket,
+            'direction': log_direction,
+            'amount': log_amount,
+            'price': log_price,
+            'result': log_result,
+            'payout': round(log_amount * (100 - log_price) / log_price, 2) if log_result == 'Won' else 0.0,
+            'profit': round(log_amount * (100 - log_price) / log_price, 2) if log_result == 'Won' else -log_amount if log_result == 'Lost' else 0.0,
+        })
+        save_bet_log(bet_log)
+        st.success(f'Logged: {log_city} {log_bracket} {log_direction} ${log_amount} @ {log_price}c — {log_result}')
+        st.rerun()
+
+with st.expander('📊 Bet Log History', expanded=False):
+    bet_log = load_bet_log()
+    if bet_log:
+        import pandas as pd
+        total_bets = len(bet_log)
+        settled = [b for b in bet_log if b['result'] != 'Pending']
+        won = [b for b in settled if b['result'] == 'Won']
+        total_wagered = sum(b['amount'] for b in settled)
+        total_profit = sum(b['profit'] for b in settled)
+        win_rate = round(100 * len(won) / len(settled)) if settled else 0
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        with m1: st.metric('Total Bets', total_bets)
+        with m2: st.metric('Win Rate', f'{win_rate}%')
+        with m3: st.metric('Total Wagered', f'${round(total_wagered, 2)}')
+        with m4: st.metric('Total P&L', f'{"+" if total_profit >= 0 else ""}{round(total_profit, 2)}')
+        with m5: st.metric('Pending', len([b for b in bet_log if b['result'] == 'Pending']))
+
+        log_df = pd.DataFrame([{
+            'Date': b['date'], 'City': b['city'], 'Bracket': b['bracket'],
+            'Dir': b['direction'], 'Amount': f"${b['amount']}",
+            'Price': f"{b['price']}c", 'Result': b['result'],
+            'P&L': ('+' if b['profit'] >= 0 else '') + f"${round(b['profit'], 2)}" if b['result'] != 'Pending' else '—'
+        } for b in reversed(bet_log)])
+        st.dataframe(log_df, use_container_width=True, hide_index=True)
+
+        # Update result for pending bets
+        pending = [b for b in bet_log if b['result'] == 'Pending']
+        if pending:
+            st.markdown('**Update pending bets:**')
+            for i, b in enumerate(bet_log):
+                if b['result'] != 'Pending': continue
+                uc1, uc2, uc3 = st.columns([3, 2, 1])
+                with uc1: st.caption(f"{b['date']} — {b['city']} {b['bracket']} {b['direction']} ${b['amount']}")
+                with uc2: new_result = st.radio('', ['Pending', 'Won', 'Lost'], key=f'update_{i}', horizontal=True, index=0)
+                with uc3:
+                    if st.button('Update', key=f'upd_btn_{i}') and new_result != 'Pending':
+                        bet_log[i]['result'] = new_result
+                        bet_log[i]['profit'] = round(b['amount'] * (100 - b['price']) / b['price'], 2) if new_result == 'Won' else -b['amount']
+                        save_bet_log(bet_log)
+                        st.rerun()
+    else:
+        st.info('No bets logged yet. Use the form above to log your first bet.')
