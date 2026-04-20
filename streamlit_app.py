@@ -431,7 +431,7 @@ REGIONAL_PRIOR_BIAS = {
 # ── Supabase ──────────────────────────────────────────────────────────────────
 # ── Supabase ──────────────────────────────────────────────────────────────────
 _SB_URL = 'https://oirnfhhuyjuotkrlymxd.supabase.co'
-_SB_KEY = 'eyJhbGci0iJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9pcm5maGh1eWp1b3Rrcmx5bXhkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc0NDQ0NTk1NiwiZXhwIjoyMDYwMDIxOTU2fQ.ZzDSQbaf0ml0irQpaFg5xRDc6S1f6rxRsH41HdKaS88'
+_SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9pcm5maGh1eWp1b3Rrcmx5bXhkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDQ4NTk1NiwiZXhwIjoyMDkwMDYxOTU2fQ.ZzDSQbafOmlOirQpaFg5xRDc6S1f6rxRsH4lHdKaS88'
 
 def get_sb_headers():
     return {'apikey': _SB_KEY, 'Authorization': 'Bearer ' + _SB_KEY,
