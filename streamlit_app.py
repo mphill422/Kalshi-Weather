@@ -1,15 +1,28 @@
-# Kalshi High Temperature Model - V5.13
+# Kalshi High Temperature Model - V5.14
 #
-# Changes from V5.12:
-# 1. SECURITY: Wethr API key and Supabase service_role key moved out of code
-#    and into Streamlit secrets (st.secrets). Fixes GitGuardian alert from
-#    April 20 — leaked JWT was rotated on Supabase side and legacy keys disabled.
-#    New Supabase key uses sb_secret_ format and lives in Streamlit secrets only.
-# 2. Version bump to V5.13
+# Changes from V5.13:
+# 1. TRUST SCORE: Added 7-factor 0-100 trust score (imported from trust_score.py)
+#    - Bracket adjacency to 2 Degree Call (28% weight)
+#    - Ensemble tier (17%)
+#    - MAE color (17%)
+#    - NBM active vs fallback (12%)
+#    - GFS-NWS gap size (11%)
+#    - Bias adj magnitude (10%)
+#    - Model % tier (5%)
+# 2. TRUST TIER displayed as NEW column alongside existing Signal column.
+#    BET / CAUTION / SKIP with warnings shown below best-bet callouts.
+# 3. VETO rules: LOW ensemble or 2+ brackets away from 2DC force SKIP tier
+#    even if composite is high. NBM-off + large GFS gap downgrades to CAUTION.
+# 4. Stake tier suggestion (conviction / solid / lottery / tail) based on Model %.
+# 5. PARALLEL DISPLAY: Old BET/AVOID Signal column stays unchanged. Trust Tier
+#    runs alongside for 2-week A/B period before promotion decision.
 #
-# All V5.12 logic retained unchanged:
-# - Auto-settlement for personal bet log (Won/Lost filled in automatically)
+# All V5.13 logic retained unchanged:
+# - Streamlit secrets for Wethr API key and Supabase key (V5.13 security fix)
+# - Auto-settlement for personal bet log (V5.12)
 # - All V5.11 features (MAE flags, not-ready suppression, gap warnings, bet log)
+# - All city-specific bias corrections, thresholds, weights
+# - Morning suppression, cold front warnings, conviction conflict logic
 
 import math, re, json, time, requests
 import streamlit as st
@@ -17,6 +30,9 @@ from bs4 import BeautifulSoup
 from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
+
+# V5.14: trust score module (file lives in repo root as trust_score.py)
+from trust_score import SignalInputs, compute_trust_score, bracket_midpoint_from_label
 
 st.set_page_config(page_title='MPH Weather Model', layout='wide', page_icon='🌡️')
 
@@ -440,7 +456,6 @@ REGIONAL_PRIOR_BIAS = {
 }
 
 # ── Supabase ──────────────────────────────────────────────────────────────────
-# ── Supabase ──────────────────────────────────────────────────────────────────
 # V5.13: read Supabase credentials from Streamlit secrets (no longer hardcoded)
 try:
     _SB_URL = st.secrets['supabase']['url']
@@ -625,6 +640,29 @@ def compute_bias_correction_db(city, n_recent=14):
     errors = [r['actual'] - r['consensus'] for r in recent]
     mean_error = sum(errors) / len(errors)
     return round(max(-5.0, min(5.0, mean_error)), 2), len(recent)
+
+# ── V5.14: City MAE helper for trust score ──────────────────────────────────
+def get_city_mae_and_color(city, n_recent=14):
+    """
+    Returns (mae_float_or_None, color_string).
+    color: 'green' if <2.5F, 'yellow' if 2.5-4F, 'red' if >=4F.
+    When insufficient data, returns (None, 'green') — treat as neutral-trusting
+    since unknown MAE shouldn't actively penalize trust score yet.
+    """
+    rows = sb_fetch_city(city)
+    complete = [r for r in rows if r.get('actual') is not None and r.get('error') is not None]
+    if len(complete) < 3:
+        return None, 'green'
+    recent = complete[-n_recent:]
+    errors = [abs(r['error']) for r in recent]
+    mae = round(sum(errors) / len(errors), 2)
+    if mae < 2.5:
+        color = 'green'
+    elif mae < 4.0:
+        color = 'yellow'
+    else:
+        color = 'red'
+    return mae, color
 
 # ── High Uncertainty Threshold ────────────────────────────────────────────────
 def get_uncertainty_threshold(city):
@@ -1005,6 +1043,53 @@ def kelly_bet_no(model_prob, no_ask_cents, bankroll, fractional=0.15, max_pct=0.
     kelly_full = (p * odds - q) / odds
     if kelly_full <= 0: return 0.0
     return round(max(0.0, min(kelly_full * fractional * bankroll, max_pct * bankroll, max_dollars)), 2)
+
+# ── V5.14: Trust Score helper ──────────────────────────────────────────────
+def compute_row_trust(
+    city, bracket_label, direction, model_pct,
+    ensemble_tier, two_degree_call_str,
+    mae_color, nbm_active, nws_forecast_f, gfs_ensemble_f, bias_adj_f,
+):
+    """
+    Compute trust score for a single bracket row. Returns a TrustScoreResult.
+    Inputs are the same values the existing code already computes —
+    this just packages them into SignalInputs and calls compute_trust_score.
+    """
+    try:
+        inp = SignalInputs(
+            city=str(city or ''),
+            bracket_label=str(bracket_label or ''),
+            direction=str(direction or 'YES'),
+            two_degree_call=str(two_degree_call_str or ''),
+            bracket_midpoint=bracket_midpoint_from_label(bracket_label),
+            twodc_midpoint=bracket_midpoint_from_label(two_degree_call_str),
+            model_pct=float(model_pct or 0),
+            edge_cents=0.0,  # not used by trust score
+            ensemble_tier=str(ensemble_tier or ''),
+            mae_color=str(mae_color or 'green'),
+            nbm_active=bool(nbm_active),
+            nws_forecast_f=float(nws_forecast_f) if nws_forecast_f is not None else None,
+            gfs_ensemble_f=float(gfs_ensemble_f) if gfs_ensemble_f is not None else None,
+            bias_adj_f=float(bias_adj_f or 0),
+        )
+        return compute_trust_score(inp)
+    except Exception:
+        return None
+
+def trust_tier_icon(tier):
+    """UI icon for a trust tier."""
+    if tier == 'BET': return '🟢'
+    if tier == 'CAUTION': return '🟡'
+    if tier == 'SKIP': return '⚪'
+    return '—'
+
+def ensemble_tier_from_confidence(conf_str):
+    """Extract HIGH/MED/LOW from strings like '🔵 HIGH' or '🟡 MED' or '⚪ LOW'."""
+    if not conf_str: return ''
+    if 'HIGH' in conf_str: return 'HIGH'
+    if 'MED' in conf_str: return 'MED'
+    if 'LOW' in conf_str: return 'LOW'
+    return ''
 
 def get_city_best_signals(city, consensus, ladder_text, ensemble_members, kalshi_markets_data,
                           obs_high, high_uncertainty, bankroll, nbm_percentiles=None,
@@ -1630,14 +1715,23 @@ with st.sidebar:
     st.markdown('⚪ **No price** — Unpriced bracket')
     st.markdown('🔵 **HIGH** — Ensemble confident')
     st.markdown('---')
+    # V5.14: trust tier key
+    st.markdown('<div class="mph-section-header">🔐 V5.14 Trust Tier</div>', unsafe_allow_html=True)
+    st.markdown('🟢 **BET** — Trust ≥75')
+    st.markdown('🟡 **CAUTION** — Trust 55-74')
+    st.markdown('⚪ **SKIP** — Trust <55 or veto')
+    st.caption('Vetoes: LOW ensemble, bracket 2+ from 2DC, NBM-off + large GFS gap')
+    st.markdown('---')
     st.markdown('<div class="mph-section-header">🔬 MAE Guide</div>', unsafe_allow_html=True)
     st.markdown('✅ **<2.5F** — Well calibrated')
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.13</div>', unsafe_allow_html=True)
-    st.markdown('- Keys moved to st.secrets (security)')
-    st.markdown('- V5.12 auto-settle bet log retained')
+    st.markdown('<div class="mph-section-header">🚀 V5.14</div>', unsafe_allow_html=True)
+    st.markdown('- Trust score column (parallel A/B with BET/AVOID)')
+    st.markdown('- 7-factor composite, 3 tiers, veto rules')
+    st.markdown('- Stake tier suggestion by Model %')
+    st.markdown('- V5.13 security + V5.12 auto-settle retained')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1651,7 +1745,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.13</span>
+                <span class="mph-version-badge">V5.14</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -2179,6 +2273,9 @@ if forecast is not None and current is not None:
     _, sigma = bracket_probs(consensus, ladder_text, city, obs_high=obs_high_final, forecast=forecast)
     call = two_degree_call(consensus, ladder_text, obs_high=obs_high_final)
 
+    # V5.14: MAE color for trust score
+    city_mae_val, city_mae_color = get_city_mae_and_color(city)
+
     save_ok = sb_upsert_prediction(city=city, consensus=consensus, forecast=forecast,
                                     ensemble_mean=ensemble_mean, source_gap=source_gap,
                                     high_uncertainty=high_uncertainty, obs_high=obs_high_final,
@@ -2221,6 +2318,9 @@ if forecast is not None and current is not None:
     no_rows = []
     best_bet = best_no_bet = None
     best_edge = best_no_edge = -999
+    # V5.14: track trust-score best bets separately (parallel A/B)
+    best_trust_yes = None  # (trust_score, row_dict, warnings)
+    best_trust_no = None
 
     for label, base_prob in prob_rows:
         ens_prob = next((ensemble_bracket_prob(ensemble_members, lo, hi)
@@ -2245,22 +2345,59 @@ if forecast is not None and current is not None:
                                      conviction_conflict=conviction_conflict)
         kelly_no = kelly_bet_no(final_prob, no_ask, bankroll) if no_ask and no_icon == '🟢' else 0.0
         ens_conf = ensemble_confidence(ens_prob) if ens_prob is not None else ''
+        ens_tier_for_trust = ensemble_tier_from_confidence(ens_conf)
         edge_str = ('+'+str(e)+'c') if e and e > 0 else (str(e)+'c' if e is not None else 'none')
         no_edge_str = ('+'+str(no_e)+'c') if no_e and no_e > 0 else (str(no_e)+'c' if no_e is not None else 'none')
+
+        # ── V5.14: Trust score for YES side ─────────────────────────────
+        trust_yes = compute_row_trust(
+            city=city, bracket_label=label, direction='YES',
+            model_pct=final_prob * 100,
+            ensemble_tier=ens_tier_for_trust,
+            two_degree_call_str=call or '',
+            mae_color=city_mae_color,
+            nbm_active=used_nbm,
+            nws_forecast_f=nws_forecast, gfs_ensemble_f=ensemble_mean,
+            bias_adj_f=bias_correction,
+        )
+        trust_no = compute_row_trust(
+            city=city, bracket_label=label, direction='NO',
+            model_pct=(1.0 - final_prob) * 100,
+            ensemble_tier=ens_tier_for_trust,
+            two_degree_call_str=call or '',
+            mae_color=city_mae_color,
+            nbm_active=used_nbm,
+            nws_forecast_f=nws_forecast, gfs_ensemble_f=ensemble_mean,
+            bias_adj_f=bias_correction,
+        )
+        trust_y_score = round(trust_yes.composite, 1) if trust_yes else None
+        trust_y_tier = trust_yes.tier if trust_yes else ''
+        trust_y_stake = trust_yes.stake_suggestion_label if trust_yes else ''
+        trust_n_score = round(trust_no.composite, 1) if trust_no else None
+        trust_n_tier = trust_no.tier if trust_no else ''
+        trust_n_stake = trust_no.stake_suggestion_label if trust_no else ''
 
         yes_rows.append({'Signal': signal_icon + ' ' + signal_text if signal_text else '',
                          'Bracket': label + (' BUSTED' if busted else ''),
                          'Model %': str(round(final_prob*100, 1))+'%',
                          'Mkt Implied %': str(round(yes_ask, 1))+'%' if yes_ask else '—',
                          'Fair': str(fair)+'c', 'YES ask': str(yes_ask)+'c' if yes_ask is not None else '—',
-                         'Edge': edge_str, 'Kelly': ('$'+str(kelly)) if kelly > 0 else '—', 'Ensemble': ens_conf})
+                         'Edge': edge_str, 'Kelly': ('$'+str(kelly)) if kelly > 0 else '—', 'Ensemble': ens_conf,
+                         # V5.14: trust columns
+                         'Trust': str(trust_y_score) if trust_y_score is not None else '—',
+                         'Trust Tier': trust_tier_icon(trust_y_tier) + ' ' + trust_y_tier if trust_y_tier else '—',
+                         'Stake Tier': trust_y_stake or '—'})
         no_rows.append({'NO Signal': (no_icon + ' ' + no_text) if no_icon and no_text else '—',
                         'Bracket': label + (' BUSTED' if busted else ''),
                         'Model %': str(round(final_prob*100, 1))+'%',
                         'Mkt Implied %': str(round(no_ask, 1))+'%' if no_ask else '—',
                         'NO ask': str(no_ask)+'c' if no_ask is not None else '—',
                         'NO Edge': no_edge_str, 'Kelly NO': ('$'+str(kelly_no)) if kelly_no > 0 else '—',
-                        'Ensemble': ens_conf})
+                        'Ensemble': ens_conf,
+                        # V5.14: trust columns
+                        'Trust': str(trust_n_score) if trust_n_score is not None else '—',
+                        'Trust Tier': trust_tier_icon(trust_n_tier) + ' ' + trust_n_tier if trust_n_tier else '—',
+                        'Stake Tier': trust_n_stake or '—'})
 
         # V5.8: consensus alignment — don't bet YES below consensus or NO above consensus
         b_lo_d, b_hi_d = next(((lo, hi) for lbl, lo, hi in parse_ladder(ladder_text)
@@ -2282,6 +2419,17 @@ if forecast is not None and current is not None:
             best_no_edge = no_e
             best_no_bet = {'label': label, 'edge': no_e, 'kelly': kelly_no, 'busted': False, 'no_ask': no_ask}
 
+        # V5.14: trust-tier best bets (only consider BET-tier with positive edge,
+        # independent of old BET/AVOID system)
+        if (trust_yes and trust_yes.tier == 'BET' and e is not None and e >= MIN_EDGE
+                and not busted and not below_consensus_d):
+            if best_trust_yes is None or trust_yes.composite > best_trust_yes[0]:
+                best_trust_yes = (trust_yes.composite, label, e, kelly, trust_yes.warnings, trust_yes.stake_suggestion_label)
+        if (trust_no and trust_no.tier == 'BET' and no_e is not None and no_e >= MIN_EDGE
+                and not above_consensus_d):
+            if best_trust_no is None or trust_no.composite > best_trust_no[0]:
+                best_trust_no = (trust_no.composite, label, no_e, kelly_no, trust_no.warnings, trust_no.stake_suggestion_label)
+
     prob_source = '(NBM percentiles)' if used_nbm else '(sigma/normal fallback)'
     st.markdown(f'#### 🟢 YES Signals {prob_source}')
     st.dataframe(pd.DataFrame(yes_rows), use_container_width=True, hide_index=True)
@@ -2295,6 +2443,15 @@ if forecast is not None and current is not None:
     else:
         st.warning('No green YES signals — suppression or conviction conflict active.')
 
+    # V5.14: trust-tier best YES callout + warnings
+    if best_trust_yes:
+        ts_val, ts_label, ts_edge, ts_kelly, ts_warns, ts_stake = best_trust_yes
+        st.info(f'🔐 V5.14 Trust-Best YES: **{ts_label}** | Trust: {round(ts_val,1)}/100 | Edge: +{ts_edge}c | Kelly: ${ts_kelly} | Stake tier: {ts_stake}')
+        if ts_warns:
+            st.caption('⚠️ ' + ' | '.join(ts_warns))
+    else:
+        st.caption('🔐 V5.14 Trust: no YES bracket reached BET tier this run.')
+
     st.markdown(f'#### 🔴 NO Signals {prob_source}')
     st.dataframe(pd.DataFrame(no_rows), use_container_width=True, hide_index=True)
 
@@ -2303,6 +2460,15 @@ if forecast is not None and current is not None:
             st.success('🟢 Best NO Bet: **' + best_no_bet['label'] + ' NO** | BUSTED bracket | NO ask: ' + str(best_no_bet['no_ask']) + 'c | Kelly: $' + str(best_no_bet['kelly']))
         else:
             st.success('🟢 Best NO Bet: **' + best_no_bet['label'] + ' NO** | Edge: +' + str(best_no_bet['edge']) + 'c | NO ask: ' + str(best_no_bet['no_ask']) + 'c | Kelly: $' + str(best_no_bet['kelly']))
+
+    # V5.14: trust-tier best NO callout + warnings
+    if best_trust_no:
+        ts_val, ts_label, ts_edge, ts_kelly, ts_warns, ts_stake = best_trust_no
+        st.info(f'🔐 V5.14 Trust-Best NO: **{ts_label} NO** | Trust: {round(ts_val,1)}/100 | Edge: +{ts_edge}c | Kelly: ${ts_kelly} | Stake tier: {ts_stake}')
+        if ts_warns:
+            st.caption('⚠️ ' + ' | '.join(ts_warns))
+    else:
+        st.caption('🔐 V5.14 Trust: no NO bracket reached BET tier this run.')
 
     parsed = parse_ladder(ladder_text)
     top_b = next((b for b in parsed if b[2] is None), None)
