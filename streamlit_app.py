@@ -1,28 +1,30 @@
-# Kalshi High Temperature Model - V5.14
+# Kalshi High Temperature Model - V5.15
 #
-# Changes from V5.13:
-# 1. TRUST SCORE: Added 7-factor 0-100 trust score (imported from trust_score.py)
-#    - Bracket adjacency to 2 Degree Call (28% weight)
-#    - Ensemble tier (17%)
-#    - MAE color (17%)
-#    - NBM active vs fallback (12%)
-#    - GFS-NWS gap size (11%)
-#    - Bias adj magnitude (10%)
-#    - Model % tier (5%)
-# 2. TRUST TIER displayed as NEW column alongside existing Signal column.
-#    BET / CAUTION / SKIP with warnings shown below best-bet callouts.
-# 3. VETO rules: LOW ensemble or 2+ brackets away from 2DC force SKIP tier
-#    even if composite is high. NBM-off + large GFS gap downgrades to CAUTION.
-# 4. Stake tier suggestion (conviction / solid / lottery / tail) based on Model %.
-# 5. PARALLEL DISPLAY: Old BET/AVOID Signal column stays unchanged. Trust Tier
-#    runs alongside for 2-week A/B period before promotion decision.
+# Changes from V5.14:
+# 1. BET LOG → SUPABASE: Migrated from local bet_log.json to Supabase `bets`
+#    table. Survives Streamlit Cloud redeploys. Backwards-compatible shims for
+#    load_bet_log() so existing call sites still work during transition.
+# 2. EDIT / DELETE BUTTONS: Pending bets now have an Edit button (fix direction,
+#    bracket, amount, price typos) and every bet has a Delete button (remove
+#    ghost entries). No more GitHub JSON edits required.
+# 3. "BET LOGGED" CONFIRMATION: Persistent success banner under the Log Bet
+#    button after a new bet is saved — no more "did it save?" uncertainty.
+# 4. READABILITY PASS: Unified VERDICT column replaces separate Signal + Trust
+#    Tier + Stake Tier columns. Single callout per direction merges old Best
+#    Bet + Trust-Best. When Signal and Trust disagree → shows "SIGNALS DISAGREE"
+#    warning rather than recommending one over the other (safest default).
+#    Raw Trust score number tucked behind "View Details" expander.
+# 5. BROKEN TIMER REMOVED: Dropped the "minutes until close" countdown from the
+#    timezone banner (it wrapped around past the cutoff and was misleading).
 #
-# All V5.13 logic retained unchanged:
-# - Streamlit secrets for Wethr API key and Supabase key (V5.13 security fix)
-# - Auto-settlement for personal bet log (V5.12)
-# - All V5.11 features (MAE flags, not-ready suppression, gap warnings, bet log)
-# - All city-specific bias corrections, thresholds, weights
+# All V5.14 logic retained unchanged:
+# - Trust score module (trust_score.py) — same weights, same vetoes
+# - All V5.13 security (st.secrets for Wethr + Supabase keys)
+# - Auto-settlement for Supabase settlements (V5.12)
+# - All V5.11 features (MAE flags, not-ready suppression, gap warnings)
+# - All city-specific bias corrections, thresholds, GFS weights
 # - Morning suppression, cold front warnings, conviction conflict logic
+# - Timezone banner, Mac/iPhone toggle, Kalshi ladder sync
 
 import math, re, json, time, requests
 import streamlit as st
@@ -1621,17 +1623,60 @@ def save_city_prediction(city, weather, saved_ladders):
                                     bias_correction=bias_correction)
     return consensus, save_ok
 
-# ── V5.12: Bet Log Auto-Settlement ────────────────────────────────────────────
-BET_LOG_FILE = Path('bet_log.json')
+# ── V5.15: Bet Log in Supabase ────────────────────────────────────────────────
+# V5.15: Migrated from local bet_log.json to Supabase `bets` table.
+#        - Persists across Streamlit Cloud redeploys
+#        - Supports Edit/Delete via new CRUD helpers below
+#        - Legacy load_bet_log() kept as a compatibility shim so existing
+#          call sites (in settle_bet_log and elsewhere) continue to work.
 
+def sb_fetch_bets():
+    """Fetch all bets from Supabase, ordered by id ascending."""
+    try:
+        r = requests.get(sb_url('bets'), headers=get_sb_headers(),
+                         params={'order': 'id.asc', 'limit': '1000'}, timeout=10)
+        return r.json() if r.status_code == 200 else []
+    except Exception: return []
+
+def sb_insert_bet(bet_dict):
+    """Insert a single bet row. Returns the inserted row (with id) or None."""
+    try:
+        r = requests.post(sb_url('bets'), headers=get_sb_headers(),
+                          json=bet_dict, timeout=10)
+        if r.status_code in (200, 201):
+            rows = r.json()
+            return rows[0] if rows else None
+        st.error(f'Bet insert failed: {r.status_code} — {r.text[:200]}')
+        return None
+    except Exception as e:
+        st.error(f'Bet insert exception: {str(e)[:200]}')
+        return None
+
+def sb_update_bet(bet_id, updates):
+    """Update columns on a bet row by id. `updates` is a dict of column→value."""
+    try:
+        r = requests.patch(sb_url('bets') + '?id=eq.' + str(bet_id),
+                           headers=get_sb_headers(),
+                           json=updates, timeout=10)
+        return r.status_code in (200, 204)
+    except Exception: return False
+
+def sb_delete_bet(bet_id):
+    """Delete a bet row by id."""
+    try:
+        r = requests.delete(sb_url('bets') + '?id=eq.' + str(bet_id),
+                            headers=get_sb_headers(), timeout=10)
+        return r.status_code in (200, 204)
+    except Exception: return False
+
+# Backwards-compatible shim — settle_bet_log() still calls load_bet_log()
 def load_bet_log():
-    if BET_LOG_FILE.exists():
-        try: return json.loads(BET_LOG_FILE.read_text())
-        except Exception: return []
-    return []
+    return sb_fetch_bets()
 
 def save_bet_log(log):
-    BET_LOG_FILE.write_text(json.dumps(log, indent=2))
+    # Legacy whole-log saves are no longer used. Kept as no-op for safety.
+    # New writes go through sb_insert_bet / sb_update_bet / sb_delete_bet.
+    pass
 
 def bracket_hits(actual_temp, lo, hi):
     """
@@ -1651,16 +1696,17 @@ def bracket_hits(actual_temp, lo, hi):
 
 def settle_bet_log(settled_rows):
     """
-    V5.12: For each city/date that just settled, find Pending bets in the log
-    and mark them Won/Lost based on whether the bracket hit.
-    Returns list of bets that were just settled this run.
+    V5.15: For each city/date that just settled, find Pending bets in Supabase
+    and mark them Won/Lost based on whether the bracket hit. Writes updates
+    directly to Supabase per-row rather than rewriting a local JSON file.
+
+    Returns list of bets that were just settled this run (for UI toasts).
     """
     if not settled_rows: return []
-    bet_log = load_bet_log()
+    bet_log = sb_fetch_bets()
     if not bet_log: return []
     now_iso = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d %H:%M:%S ET')
     just_settled = []
-    changed = False
     for s in settled_rows:
         s_city = s.get('city')
         s_date = s.get('date')
@@ -1669,34 +1715,38 @@ def settle_bet_log(settled_rows):
         for b in bet_log:
             if b.get('result') != 'Pending': continue
             if b.get('city') != s_city: continue
-            if b.get('date') != s_date: continue
+            # Supabase returns date as 'YYYY-MM-DD' string — compare as strings
+            if str(b.get('date')) != s_date: continue
             bracket_str = b.get('bracket', '')
             lo, hi = label_to_numeric_key(bracket_str)
             if lo is None and hi is None:
-                # Couldn't parse bracket — leave pending and skip silently
                 continue
             hit = bracket_hits(s_actual, lo, hi)
             if hit is None: continue
             direction = (b.get('direction') or 'YES').upper()
             won = hit if direction == 'YES' else (not hit)
-            b['result'] = 'Won' if won else 'Lost'
             amount = float(b.get('amount', 0) or 0)
             price = float(b.get('price', 0) or 0)
             if won and price > 0:
-                b['profit'] = round(amount * (100 - price) / price, 2)
-                b['payout'] = b['profit']
+                profit = round(amount * (100 - price) / price, 2)
+                payout = profit
             else:
-                b['profit'] = -amount
-                b['payout'] = 0.0
-            b['actual'] = s_actual
-            b['settled_at'] = now_iso
-            just_settled.append({
-                'city': s_city, 'date': s_date, 'bracket': bracket_str,
-                'direction': direction, 'actual': s_actual, 'won': won,
-                'amount': amount, 'profit': b['profit'],
-            })
-            changed = True
-    if changed: save_bet_log(bet_log)
+                profit = -amount
+                payout = 0.0
+            updates = {
+                'result': 'Won' if won else 'Lost',
+                'profit': profit,
+                'payout': payout,
+                'actual': s_actual,
+                'settled_at': now_iso,
+            }
+            ok = sb_update_bet(b['id'], updates)
+            if ok:
+                just_settled.append({
+                    'city': s_city, 'date': s_date, 'bracket': bracket_str,
+                    'direction': direction, 'actual': s_actual, 'won': won,
+                    'amount': amount, 'profit': profit,
+                })
     return just_settled
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -1715,23 +1765,24 @@ with st.sidebar:
     st.markdown('⚪ **No price** — Unpriced bracket')
     st.markdown('🔵 **HIGH** — Ensemble confident')
     st.markdown('---')
-    # V5.14: trust tier key
-    st.markdown('<div class="mph-section-header">🔐 V5.14 Trust Tier</div>', unsafe_allow_html=True)
-    st.markdown('🟢 **BET** — Trust ≥75')
-    st.markdown('🟡 **CAUTION** — Trust 55-74')
-    st.markdown('⚪ **SKIP** — Trust <55 or veto')
-    st.caption('Vetoes: LOW ensemble, bracket 2+ from 2DC, NBM-off + large GFS gap')
+    # V5.15: unified Verdict key (replaces separate Signal + Trust Tier keys)
+    st.markdown('<div class="mph-section-header">🎯 Verdict Key</div>', unsafe_allow_html=True)
+    st.markdown('🟢 **BET** — Signal + Trust both green')
+    st.markdown('🟡 **CHECK / CAUTION** — mixed signals')
+    st.markdown('🔴 **SKIP** — Signal or Trust says skip')
+    st.caption('Trust veto rules: LOW ensemble, bracket 2+ from 2DC, NBM-off + large GFS gap')
     st.markdown('---')
     st.markdown('<div class="mph-section-header">🔬 MAE Guide</div>', unsafe_allow_html=True)
     st.markdown('✅ **<2.5F** — Well calibrated')
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.14</div>', unsafe_allow_html=True)
-    st.markdown('- Trust score column (parallel A/B with BET/AVOID)')
-    st.markdown('- 7-factor composite, 3 tiers, veto rules')
-    st.markdown('- Stake tier suggestion by Model %')
-    st.markdown('- V5.13 security + V5.12 auto-settle retained')
+    st.markdown('<div class="mph-section-header">🚀 V5.15</div>', unsafe_allow_html=True)
+    st.markdown('- Bet log now in Supabase (survives redeploys)')
+    st.markdown('- Edit / Delete buttons on bets')
+    st.markdown('- Unified VERDICT column (cleaner reading)')
+    st.markdown('- One merged Best Bet callout per direction')
+    st.markdown('- V5.14 trust score logic unchanged')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1745,7 +1796,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.14</span>
+                <span class="mph-version-badge">V5.15</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -1877,16 +1928,23 @@ def get_et_time_str():
     return datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p ET')
 
 def minutes_until_close(cutoff_et_hour):
+    """Kept for backwards compatibility — used in a few places to gate logic."""
     now_et = datetime.now(pytz.timezone('America/New_York'))
     close_et = now_et.replace(hour=cutoff_et_hour, minute=0, second=0, microsecond=0)
     diff = (close_et - now_et).total_seconds() / 60
     return int(diff)
 
 def window_status(cutoff_et_hour):
+    """
+    V5.15: Removed the misleading 'XYZ min left' countdown. The old version
+    rolled over past the cutoff and showed tomorrow's countdown, which was
+    confusing. Now just shows OPEN / CLOSING / CLOSED — the 'closes 2:00 PM ET'
+    label in the header tells you exactly when the window ends.
+    """
     mins = minutes_until_close(cutoff_et_hour)
     if mins <= 0: return '🔴 CLOSED', '#ef4444'
-    if mins <= 30: return f'⚠️ CLOSING in {mins}m', '#f59e0b'
-    return f'✅ OPEN — {mins}m left', '#00ff88'
+    if mins <= 30: return '⚠️ CLOSING SOON', '#f59e0b'
+    return '✅ OPEN', '#00ff88'
 
 TIMEZONE_STATIC_INFO = {
     'ET': {'sweet_spot': '10:00–11:30 AM ET', 'peak_heat': '2:00–4:00 PM ET'},
@@ -2318,9 +2376,40 @@ if forecast is not None and current is not None:
     no_rows = []
     best_bet = best_no_bet = None
     best_edge = best_no_edge = -999
-    # V5.14: track trust-score best bets separately (parallel A/B)
-    best_trust_yes = None  # (trust_score, row_dict, warnings)
+    # V5.14: track trust-score best bets separately
+    best_trust_yes = None  # (composite, label, edge, kelly, warnings, stake_label)
     best_trust_no = None
+
+    # V5.15: helper — combine Signal + Trust into a single Verdict string
+    def make_verdict(signal_icon, signal_text, trust_tier, stake_tier, kelly_amt, is_yes=True):
+        """
+        Build a single cell value summarizing what to do. Rules:
+          - 🟢 BET only if BOTH Signal says BET (🟢) AND Trust says BET
+          - 🟡 CHECK if signals partially agree (any green + no hard skip)
+          - 🔴 SKIP if Signal is red AVOID OR Trust is SKIP
+          - Stake tier shown inline in (parens) when betting
+        """
+        sig_is_bet = (signal_icon == '🟢')
+        sig_is_skip = (signal_icon == '🟡')
+        sig_is_avoid = (signal_icon == '🔴')
+        trust_bet = (trust_tier == 'BET')
+        trust_skip = (trust_tier == 'SKIP')
+        trust_caution = (trust_tier == 'CAUTION')
+
+        if sig_is_bet and trust_bet:
+            amt = ('$' + str(kelly_amt)) if kelly_amt and kelly_amt > 0 else ''
+            stake_tag = f' · {stake_tier}' if stake_tier else ''
+            return f'🟢 BET {amt}{stake_tag}'.strip()
+        if sig_is_avoid or trust_skip:
+            return '🔴 SKIP'
+        # Anything else — partial agreement or caution territory
+        if sig_is_bet and trust_caution:
+            return '🟡 CHECK (trust caution)'
+        if sig_is_skip and trust_bet:
+            return '🟡 CHECK (signal wary)'
+        if trust_caution:
+            return '🟡 CAUTION'
+        return '🟡 SKIP'
 
     for label, base_prob in prob_rows:
         ens_prob = next((ensemble_bracket_prob(ensemble_members, lo, hi)
@@ -2349,7 +2438,7 @@ if forecast is not None and current is not None:
         edge_str = ('+'+str(e)+'c') if e and e > 0 else (str(e)+'c' if e is not None else 'none')
         no_edge_str = ('+'+str(no_e)+'c') if no_e and no_e > 0 else (str(no_e)+'c' if no_e is not None else 'none')
 
-        # ── V5.14: Trust score for YES side ─────────────────────────────
+        # ── V5.14: Trust score for YES and NO sides ─────────────────────
         trust_yes = compute_row_trust(
             city=city, bracket_label=label, direction='YES',
             model_pct=final_prob * 100,
@@ -2377,27 +2466,36 @@ if forecast is not None and current is not None:
         trust_n_tier = trust_no.tier if trust_no else ''
         trust_n_stake = trust_no.stake_suggestion_label if trust_no else ''
 
-        yes_rows.append({'Signal': signal_icon + ' ' + signal_text if signal_text else '',
-                         'Bracket': label + (' BUSTED' if busted else ''),
-                         'Model %': str(round(final_prob*100, 1))+'%',
-                         'Mkt Implied %': str(round(yes_ask, 1))+'%' if yes_ask else '—',
-                         'Fair': str(fair)+'c', 'YES ask': str(yes_ask)+'c' if yes_ask is not None else '—',
-                         'Edge': edge_str, 'Kelly': ('$'+str(kelly)) if kelly > 0 else '—', 'Ensemble': ens_conf,
-                         # V5.14: trust columns
-                         'Trust': str(trust_y_score) if trust_y_score is not None else '—',
-                         'Trust Tier': trust_tier_icon(trust_y_tier) + ' ' + trust_y_tier if trust_y_tier else '—',
-                         'Stake Tier': trust_y_stake or '—'})
-        no_rows.append({'NO Signal': (no_icon + ' ' + no_text) if no_icon and no_text else '—',
-                        'Bracket': label + (' BUSTED' if busted else ''),
-                        'Model %': str(round(final_prob*100, 1))+'%',
-                        'Mkt Implied %': str(round(no_ask, 1))+'%' if no_ask else '—',
-                        'NO ask': str(no_ask)+'c' if no_ask is not None else '—',
-                        'NO Edge': no_edge_str, 'Kelly NO': ('$'+str(kelly_no)) if kelly_no > 0 else '—',
-                        'Ensemble': ens_conf,
-                        # V5.14: trust columns
-                        'Trust': str(trust_n_score) if trust_n_score is not None else '—',
-                        'Trust Tier': trust_tier_icon(trust_n_tier) + ' ' + trust_n_tier if trust_n_tier else '—',
-                        'Stake Tier': trust_n_stake or '—'})
+        # V5.15: unified Verdict column (Signal + Trust combined)
+        yes_verdict = make_verdict(signal_icon, signal_text, trust_y_tier,
+                                    trust_y_stake, kelly, is_yes=True)
+        no_verdict = make_verdict(no_icon, no_text, trust_n_tier,
+                                   trust_n_stake, kelly_no, is_yes=False)
+
+        yes_rows.append({
+            'Verdict': yes_verdict,
+            'Bracket': label + (' BUSTED' if busted else ''),
+            'Model %': str(round(final_prob*100, 1))+'%',
+            'Mkt Implied %': str(round(yes_ask, 1))+'%' if yes_ask else '—',
+            'Fair': str(fair)+'c',
+            'YES ask': str(yes_ask)+'c' if yes_ask is not None else '—',
+            'Edge': edge_str,
+            'Kelly': ('$'+str(kelly)) if kelly > 0 else '—',
+            'Ensemble': ens_conf,
+            # Trust score available but hidden in rendering (see expander below)
+            '_Trust': str(trust_y_score) if trust_y_score is not None else '—',
+        })
+        no_rows.append({
+            'Verdict': no_verdict,
+            'Bracket': label + (' BUSTED' if busted else ''),
+            'Model %': str(round(final_prob*100, 1))+'%',
+            'Mkt Implied %': str(round(no_ask, 1))+'%' if no_ask else '—',
+            'NO ask': str(no_ask)+'c' if no_ask is not None else '—',
+            'NO Edge': no_edge_str,
+            'Kelly NO': ('$'+str(kelly_no)) if kelly_no > 0 else '—',
+            'Ensemble': ens_conf,
+            '_Trust': str(trust_n_score) if trust_n_score is not None else '—',
+        })
 
         # V5.8: consensus alignment — don't bet YES below consensus or NO above consensus
         b_lo_d, b_hi_d = next(((lo, hi) for lbl, lo, hi in parse_ladder(ladder_text)
@@ -2419,8 +2517,7 @@ if forecast is not None and current is not None:
             best_no_edge = no_e
             best_no_bet = {'label': label, 'edge': no_e, 'kelly': kelly_no, 'busted': False, 'no_ask': no_ask}
 
-        # V5.14: trust-tier best bets (only consider BET-tier with positive edge,
-        # independent of old BET/AVOID system)
+        # V5.14: trust-tier best bets
         if (trust_yes and trust_yes.tier == 'BET' and e is not None and e >= MIN_EDGE
                 and not busted and not below_consensus_d):
             if best_trust_yes is None or trust_yes.composite > best_trust_yes[0]:
@@ -2431,44 +2528,109 @@ if forecast is not None and current is not None:
                 best_trust_no = (trust_no.composite, label, no_e, kelly_no, trust_no.warnings, trust_no.stake_suggestion_label)
 
     prob_source = '(NBM percentiles)' if used_nbm else '(sigma/normal fallback)'
+
+    # V5.15: Drop the _Trust hidden column from the default display dataframe
+    yes_display = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith('_')} for r in yes_rows])
+    no_display = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith('_')} for r in no_rows])
+
     st.markdown(f'#### 🟢 YES Signals {prob_source}')
-    st.dataframe(pd.DataFrame(yes_rows), use_container_width=True, hide_index=True)
+    st.dataframe(yes_display, use_container_width=True, hide_index=True)
 
-    if best_bet and best_bet['edge'] >= MIN_EDGE and not best_bet['uncertain']:
-        st.success('🟢 Best YES Bet: **' + best_bet['label'] + '** | Edge: +' + str(best_bet['edge']) + 'c | Kelly: $' + str(best_bet['kelly']))
-    elif best_bet and best_bet['edge'] >= MIN_EDGE and best_bet['uncertain']:
-        st.warning('Best YES edge: **' + best_bet['label'] + '** (+' + str(best_bet['edge']) + 'c) but HIGH UNCERTAINTY — consider skipping.')
-    elif best_bet:
-        st.warning('No YES bracket meets the ' + str(MIN_EDGE) + 'c minimum. Best: ' + best_bet['label'] + ' (+' + str(best_bet['edge']) + 'c)')
-    else:
-        st.warning('No green YES signals — suppression or conviction conflict active.')
+    # V5.15: MERGED Best YES callout — Signal + Trust unified.
+    # Four cases:
+    #   (A) Signal picks X AND Trust picks X (same)  → single strong green callout
+    #   (B) Signal picks X, Trust picks Y (differ)   → yellow "SIGNALS DISAGREE" warning
+    #   (C) Signal picks X, Trust has none           → yellow "signal only" note
+    #   (D) Trust picks X, Signal none               → yellow "trust only" note
+    #   (E) Neither picks anything                   → plain no-bet message
+    def _render_merged_best(best_sig, best_tr, side_label, side_suffix):
+        """side_label: 'YES' or 'NO'. side_suffix: '' for YES, ' NO' for NO."""
+        sig_label = best_sig['label'] if best_sig else None
+        tr_label = best_tr[1] if best_tr else None
 
-    # V5.14: trust-tier best YES callout + warnings
-    if best_trust_yes:
-        ts_val, ts_label, ts_edge, ts_kelly, ts_warns, ts_stake = best_trust_yes
-        st.info(f'🔐 V5.14 Trust-Best YES: **{ts_label}** | Trust: {round(ts_val,1)}/100 | Edge: +{ts_edge}c | Kelly: ${ts_kelly} | Stake tier: {ts_stake}')
-        if ts_warns:
-            st.caption('⚠️ ' + ' | '.join(ts_warns))
-    else:
-        st.caption('🔐 V5.14 Trust: no YES bracket reached BET tier this run.')
+        # Case A — both agree
+        if sig_label and tr_label and labels_match(sig_label, tr_label):
+            tr_score = round(best_tr[0], 1)
+            tr_stake = best_tr[5] or ''
+            warns = best_tr[4] or []
+            msg = (f"🟢 Best {side_label} Bet: **{sig_label}{side_suffix}** · "
+                   f"Edge +{best_sig['edge']}c · Kelly ${best_sig['kelly']} · "
+                   f"Trust {tr_score} · {tr_stake}" if tr_stake
+                   else f"🟢 Best {side_label} Bet: **{sig_label}{side_suffix}** · "
+                        f"Edge +{best_sig['edge']}c · Kelly ${best_sig['kelly']} · Trust {tr_score}")
+            if best_sig.get('uncertain'):
+                st.warning(msg + ' — ⚠️ HIGH UNCERTAINTY')
+            else:
+                st.success(msg)
+            if warns:
+                st.caption('⚠️ ' + ' | '.join(warns))
+            return
+
+        # Case B — both exist but disagree
+        if sig_label and tr_label and not labels_match(sig_label, tr_label):
+            tr_score = round(best_tr[0], 1)
+            st.warning(
+                f"⚠️ Signals disagree on best {side_label}: "
+                f"Signal picks **{sig_label}{side_suffix}** (+{best_sig['edge']}c) · "
+                f"Trust picks **{tr_label}{side_suffix}** (Trust {tr_score}) — "
+                f"no recommendation (verify manually)."
+            )
+            return
+
+        # Case C — signal only
+        if sig_label and not tr_label:
+            if best_sig.get('uncertain'):
+                st.warning(f"Signal best {side_label}: **{sig_label}{side_suffix}** "
+                           f"(+{best_sig['edge']}c) but HIGH UNCERTAINTY — "
+                           f"and Trust did not reach BET tier. Consider skipping.")
+            else:
+                st.info(f"Signal best {side_label}: **{sig_label}{side_suffix}** "
+                        f"(+{best_sig['edge']}c, Kelly ${best_sig['kelly']}) — "
+                        f"but Trust did not reach BET tier. Verify before betting.")
+            return
+
+        # Case D — trust only
+        if tr_label and not sig_label:
+            tr_score = round(best_tr[0], 1)
+            warns = best_tr[4] or []
+            st.info(f"Trust best {side_label}: **{tr_label}{side_suffix}** "
+                    f"(Trust {tr_score}, Edge +{best_tr[2]}c, Kelly ${best_tr[3]}) — "
+                    f"but Signal did not reach BET tier.")
+            if warns:
+                st.caption('⚠️ ' + ' | '.join(warns))
+            return
+
+        # Case E — nothing
+        st.caption(f"No green {side_label} — both Signal and Trust recommend skipping this run.")
+
+    _render_merged_best(best_bet, best_trust_yes, 'YES', '')
 
     st.markdown(f'#### 🔴 NO Signals {prob_source}')
-    st.dataframe(pd.DataFrame(no_rows), use_container_width=True, hide_index=True)
+    st.dataframe(no_display, use_container_width=True, hide_index=True)
 
-    if best_no_bet:
-        if best_no_bet['busted']:
-            st.success('🟢 Best NO Bet: **' + best_no_bet['label'] + ' NO** | BUSTED bracket | NO ask: ' + str(best_no_bet['no_ask']) + 'c | Kelly: $' + str(best_no_bet['kelly']))
-        else:
-            st.success('🟢 Best NO Bet: **' + best_no_bet['label'] + ' NO** | Edge: +' + str(best_no_bet['edge']) + 'c | NO ask: ' + str(best_no_bet['no_ask']) + 'c | Kelly: $' + str(best_no_bet['kelly']))
-
-    # V5.14: trust-tier best NO callout + warnings
-    if best_trust_no:
-        ts_val, ts_label, ts_edge, ts_kelly, ts_warns, ts_stake = best_trust_no
-        st.info(f'🔐 V5.14 Trust-Best NO: **{ts_label} NO** | Trust: {round(ts_val,1)}/100 | Edge: +{ts_edge}c | Kelly: ${ts_kelly} | Stake tier: {ts_stake}')
-        if ts_warns:
-            st.caption('⚠️ ' + ' | '.join(ts_warns))
+    # Wrap the old busted-NO case specially — the legacy best_no_bet dict has
+    # a 'busted' flag that the merged renderer above doesn't handle. So if NO
+    # is a busted BET NO, we bypass the renderer and show the classic callout.
+    if best_no_bet and best_no_bet.get('busted'):
+        st.success('🟢 Best NO Bet: **' + best_no_bet['label'] + ' NO** | BUSTED bracket | '
+                   'NO ask: ' + str(best_no_bet['no_ask']) + 'c | Kelly: $' + str(best_no_bet['kelly']))
+        # Also surface trust warning if trust-best disagrees
+        if best_trust_no and not labels_match(best_no_bet['label'], best_trust_no[1]):
+            st.caption(f"Note: Trust picks {best_trust_no[1]} NO (Trust {round(best_trust_no[0],1)}).")
     else:
-        st.caption('🔐 V5.14 Trust: no NO bracket reached BET tier this run.')
+        _render_merged_best(best_no_bet, best_trust_no, 'NO', ' NO')
+
+    # V5.15: Trust score detail expander — raw per-bracket scores
+    with st.expander('🔐 View Trust Score Details', expanded=False):
+        st.caption('Raw trust composite (0-100) per bracket. See sidebar for tier thresholds.')
+        trust_detail = pd.DataFrame([{
+            'Bracket': yr.get('Bracket', ''),
+            'YES Trust': yr.get('_Trust', '—'),
+            'NO Trust': nr.get('_Trust', '—') if nr else '—',
+            'Model %': yr.get('Model %', '—'),
+            'Ensemble': yr.get('Ensemble', ''),
+        } for yr, nr in zip(yes_rows, no_rows)])
+        st.dataframe(trust_detail, use_container_width=True, hide_index=True)
 
     parsed = parse_ladder(ladder_text)
     top_b = next((b for b in parsed if b[2] is None), None)
@@ -2622,8 +2784,9 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
     else:
         st.info('Loading predictions for all cities — this panel fills itself in automatically.')
 
-# ── V5.12: Personal Bet Log ───────────────────────────────────────────────────
-# (load_bet_log / save_bet_log defined near top with settle_bet_log)
+# ── V5.15: Personal Bet Log (Supabase-backed) ────────────────────────────────
+# Migrated from local JSON to Supabase `bets` table. Adds Edit and Delete
+# buttons per row plus a persistent "logged" confirmation banner.
 st.markdown('---')
 st.markdown('<div class="mph-section-header">📒 Personal Bet Log</div>', unsafe_allow_html=True)
 
@@ -2631,6 +2794,16 @@ _bet_log_pw = st.text_input('Enter password to access bet log', type='password',
 _correct_pw = '2974'
 
 if _bet_log_pw == _correct_pw:
+    # V5.15: persistent "logged" banner, survives the st.rerun() after saving
+    if st.session_state.get('_last_logged_bet'):
+        lb = st.session_state['_last_logged_bet']
+        st.success(f"✅ Logged: **{lb['city']} {lb['bracket']} {lb['direction']}** · "
+                   f"${lb['amount']} @ {lb['price']}c · {lb['result']}")
+        st.caption('(Shows once per session after logging. Clear this or log another bet.)')
+        if st.button('Clear confirmation', key='clear_log_confirm'):
+            st.session_state['_last_logged_bet'] = None
+            st.rerun()
+
     with st.expander('📒 Log a Bet', expanded=False):
         bl1, bl2, bl3 = st.columns(3)
         with bl1:
@@ -2643,35 +2816,49 @@ if _bet_log_pw == _correct_pw:
             log_price = st.number_input('Price paid (cents)', min_value=1, max_value=99, value=40, key='log_price')
             log_result = st.radio('Result', ['Pending', 'Won', 'Lost'], horizontal=True, key='log_result')
 
-        if st.button('Log Bet'):
-            bet_log = load_bet_log()
-            bet_log.append({
-                'date': get_eastern_date(),
-                'city': log_city,
-                'bracket': log_bracket,
-                'direction': log_direction,
-                'amount': log_amount,
-                'price': log_price,
-                'result': log_result,
-                'payout': round(log_amount * (100 - log_price) / log_price, 2) if log_result == 'Won' else 0.0,
-                'profit': round(log_amount * (100 - log_price) / log_price, 2) if log_result == 'Won' else -log_amount if log_result == 'Lost' else 0.0,
-                # V5.12: new fields populated by auto-settler
-                'actual': None,
-                'settled_at': None,
-            })
-            save_bet_log(bet_log)
-            st.success(f'Logged: {log_city} {log_bracket} {log_direction} ${log_amount} @ {log_price}c — {log_result}')
-            st.rerun()
+        if st.button('Log Bet', type='primary'):
+            # V5.15: validate + insert into Supabase
+            if not log_bracket or not log_bracket.strip():
+                st.error('Bracket is required (e.g. 77-78, or "74 or below").')
+            else:
+                profit_val = 0.0
+                payout_val = 0.0
+                if log_result == 'Won' and log_price > 0:
+                    profit_val = round(log_amount * (100 - log_price) / log_price, 2)
+                    payout_val = profit_val
+                elif log_result == 'Lost':
+                    profit_val = -log_amount
+                bet_row = {
+                    'date': get_eastern_date(),
+                    'city': log_city,
+                    'bracket': log_bracket.strip(),
+                    'direction': log_direction,
+                    'amount': float(log_amount),
+                    'price': int(log_price),
+                    'result': log_result,
+                    'payout': payout_val,
+                    'profit': profit_val,
+                    'actual': None,
+                    'settled_at': None,
+                }
+                inserted = sb_insert_bet(bet_row)
+                if inserted:
+                    st.session_state['_last_logged_bet'] = {
+                        'city': log_city, 'bracket': log_bracket.strip(),
+                        'direction': log_direction, 'amount': log_amount,
+                        'price': log_price, 'result': log_result,
+                    }
+                    st.rerun()
 
     with st.expander('📊 Bet Log History', expanded=False):
-        bet_log = load_bet_log()
+        bet_log = sb_fetch_bets()
         if bet_log:
             import pandas as pd
             total_bets = len(bet_log)
-            settled = [b for b in bet_log if b['result'] != 'Pending']
-            won = [b for b in settled if b['result'] == 'Won']
-            total_wagered = sum(b['amount'] for b in settled)
-            total_profit = sum(b['profit'] for b in settled)
+            settled = [b for b in bet_log if b.get('result') != 'Pending']
+            won = [b for b in settled if b.get('result') == 'Won']
+            total_wagered = sum(float(b.get('amount') or 0) for b in settled)
+            total_profit = sum(float(b.get('profit') or 0) for b in settled)
             win_rate = round(100 * len(won) / len(settled)) if settled else 0
 
             m1, m2, m3, m4, m5 = st.columns(5)
@@ -2679,33 +2866,109 @@ if _bet_log_pw == _correct_pw:
             with m2: st.metric('Win Rate', f'{win_rate}%')
             with m3: st.metric('Total Wagered', f'${round(total_wagered, 2)}')
             with m4: st.metric('Total P&L', f'{"+" if total_profit >= 0 else ""}{round(total_profit, 2)}')
-            with m5: st.metric('Pending', len([b for b in bet_log if b['result'] == 'Pending']))
+            with m5: st.metric('Pending', len([b for b in bet_log if b.get('result') == 'Pending']))
 
-            # V5.12: show Actual high column so you can see what settled each bet
             log_df = pd.DataFrame([{
-                'Date': b['date'], 'City': b['city'], 'Bracket': b['bracket'],
-                'Dir': b['direction'], 'Amount': f"${b['amount']}",
-                'Price': f"{b['price']}c", 'Result': b['result'],
+                'Date': b.get('date'),
+                'City': b.get('city'),
+                'Bracket': b.get('bracket'),
+                'Dir': b.get('direction'),
+                'Amount': f"${float(b.get('amount') or 0):g}",
+                'Price': f"{int(float(b.get('price') or 0))}c",
+                'Result': b.get('result'),
                 'Actual': (f"{b.get('actual')}F" if b.get('actual') is not None else '—'),
-                'P&L': ('+' if b['profit'] >= 0 else '') + f"${round(b['profit'], 2)}" if b['result'] != 'Pending' else '—'
+                'P&L': (('+' if (b.get('profit') or 0) >= 0 else '') +
+                        f"${round(float(b.get('profit') or 0), 2)}"
+                        if b.get('result') != 'Pending' else '—'),
             } for b in reversed(bet_log)])
             st.dataframe(log_df, use_container_width=True, hide_index=True)
 
-            pending = [b for b in bet_log if b['result'] == 'Pending']
-            if pending:
-                st.markdown('**Update pending bets:**')
-                st.caption('💡 V5.12: Bets auto-settle when the morning auto-settler runs. Manual override below if needed.')
-                for i, b in enumerate(bet_log):
-                    if b['result'] != 'Pending': continue
-                    uc1, uc2, uc3 = st.columns([3, 2, 1])
-                    with uc1: st.caption(f"{b['date']} — {b['city']} {b['bracket']} {b['direction']} ${b['amount']}")
-                    with uc2: new_result = st.radio('', ['Pending', 'Won', 'Lost'], key=f'update_{i}', horizontal=True, index=0)
-                    with uc3:
-                        if st.button('Update', key=f'upd_btn_{i}') and new_result != 'Pending':
-                            bet_log[i]['result'] = new_result
-                            bet_log[i]['profit'] = round(b['amount'] * (100 - b['price']) / b['price'], 2) if new_result == 'Won' else -b['amount']
-                            save_bet_log(bet_log)
-                            st.rerun()
+            # V5.15: EDIT / DELETE controls per row
+            st.markdown('**Edit or Delete bets:**')
+            st.caption('💡 V5.15: Fix typos on pending bets. Delete ghost entries. '
+                       'Changes save directly to Supabase.')
+
+            for b in reversed(bet_log):
+                bet_id = b.get('id')
+                if bet_id is None: continue
+                summary = (f"#{bet_id} — {b.get('date')} · {b.get('city')} · "
+                           f"{b.get('bracket')} · {b.get('direction')} · "
+                           f"${float(b.get('amount') or 0):g} @ {int(float(b.get('price') or 0))}c · "
+                           f"{b.get('result')}")
+
+                with st.expander(summary, expanded=False):
+                    # --- Edit form ---
+                    ec1, ec2, ec3 = st.columns(3)
+                    with ec1:
+                        new_city = st.selectbox(
+                            'City', list(CITIES.keys()),
+                            index=list(CITIES.keys()).index(b.get('city')) if b.get('city') in CITIES else 0,
+                            key=f'edit_city_{bet_id}')
+                        new_direction = st.radio(
+                            'Direction', ['YES', 'NO'], horizontal=True,
+                            index=0 if b.get('direction') == 'YES' else 1,
+                            key=f'edit_dir_{bet_id}')
+                    with ec2:
+                        new_bracket = st.text_input(
+                            'Bracket', value=b.get('bracket', ''),
+                            key=f'edit_bracket_{bet_id}')
+                        new_amount = st.number_input(
+                            'Amount ($)', min_value=1.0, max_value=500.0,
+                            value=float(b.get('amount') or 1.0), step=1.0,
+                            key=f'edit_amount_{bet_id}')
+                    with ec3:
+                        new_price = st.number_input(
+                            'Price (cents)', min_value=1, max_value=99,
+                            value=int(float(b.get('price') or 40)),
+                            key=f'edit_price_{bet_id}')
+                        new_result = st.radio(
+                            'Result', ['Pending', 'Won', 'Lost'], horizontal=True,
+                            index=['Pending', 'Won', 'Lost'].index(b.get('result')) if b.get('result') in ('Pending', 'Won', 'Lost') else 0,
+                            key=f'edit_result_{bet_id}')
+
+                    bc1, bc2, bc3 = st.columns([1, 1, 4])
+                    with bc1:
+                        if st.button('Save Edit', key=f'save_{bet_id}', type='primary'):
+                            profit_val = 0.0
+                            payout_val = 0.0
+                            if new_result == 'Won' and new_price > 0:
+                                profit_val = round(new_amount * (100 - new_price) / new_price, 2)
+                                payout_val = profit_val
+                            elif new_result == 'Lost':
+                                profit_val = -new_amount
+                            updates = {
+                                'city': new_city,
+                                'bracket': new_bracket.strip(),
+                                'direction': new_direction,
+                                'amount': float(new_amount),
+                                'price': int(new_price),
+                                'result': new_result,
+                                'profit': profit_val,
+                                'payout': payout_val,
+                            }
+                            if sb_update_bet(bet_id, updates):
+                                st.success('✅ Bet updated.')
+                                st.rerun()
+                            else:
+                                st.error('Update failed.')
+                    with bc2:
+                        # Two-step delete — confirm before actually deleting
+                        confirm_key = f'confirm_del_{bet_id}'
+                        if st.session_state.get(confirm_key):
+                            if st.button('⚠️ Confirm Delete', key=f'del_{bet_id}'):
+                                if sb_delete_bet(bet_id):
+                                    st.session_state[confirm_key] = False
+                                    st.success('🗑️ Bet deleted.')
+                                    st.rerun()
+                                else:
+                                    st.error('Delete failed.')
+                        else:
+                            if st.button('🗑️ Delete', key=f'del_btn_{bet_id}'):
+                                st.session_state[confirm_key] = True
+                                st.rerun()
+                    with bc3:
+                        if st.session_state.get(f'confirm_del_{bet_id}'):
+                            st.caption('⚠️ Click "Confirm Delete" to permanently remove this bet, or collapse this row to cancel.')
         else:
             st.info('No bets logged yet. Use the form above to log your first bet.')
 elif _bet_log_pw:
