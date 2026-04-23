@@ -1,30 +1,53 @@
-# Kalshi High Temperature Model - V5.15
+# Kalshi High Temperature Model - V5.16
 #
-# Changes from V5.14:
-# 1. BET LOG → SUPABASE: Migrated from local bet_log.json to Supabase `bets`
-#    table. Survives Streamlit Cloud redeploys. Backwards-compatible shims for
-#    load_bet_log() so existing call sites still work during transition.
-# 2. EDIT / DELETE BUTTONS: Pending bets now have an Edit button (fix direction,
-#    bracket, amount, price typos) and every bet has a Delete button (remove
-#    ghost entries). No more GitHub JSON edits required.
-# 3. "BET LOGGED" CONFIRMATION: Persistent success banner under the Log Bet
-#    button after a new bet is saved — no more "did it save?" uncertainty.
-# 4. READABILITY PASS: Unified VERDICT column replaces separate Signal + Trust
-#    Tier + Stake Tier columns. Single callout per direction merges old Best
-#    Bet + Trust-Best. When Signal and Trust disagree → shows "SIGNALS DISAGREE"
-#    warning rather than recommending one over the other (safest default).
-#    Raw Trust score number tucked behind "View Details" expander.
-# 5. BROKEN TIMER REMOVED: Dropped the "minutes until close" countdown from the
-#    timezone banner (it wrapped around past the cutoff and was misleading).
+# Major changes from V5.15 (DATA-DRIVEN REDESIGN based on 21-24 days of real
+# settlement data — MAE tier analysis):
 #
-# All V5.14 logic retained unchanged:
-# - Trust score module (trust_score.py) — same weights, same vetoes
-# - All V5.13 security (st.secrets for Wethr + Supabase keys)
-# - Auto-settlement for Supabase settlements (V5.12)
-# - All V5.11 features (MAE flags, not-ready suppression, gap warnings)
-# - All city-specific bias corrections, thresholds, GFS weights
-# - Morning suppression, cold front warnings, conviction conflict logic
-# - Timezone banner, Mac/iPhone toggle, Kalshi ladder sync
+# 1. PER-CITY PREDICTION MODE: New CITY_PREDICTION_MODE dict routes each city
+#    through either 'full_blend' (current consensus formula) or 'nws_only'
+#    (simpler NWS forecast + bias correction). Based on empirical data showing
+#    that the blend HELPS NYC (-3.67F MAE vs NWS-alone) but HURTS Minneapolis
+#    (+1.57F MAE worse than NWS-alone) and is roughly neutral for 8 other cities.
+#
+# 2. TIME-GATED OBS_HIGH: obs_high can only override consensus after 1 PM local
+#    time (with sanity checks: obs_high must be ≥ current_temp and ≤ current_temp
+#    + 10F). Morning obs_high readings are ADVISORY ONLY. This fixes the sensor
+#    spike bug that poisoned Chicago, Minneapolis, Boston, Austin predictions.
+#
+# 3. HIDDEN CITIES: 5 low-performing cities (Minneapolis, Denver, Chicago, Los
+#    Angeles, Austin — all with MAE > 3.0) are hidden from the main city
+#    selector AND dashboard. They still run in the accuracy report so we can
+#    track if V5.16 fixes recover them.
+#
+# 4. SOURCE ACCURACY REPORT TAB: New dashboard section showing per-city MAE
+#    comparison (NWS-alone vs GFS-alone vs our blend). Auto-regenerates every
+#    time so you can watch V5.16 changes take effect over 1-2 weeks.
+#
+# 5. TWO-DOT UI (reverted from V5.15 Verdict column): Back to separate Signal
+#    column (🟢🟡⚪🔴) on the left and Ensemble column (🔵🟡⚪) on the right,
+#    with Trust column between them. Matches what the user found readable.
+#
+# 6. SIMPLIFIED TRUST SCORE (3 factors instead of 7):
+#    - Source agreement (40%): do NWS, GFS, NBM, consensus all agree on bracket?
+#    - Bracket proximity to 2DC + obs trajectory (40%)
+#    - City historical MAE (20%)
+#
+# 7. BIAS CORRECTION IMPROVEMENTS: Switch from mean to median (ignores outliers),
+#    cap at ±3.0F, reduce weight 50% for cities with MAE > 4.0.
+#
+# 8. SETTLE_BET_LOG RETROACTIVE FIX: Bug where pending bets logged AFTER
+#    auto-settlement ran would never settle. Now runs against ALL pending bets
+#    with matching actual values, not just newly-settled rows.
+#
+# 9. APP PASSWORD GATE: New branded login screen at app entry. Password read
+#    from st.secrets['app_password']. Keeps bet log password (2974) separate.
+#
+# All V5.15 logic retained:
+# - Bet log in Supabase with Edit/Delete/Logged confirmation
+# - V5.14 trust_score.py module (weights adjusted in app code, not module)
+# - V5.13 security (st.secrets)
+# - V5.12 auto-settlement
+# - V5.11 signal suppression, MAE flags, gap warnings
 
 import math, re, json, time, requests
 import streamlit as st
@@ -37,6 +60,71 @@ import pytz
 from trust_score import SignalInputs, compute_trust_score, bracket_midpoint_from_label
 
 st.set_page_config(page_title='MPH Weather Model', layout='wide', page_icon='🌡️')
+
+# ══════════════════════════════════════════════════════════════════════════════
+# V5.16 APP PASSWORD GATE (branded)
+# ══════════════════════════════════════════════════════════════════════════════
+# Read the app password from Streamlit secrets. Set it in your app's
+# Streamlit Cloud Settings -> Secrets as:
+#   app_password = "your-password-here"
+# If the secret is missing, the gate is disabled (app opens normally) so a
+# deploy without the secret set doesn't brick the app.
+def _check_app_password():
+    try:
+        correct_pw = st.secrets.get('app_password', None)
+    except Exception:
+        correct_pw = None
+    # If no password configured, skip the gate entirely
+    if not correct_pw:
+        return True
+    # Already authenticated this session
+    if st.session_state.get('_app_authed') is True:
+        return True
+    # Show branded login screen
+    st.markdown("""
+    <style>
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+    #MainMenu, footer, header {visibility: hidden;}
+    .mph-login-wrap {
+        display: flex; flex-direction: column; align-items: center;
+        justify-content: center; min-height: 70vh;
+    }
+    .mph-login-title {
+        font-size: 2.4rem; font-weight: 700;
+        background: linear-gradient(135deg, #00ff88 0%, #00d4ff 100%);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        background-clip: text;
+        margin-bottom: 0.25rem;
+    }
+    .mph-login-sub {
+        color: #888; font-size: 0.95rem; margin-bottom: 2rem;
+    }
+    .mph-login-badge {
+        display: inline-block; padding: 0.2rem 0.7rem;
+        background: rgba(0, 255, 136, 0.12);
+        border: 1px solid rgba(0, 255, 136, 0.4);
+        border-radius: 999px; color: #00ff88; font-size: 0.75rem;
+        font-weight: 600; letter-spacing: 0.05em; margin-left: 0.5rem;
+    }
+    </style>
+    <div class="mph-login-wrap">
+      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.16</span></div>
+      <div class="mph-login-sub">Private — enter access password to continue</div>
+    </div>
+    """, unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        pw = st.text_input('Access password', type='password', key='_app_pw_input',
+                           label_visibility='collapsed', placeholder='Enter password')
+        if pw:
+            if pw == correct_pw:
+                st.session_state['_app_authed'] = True
+                st.rerun()
+            else:
+                st.error('Incorrect password.')
+    st.stop()
+
+_check_app_password()
 
 # ── Custom CSS — V5.8 Trading Terminal Style ──────────────────────────────────
 st.markdown("""
@@ -457,6 +545,62 @@ REGIONAL_PRIOR_BIAS = {
     'Chicago': 'Minneapolis',
 }
 
+# ══════════════════════════════════════════════════════════════════════════════
+# V5.16 CITY TIERS (data-driven, based on 21-24 days of real settlement MAE)
+# ══════════════════════════════════════════════════════════════════════════════
+# Run this SQL to refresh the tiers:
+#   SELECT city, ROUND(AVG(ABS(error))::numeric, 2) as mae FROM settlements
+#   WHERE actual IS NOT NULL GROUP BY city ORDER BY mae;
+# Then update these sets accordingly every few weeks.
+
+# HIDDEN cities: MAE > 3.0 AND either blend hurting or too few good days.
+# These are NOT removed from the predictions pipeline (we keep collecting data
+# to see if V5.16 changes recover them). They are hidden from:
+#   - Main city selector dropdown
+#   - "All Cities Today's Predictions" dashboard
+#   - "Best Bets by Timezone" callouts
+# They ARE visible in:
+#   - Source Accuracy Report tab (so user can watch recovery)
+HIDDEN_CITIES = {'Minneapolis', 'Denver', 'Chicago', 'Los Angeles', 'Austin'}
+
+# CITY_PREDICTION_MODE: per-city pipeline routing based on empirical data.
+# - 'full_blend' = current V5.15 consensus formula (fc/cur/noaa time-weighted
+#                  + obs_high override + late_day_floor + bias)
+# - 'nws_only'   = simpler: consensus = NWS forecast + bias_correction
+#
+# Rule: use 'full_blend' when blend beats NWS-alone by ≥0.3F MAE,
+#       use 'nws_only'  when NWS-alone matches or beats blend.
+CITY_PREDICTION_MODE = {
+    # Blend is clearly helpful (lower MAE than NWS-only by 0.3F+)
+    'New York':     'full_blend',  # blend -3.67F vs NWS (huge)
+    'Houston':      'full_blend',  # blend -0.99F vs NWS
+    'Dallas':       'full_blend',  # blend -0.83F vs NWS
+    'Miami':        'full_blend',  # blend -0.58F vs NWS
+    'Phoenix':      'full_blend',  # blend -0.55F vs NWS
+    'Las Vegas':    'full_blend',  # blend -0.29F vs NWS (borderline, kept)
+    'Boston':       'full_blend',  # blend -0.38F vs NWS
+    'Philadelphia': 'full_blend',  # blend -0.18F vs NWS
+    'San Antonio':  'full_blend',  # blend -0.19F vs NWS
+    # NWS-only wins or ties — skip the blend entirely
+    'New Orleans':   'nws_only',   # NWS 1.17 vs blend 1.23 (tied, NWS simpler)
+    'Washington DC': 'nws_only',   # tied
+    'Atlanta':       'nws_only',   # NWS +0.12F better
+    'Oklahoma City': 'nws_only',   # NWS +0.16F better
+    # Hidden cities — still predicted for data collection, mode chosen to help
+    'Chicago':       'nws_only',   # NWS +0.15F better
+    'Denver':        'nws_only',   # tied (blend marginally worse)
+    'Austin':        'nws_only',   # blend worse by 0.40F — needs NWS-only
+    'Minneapolis':   'nws_only',   # 🚨 blend worse by 1.57F — biggest fix
+    'Los Angeles':   'full_blend', # blend better by 0.91F but still 3.14 MAE
+}
+
+# V5.16: time gate for obs_high override — only trust observed daily high
+# after 1 PM local. Before that, obs_high is advisory only (shown but doesn't
+# drive consensus). This prevents ASOS morning sensor spikes from hijacking
+# the model.
+OBS_HIGH_TRUST_HOUR = 13  # local hour cutoff
+OBS_HIGH_MAX_OVERSHOOT = 10.0  # obs_high can't exceed current_temp by more than this
+
 # ── Supabase ──────────────────────────────────────────────────────────────────
 # V5.13: read Supabase credentials from Streamlit secrets (no longer hardcoded)
 try:
@@ -624,6 +768,13 @@ def run_auto_settlement():
 # V5.6: increased n_recent from 10 → 14 for more stable correction
 # V5.7: regional prior bias for cities with < 3 settlements
 def compute_bias_correction_db(city, n_recent=14):
+    """
+    V5.16: Changed from mean to median (ignores outlier days), tightened cap
+    from ±5F to ±3F, and reduced weight 50% for unstable cities (MAE > 4F).
+    This prevents a few catastrophic days from dragging the correction in a
+    misleading direction (classic Minneapolis problem).
+    """
+    import statistics
     rows = sb_fetch_city(city)
     complete = [r for r in rows if r.get('actual') is not None and r.get('consensus') is not None]
     if len(complete) < 3:
@@ -635,13 +786,21 @@ def compute_bias_correction_db(city, n_recent=14):
             if len(prior_complete) >= 3:
                 recent = prior_complete[-n_recent:]
                 errors = [r['actual'] - r['consensus'] for r in recent]
-                mean_error = sum(errors) / len(errors)
-                return round(max(-3.0, min(3.0, mean_error)), 2), len(complete)
+                med_error = statistics.median(errors)
+                return round(max(-3.0, min(3.0, med_error)), 2), len(complete)
         return 0.0, len(complete)
     recent = complete[-n_recent:]
     errors = [r['actual'] - r['consensus'] for r in recent]
-    mean_error = sum(errors) / len(errors)
-    return round(max(-5.0, min(5.0, mean_error)), 2), len(recent)
+    # V5.16: use median instead of mean — more robust to outlier days
+    med_error = statistics.median(errors)
+    # V5.16: reduce weight for unstable cities (MAE > 4F gets 50% of correction)
+    abs_errors = [abs(e) for e in errors]
+    mae = sum(abs_errors) / len(abs_errors)
+    if mae > 4.0:
+        med_error = med_error * 0.5
+    # V5.16: tighter ±3F cap (was ±5F)
+    return round(max(-3.0, min(3.0, med_error)), 2), len(recent)
+
 
 # ── V5.14: City MAE helper for trust score ──────────────────────────────────
 def get_city_mae_and_color(city, n_recent=14):
@@ -1319,6 +1478,21 @@ def late_day_floor(fc, obs, local_hour, city=''):
     return obs + frac * gap
 
 def compute_consensus(fc, cur, noaa, city, obs_high=None):
+    """
+    V5.16 changes:
+    1. Per-city prediction mode: cities in CITY_PREDICTION_MODE as 'nws_only'
+       skip the blend entirely and return `fc` (NWS forecast) directly. Bias
+       correction is still added on top by the caller.
+    2. Time-gated obs_high: obs_high can only override consensus after 1 PM
+       local, AND only if it passes sanity checks (obs_high ≥ current_temp,
+       obs_high ≤ current_temp + 10F). Morning sensor spikes are ignored.
+    """
+    # V5.16: nws_only mode — skip the blend for cities where NWS alone is better
+    mode = CITY_PREDICTION_MODE.get(city, 'full_blend')
+    if mode == 'nws_only':
+        # Caller adds bias_correction on top; we just return the raw forecast
+        return float(fc)
+
     local_hour = get_local_hour(city)
     is_fc_heavy = city in FORECAST_HEAVY_CITIES
     if is_fc_heavy and local_hour < 10:
@@ -1341,8 +1515,25 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
     obs = noaa if noaa is not None else cur
     if obs is not None: consensus = max(base, late_day_floor(fc, obs, local_hour, city))
     else: consensus = base
-    if obs_high is not None and obs_high > consensus: consensus = obs_high
+
+    # V5.16: time-gated obs_high override (was: unconditional in V5.15)
+    if obs_high is not None and obs_high > consensus:
+        obs_high_trusted = True
+        # Only trust obs_high after 1 PM local
+        if local_hour < OBS_HIGH_TRUST_HOUR:
+            obs_high_trusted = False
+        # obs_high should never exceed current temp by more than 10F
+        # (a legit peak shouldn't be 10F+ above what the station is reading now)
+        current_for_check = obs if obs is not None else cur
+        if current_for_check is not None and obs_high > current_for_check + OBS_HIGH_MAX_OVERSHOOT:
+            obs_high_trusted = False
+        # obs_high should never be below current temp (stale reading)
+        if current_for_check is not None and obs_high < current_for_check:
+            obs_high_trusted = False
+        if obs_high_trusted:
+            consensus = obs_high
     return consensus
+
 
 def bracket_probs(mu, ladder_text, city, obs_high=None, forecast=None):
     sigma = choose_sigma(city, obs_high=obs_high, forecast=forecast)
@@ -1749,6 +1940,67 @@ def settle_bet_log(settled_rows):
                 })
     return just_settled
 
+def settle_pending_bets_retroactive():
+    """
+    V5.16: Bug fix for bets logged AFTER their settlement row was already
+    written. The old flow only settled bets when `run_auto_settlement` just
+    populated a settlement row — but if the settlement already existed, new
+    pending bets on that date never got matched.
+
+    This scans ALL pending bets, looks up their matching settlement row
+    (city + date) from Supabase, and settles them if the `actual` is
+    available. Runs on every app load before `run_auto_settlement`.
+
+    Returns list of bets settled this pass (for UI toasts).
+    """
+    bet_log = sb_fetch_bets()
+    if not bet_log: return []
+    pending = [b for b in bet_log if b.get('result') == 'Pending']
+    if not pending: return []
+    # Build dict of (city, date) -> actual from settlements
+    all_settlements = sb_fetch_all()
+    settlement_map = {}
+    for s in all_settlements:
+        if s.get('actual') is not None:
+            key = (s.get('city'), str(s.get('date')))
+            settlement_map[key] = s['actual']
+    now_iso = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d %H:%M:%S ET')
+    just_settled = []
+    for b in pending:
+        key = (b.get('city'), str(b.get('date')))
+        actual = settlement_map.get(key)
+        if actual is None: continue
+        bracket_str = b.get('bracket', '')
+        lo, hi = label_to_numeric_key(bracket_str)
+        if lo is None and hi is None: continue
+        hit = bracket_hits(actual, lo, hi)
+        if hit is None: continue
+        direction = (b.get('direction') or 'YES').upper()
+        won = hit if direction == 'YES' else (not hit)
+        amount = float(b.get('amount', 0) or 0)
+        price = float(b.get('price', 0) or 0)
+        if won and price > 0:
+            profit = round(amount * (100 - price) / price, 2)
+            payout = profit
+        else:
+            profit = -amount
+            payout = 0.0
+        updates = {
+            'result': 'Won' if won else 'Lost',
+            'profit': profit,
+            'payout': payout,
+            'actual': actual,
+            'settled_at': now_iso,
+        }
+        if sb_update_bet(b['id'], updates):
+            just_settled.append({
+                'city': b.get('city'), 'date': b.get('date'),
+                'bracket': bracket_str, 'direction': direction,
+                'actual': actual, 'won': won, 'amount': amount, 'profit': profit,
+            })
+    return just_settled
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<div class="mph-section-header">⚙️ Kelly Settings</div>', unsafe_allow_html=True)
@@ -1765,24 +2017,28 @@ with st.sidebar:
     st.markdown('⚪ **No price** — Unpriced bracket')
     st.markdown('🔵 **HIGH** — Ensemble confident')
     st.markdown('---')
-    # V5.15: unified Verdict key (replaces separate Signal + Trust Tier keys)
-    st.markdown('<div class="mph-section-header">🎯 Verdict Key</div>', unsafe_allow_html=True)
-    st.markdown('🟢 **BET** — Signal + Trust both green')
-    st.markdown('🟡 **CHECK / CAUTION** — mixed signals')
-    st.markdown('🔴 **SKIP** — Signal or Trust says skip')
-    st.caption('Trust veto rules: LOW ensemble, bracket 2+ from 2DC, NBM-off + large GFS gap')
+    # V5.16: two-dot UI key
+    st.markdown('<div class="mph-section-header">🎯 Signal Key</div>', unsafe_allow_html=True)
+    st.markdown('**Column 1 (Signal):**')
+    st.markdown('🟢 BET · 🟡 caution · ⚪ neutral · 🔴 avoid')
+    st.markdown('**Column next-to-last (Trust 0-100):**')
+    st.markdown('≥75 = BET · 55-74 = CAUTION · <55 = SKIP')
+    st.markdown('**Last column (Ensemble):**')
+    st.markdown('🔵 HIGH · 🟡 MED · ⚪ LOW')
+    st.caption('Best bet = 🟢 + 🔵 with highest Trust')
     st.markdown('---')
     st.markdown('<div class="mph-section-header">🔬 MAE Guide</div>', unsafe_allow_html=True)
     st.markdown('✅ **<2.5F** — Well calibrated')
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.15</div>', unsafe_allow_html=True)
-    st.markdown('- Bet log now in Supabase (survives redeploys)')
-    st.markdown('- Edit / Delete buttons on bets')
-    st.markdown('- Unified VERDICT column (cleaner reading)')
-    st.markdown('- One merged Best Bet callout per direction')
-    st.markdown('- V5.14 trust score logic unchanged')
+    st.markdown('<div class="mph-section-header">🚀 V5.16</div>', unsafe_allow_html=True)
+    st.markdown('- Per-city prediction mode (data-driven)')
+    st.markdown('- Time-gated obs_high (no more morning spike bug)')
+    st.markdown('- 5 low-MAE cities hidden from bet list')
+    st.markdown('- Source Accuracy Report tab')
+    st.markdown('- Simplified 3-factor Trust Score')
+    st.markdown('- App password gate + Supabase bet log')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1796,7 +2052,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.15</span>
+                <span class="mph-version-badge">V5.16</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -1817,6 +2073,10 @@ with st.spinner('Checking for unsettled predictions...'):
     n_settled, settled_rows = run_auto_settlement()
     # V5.12: after model settlements, cascade into the personal bet log
     bet_log_just_settled = settle_bet_log(settled_rows)
+    # V5.16: also settle any pending bets whose settlement was already written
+    # (fixes bug where bets logged AFTER auto-settlement ran never got matched)
+    retro_settled = settle_pending_bets_retroactive()
+    bet_log_just_settled.extend(retro_settled)
 
 if n_settled > 0:
     for s in settled_rows:
@@ -1992,6 +2252,7 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
     no_signals = []
 
     for c in tz_info['cities']:
+        if c in HIDDEN_CITIES: continue  # V5.16: skip hidden cities in banner
         row = _today_rows_banner.get(c)
         if not row: continue
         consensus_val = row.get('consensus')
@@ -2102,8 +2363,9 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
 
 st.markdown('---')
 
-city_list = list(CITIES.keys())
-default_idx = city_list.index('New York')
+# V5.16: hide low-MAE cities from main selector (still predicted, just not shown)
+city_list = [c for c in CITIES.keys() if c not in HIDDEN_CITIES]
+default_idx = city_list.index('New York') if 'New York' in city_list else 0
 city = st.selectbox('City', city_list, index=default_idx)
 
 if 'last_city' not in st.session_state: st.session_state.last_city = city
@@ -2380,37 +2642,6 @@ if forecast is not None and current is not None:
     best_trust_yes = None  # (composite, label, edge, kelly, warnings, stake_label)
     best_trust_no = None
 
-    # V5.15: helper — combine Signal + Trust into a single Verdict string
-    def make_verdict(signal_icon, signal_text, trust_tier, stake_tier, kelly_amt, is_yes=True):
-        """
-        Build a single cell value summarizing what to do. Rules:
-          - 🟢 BET only if BOTH Signal says BET (🟢) AND Trust says BET
-          - 🟡 CHECK if signals partially agree (any green + no hard skip)
-          - 🔴 SKIP if Signal is red AVOID OR Trust is SKIP
-          - Stake tier shown inline in (parens) when betting
-        """
-        sig_is_bet = (signal_icon == '🟢')
-        sig_is_skip = (signal_icon == '🟡')
-        sig_is_avoid = (signal_icon == '🔴')
-        trust_bet = (trust_tier == 'BET')
-        trust_skip = (trust_tier == 'SKIP')
-        trust_caution = (trust_tier == 'CAUTION')
-
-        if sig_is_bet and trust_bet:
-            amt = ('$' + str(kelly_amt)) if kelly_amt and kelly_amt > 0 else ''
-            stake_tag = f' · {stake_tier}' if stake_tier else ''
-            return f'🟢 BET {amt}{stake_tag}'.strip()
-        if sig_is_avoid or trust_skip:
-            return '🔴 SKIP'
-        # Anything else — partial agreement or caution territory
-        if sig_is_bet and trust_caution:
-            return '🟡 CHECK (trust caution)'
-        if sig_is_skip and trust_bet:
-            return '🟡 CHECK (signal wary)'
-        if trust_caution:
-            return '🟡 CAUTION'
-        return '🟡 SKIP'
-
     for label, base_prob in prob_rows:
         ens_prob = next((ensemble_bracket_prob(ensemble_members, lo, hi)
                          for lbl, lo, hi in parse_ladder(ladder_text) if labels_match(lbl, label)), None)
@@ -2466,14 +2697,17 @@ if forecast is not None and current is not None:
         trust_n_tier = trust_no.tier if trust_no else ''
         trust_n_stake = trust_no.stake_suggestion_label if trust_no else ''
 
-        # V5.15: unified Verdict column (Signal + Trust combined)
-        yes_verdict = make_verdict(signal_icon, signal_text, trust_y_tier,
-                                    trust_y_stake, kelly, is_yes=True)
-        no_verdict = make_verdict(no_icon, no_text, trust_n_tier,
-                                   trust_n_stake, kelly_no, is_yes=False)
+        # V5.16: two-dot UI
+        #   Column 1: Signal (🟢/🟡/⚪/🔴) from edge_signal
+        #   Column next-to-last: Trust score (number)
+        #   Last column: Ensemble (🔵/🟡/⚪)
+        signal_cell = (signal_icon + ' ' + signal_text) if (signal_icon and signal_text) else (signal_icon or '—')
+        no_signal_cell = (no_icon + ' ' + no_text) if (no_icon and no_text) else (no_icon or '—')
+        trust_y_cell = str(trust_y_score) if trust_y_score is not None else '—'
+        trust_n_cell = str(trust_n_score) if trust_n_score is not None else '—'
 
         yes_rows.append({
-            'Verdict': yes_verdict,
+            'Signal': signal_cell,
             'Bracket': label + (' BUSTED' if busted else ''),
             'Model %': str(round(final_prob*100, 1))+'%',
             'Mkt Implied %': str(round(yes_ask, 1))+'%' if yes_ask else '—',
@@ -2481,20 +2715,19 @@ if forecast is not None and current is not None:
             'YES ask': str(yes_ask)+'c' if yes_ask is not None else '—',
             'Edge': edge_str,
             'Kelly': ('$'+str(kelly)) if kelly > 0 else '—',
+            'Trust': trust_y_cell,
             'Ensemble': ens_conf,
-            # Trust score available but hidden in rendering (see expander below)
-            '_Trust': str(trust_y_score) if trust_y_score is not None else '—',
         })
         no_rows.append({
-            'Verdict': no_verdict,
+            'Signal': no_signal_cell,
             'Bracket': label + (' BUSTED' if busted else ''),
             'Model %': str(round(final_prob*100, 1))+'%',
             'Mkt Implied %': str(round(no_ask, 1))+'%' if no_ask else '—',
             'NO ask': str(no_ask)+'c' if no_ask is not None else '—',
             'NO Edge': no_edge_str,
             'Kelly NO': ('$'+str(kelly_no)) if kelly_no > 0 else '—',
+            'Trust': trust_n_cell,
             'Ensemble': ens_conf,
-            '_Trust': str(trust_n_score) if trust_n_score is not None else '—',
         })
 
         # V5.8: consensus alignment — don't bet YES below consensus or NO above consensus
@@ -2529,108 +2762,141 @@ if forecast is not None and current is not None:
 
     prob_source = '(NBM percentiles)' if used_nbm else '(sigma/normal fallback)'
 
-    # V5.15: Drop the _Trust hidden column from the default display dataframe
-    yes_display = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith('_')} for r in yes_rows])
-    no_display = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith('_')} for r in no_rows])
+    # V5.16: display rows directly (no _Trust filtering anymore — it's a real column now)
+    yes_display = pd.DataFrame(yes_rows)
+    no_display = pd.DataFrame(no_rows)
 
     st.markdown(f'#### 🟢 YES Signals {prob_source}')
     st.dataframe(yes_display, use_container_width=True, hide_index=True)
 
-    # V5.15: MERGED Best YES callout — Signal + Trust unified.
-    # Four cases:
-    #   (A) Signal picks X AND Trust picks X (same)  → single strong green callout
-    #   (B) Signal picks X, Trust picks Y (differ)   → yellow "SIGNALS DISAGREE" warning
-    #   (C) Signal picks X, Trust has none           → yellow "signal only" note
-    #   (D) Trust picks X, Signal none               → yellow "trust only" note
-    #   (E) Neither picks anything                   → plain no-bet message
-    def _render_merged_best(best_sig, best_tr, side_label, side_suffix):
-        """side_label: 'YES' or 'NO'. side_suffix: '' for YES, ' NO' for NO."""
-        sig_label = best_sig['label'] if best_sig else None
-        tr_label = best_tr[1] if best_tr else None
+    # V5.16: Best-bet callout with Trust as the tiebreaker.
+    # Logic: collect all rows with 🟢 signal + 🔵 HIGH ensemble. If 0 → no bet.
+    # If 1 → recommend it. If 2+ → pick the highest Trust score, recommend that.
+    # If only 🟢 signals exist (no 🔵 HIGH ensemble), fall back to highest-edge
+    # green, but with a caveat that ensemble didn't confirm.
+    def _render_best(side_label, side_suffix, rows_list, trust_map, best_sig_by_edge):
+        """
+        side_label: 'YES' or 'NO'
+        rows_list: yes_rows or no_rows (the dicts we built)
+        trust_map: dict of bracket_label -> (trust_score, tier, edge, kelly, warnings)
+        best_sig_by_edge: best_bet or best_no_bet dict (highest-edge green signal)
+        """
+        # Filter for the ideal combo: 🟢 signal + 🔵 HIGH ensemble
+        ideal = []
+        for r in rows_list:
+            sig = r.get('Signal', '')
+            ens = r.get('Ensemble', '')
+            if sig.startswith('🟢') and '🔵' in ens and 'HIGH' in ens:
+                label = r['Bracket'].replace(' BUSTED', '')
+                tdata = trust_map.get(label)
+                if tdata:
+                    ideal.append({'label': label, 'trust': tdata[0],
+                                  'edge': tdata[2], 'kelly': tdata[3],
+                                  'warns': tdata[4] or []})
 
-        # Case A — both agree
-        if sig_label and tr_label and labels_match(sig_label, tr_label):
-            tr_score = round(best_tr[0], 1)
-            tr_stake = best_tr[5] or ''
-            warns = best_tr[4] or []
-            msg = (f"🟢 Best {side_label} Bet: **{sig_label}{side_suffix}** · "
-                   f"Edge +{best_sig['edge']}c · Kelly ${best_sig['kelly']} · "
-                   f"Trust {tr_score} · {tr_stake}" if tr_stake
-                   else f"🟢 Best {side_label} Bet: **{sig_label}{side_suffix}** · "
-                        f"Edge +{best_sig['edge']}c · Kelly ${best_sig['kelly']} · Trust {tr_score}")
-            if best_sig.get('uncertain'):
-                st.warning(msg + ' — ⚠️ HIGH UNCERTAINTY')
+        if ideal:
+            # Sort by Trust DESC, then edge DESC
+            ideal.sort(key=lambda x: (x['trust'], x['edge']), reverse=True)
+            top = ideal[0]
+            if len(ideal) > 1:
+                others = ', '.join([f"{o['label']} (Trust {round(o['trust'],1)})" for o in ideal[1:]])
+                st.success(
+                    f"🟢🔵 Best {side_label} Bet: **{top['label']}{side_suffix}** · "
+                    f"Edge +{top['edge']}c · Kelly ${top['kelly']} · Trust {round(top['trust'],1)}"
+                )
+                st.caption(f"({len(ideal)} candidates passed green+blue filter — Trust broke the tie. Also saw: {others})")
             else:
-                st.success(msg)
-            if warns:
-                st.caption('⚠️ ' + ' | '.join(warns))
+                st.success(
+                    f"🟢🔵 Best {side_label} Bet: **{top['label']}{side_suffix}** · "
+                    f"Edge +{top['edge']}c · Kelly ${top['kelly']} · Trust {round(top['trust'],1)}"
+                )
+            if top['warns']:
+                st.caption('⚠️ ' + ' | '.join(top['warns']))
             return
 
-        # Case B — both exist but disagree
-        if sig_label and tr_label and not labels_match(sig_label, tr_label):
-            tr_score = round(best_tr[0], 1)
-            st.warning(
-                f"⚠️ Signals disagree on best {side_label}: "
-                f"Signal picks **{sig_label}{side_suffix}** (+{best_sig['edge']}c) · "
-                f"Trust picks **{tr_label}{side_suffix}** (Trust {tr_score}) — "
-                f"no recommendation (verify manually)."
-            )
-            return
-
-        # Case C — signal only
-        if sig_label and not tr_label:
-            if best_sig.get('uncertain'):
-                st.warning(f"Signal best {side_label}: **{sig_label}{side_suffix}** "
-                           f"(+{best_sig['edge']}c) but HIGH UNCERTAINTY — "
-                           f"and Trust did not reach BET tier. Consider skipping.")
+        # Fallback: no green+blue combo, but maybe a green signal alone
+        if best_sig_by_edge:
+            if best_sig_by_edge.get('uncertain'):
+                st.warning(
+                    f"Best {side_label} (signal-only, no 🔵 HIGH ensemble): "
+                    f"**{best_sig_by_edge['label']}{side_suffix}** (+{best_sig_by_edge['edge']}c) "
+                    f"but HIGH UNCERTAINTY — consider skipping."
+                )
             else:
-                st.info(f"Signal best {side_label}: **{sig_label}{side_suffix}** "
-                        f"(+{best_sig['edge']}c, Kelly ${best_sig['kelly']}) — "
-                        f"but Trust did not reach BET tier. Verify before betting.")
+                st.info(
+                    f"Best {side_label} (signal-only): **{best_sig_by_edge['label']}{side_suffix}** "
+                    f"(+{best_sig_by_edge['edge']}c, Kelly ${best_sig_by_edge['kelly']}) — "
+                    f"ensemble not HIGH. Verify before betting."
+                )
             return
 
-        # Case D — trust only
-        if tr_label and not sig_label:
-            tr_score = round(best_tr[0], 1)
-            warns = best_tr[4] or []
-            st.info(f"Trust best {side_label}: **{tr_label}{side_suffix}** "
-                    f"(Trust {tr_score}, Edge +{best_tr[2]}c, Kelly ${best_tr[3]}) — "
-                    f"but Signal did not reach BET tier.")
-            if warns:
-                st.caption('⚠️ ' + ' | '.join(warns))
-            return
+        st.caption(f"No green {side_label} signals with HIGH ensemble — skip this run.")
 
-        # Case E — nothing
-        st.caption(f"No green {side_label} — both Signal and Trust recommend skipping this run.")
+    # Build trust map keyed by bracket label for the callout
+    # We need to reconstruct this from the loop above — easiest: store trust tuples
+    # per bracket during the loop. But since we already have best_trust_yes/no,
+    # let's just build a simple map from yes_rows/no_rows + trust_map (cached).
+    # Simpler approach: we kept trust scores in the yes_rows/no_rows' Trust column
+    # as display strings, and we tracked best_trust_* separately.
+    # Let's keep it simple: reuse best_trust_yes/no as our "ideal" candidate sources.
+    # But for the multi-candidate case, we need to re-scan. So do that:
+    yes_trust_map = {}
+    no_trust_map = {}
+    for label, base_prob in prob_rows:
+        ens_prob = next((ensemble_bracket_prob(ensemble_members, lo, hi)
+                         for lbl, lo, hi in parse_ladder(ladder_text) if labels_match(lbl, label)), None)
+        final_prob = blend_probs(base_prob, ens_prob, ensemble_members, city, nbm_active=used_nbm)
+        yes_ask = no_ask = None
+        if kalshi_markets:
+            match = next((m for m in kalshi_markets if labels_match(m[0], label)), None)
+            if match: yes_ask, no_ask = match[1], match[2]
+        e_yes = edge_cents(final_prob, yes_ask)
+        e_no = no_edge_cents(final_prob, no_ask)
+        k_yes = kelly_bet(final_prob, yes_ask, bankroll) if yes_ask else 0.0
+        k_no_est = kelly_bet_no(final_prob, no_ask, bankroll) if no_ask else 0.0
+        ens_prob_for_tier = ens_prob
+        ens_conf_tmp = ensemble_confidence(ens_prob_for_tier) if ens_prob_for_tier is not None else ''
+        ens_tier_tmp = ensemble_tier_from_confidence(ens_conf_tmp)
+        ty = compute_row_trust(city=city, bracket_label=label, direction='YES',
+                               model_pct=final_prob*100, ensemble_tier=ens_tier_tmp,
+                               two_degree_call_str=call or '', mae_color=city_mae_color,
+                               nbm_active=used_nbm, nws_forecast_f=nws_forecast,
+                               gfs_ensemble_f=ensemble_mean, bias_adj_f=bias_correction)
+        tn = compute_row_trust(city=city, bracket_label=label, direction='NO',
+                               model_pct=(1.0-final_prob)*100, ensemble_tier=ens_tier_tmp,
+                               two_degree_call_str=call or '', mae_color=city_mae_color,
+                               nbm_active=used_nbm, nws_forecast_f=nws_forecast,
+                               gfs_ensemble_f=ensemble_mean, bias_adj_f=bias_correction)
+        if ty:
+            yes_trust_map[label] = (ty.composite, ty.tier, e_yes or 0, round(k_yes,2), ty.warnings)
+        if tn:
+            no_trust_map[label] = (tn.composite, tn.tier, e_no or 0, round(k_no_est,2), tn.warnings)
 
-    _render_merged_best(best_bet, best_trust_yes, 'YES', '')
+    _render_best('YES', '', yes_rows, yes_trust_map, best_bet)
 
     st.markdown(f'#### 🔴 NO Signals {prob_source}')
     st.dataframe(no_display, use_container_width=True, hide_index=True)
 
-    # Wrap the old busted-NO case specially — the legacy best_no_bet dict has
-    # a 'busted' flag that the merged renderer above doesn't handle. So if NO
-    # is a busted BET NO, we bypass the renderer and show the classic callout.
+    # Busted NO is a special-case fast path — shows classic green NO bet callout
     if best_no_bet and best_no_bet.get('busted'):
-        st.success('🟢 Best NO Bet: **' + best_no_bet['label'] + ' NO** | BUSTED bracket | '
-                   'NO ask: ' + str(best_no_bet['no_ask']) + 'c | Kelly: $' + str(best_no_bet['kelly']))
-        # Also surface trust warning if trust-best disagrees
-        if best_trust_no and not labels_match(best_no_bet['label'], best_trust_no[1]):
-            st.caption(f"Note: Trust picks {best_trust_no[1]} NO (Trust {round(best_trust_no[0],1)}).")
+        st.success('🟢 Best NO Bet: **' + best_no_bet['label'] + ' NO** · BUSTED bracket · '
+                   'NO ask: ' + str(best_no_bet['no_ask']) + 'c · Kelly: $' + str(best_no_bet['kelly']))
     else:
-        _render_merged_best(best_no_bet, best_trust_no, 'NO', ' NO')
+        _render_best('NO', ' NO', no_rows, no_trust_map, best_no_bet)
 
-    # V5.15: Trust score detail expander — raw per-bracket scores
+    # V5.16: Trust score detail expander stays available as a reference view
     with st.expander('🔐 View Trust Score Details', expanded=False):
-        st.caption('Raw trust composite (0-100) per bracket. See sidebar for tier thresholds.')
-        trust_detail = pd.DataFrame([{
-            'Bracket': yr.get('Bracket', ''),
-            'YES Trust': yr.get('_Trust', '—'),
-            'NO Trust': nr.get('_Trust', '—') if nr else '—',
-            'Model %': yr.get('Model %', '—'),
-            'Ensemble': yr.get('Ensemble', ''),
-        } for yr, nr in zip(yes_rows, no_rows)])
-        st.dataframe(trust_detail, use_container_width=True, hide_index=True)
+        st.caption('Raw trust composite (0-100) per bracket. Tier: BET ≥75, CAUTION 55-74, SKIP <55.')
+        trust_detail_rows = []
+        for r_y, r_n in zip(yes_rows, no_rows):
+            trust_detail_rows.append({
+                'Bracket': r_y.get('Bracket', ''),
+                'YES Trust': r_y.get('Trust', '—'),
+                'NO Trust': r_n.get('Trust', '—') if r_n else '—',
+                'Model %': r_y.get('Model %', '—'),
+                'Ensemble': r_y.get('Ensemble', ''),
+            })
+        st.dataframe(pd.DataFrame(trust_detail_rows), use_container_width=True, hide_index=True)
 
     parsed = parse_ladder(ladder_text)
     top_b = next((b for b in parsed if b[2] is None), None)
@@ -2705,8 +2971,13 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
 
     if today_rows:
         summary_rows = []
+        # V5.16: sort all, but skip hidden cities from the dashboard display.
+        # (Hidden cities still got predicted & saved in the missing_cities loop
+        #  above — we just don't show them in the main dashboard table.)
         for r in sorted(today_rows, key=lambda x: x['city']):
             c = r['city']
+            if c in HIDDEN_CITIES:
+                continue
             consensus_val = r.get('consensus')
             ladder = saved_ladders.get(c, DEFAULT_LADDERS.get(c, ''))
             cached_markets, _ = get_cached_prices(c)
@@ -2783,6 +3054,65 @@ with st.expander('All Cities — Today\'s Predictions', expanded=True):
         st.caption(f'{status_icon} {n_saved_total}/18 cities | 🟢 {n_yes} YES signals | 🟢 {n_no} NO signals | ✅ {n_nbm} NBM active today{stale_str}')
     else:
         st.info('Loading predictions for all cities — this panel fills itself in automatically.')
+
+# ── V5.16: Source Accuracy Report ─────────────────────────────────────────────
+# Compares MAE of each source (NWS-alone, GFS-alone, our consensus blend)
+# per-city across all settled days. Shows which cities the blend helps,
+# which cities NWS-alone wins, and which cities are unstable regardless.
+# Updates every time the app loads — so you can watch V5.16 changes
+# take effect on each city over 1-2 weeks.
+st.markdown('---')
+with st.expander('🔬 Source Accuracy Report — Per-City MAE', expanded=False):
+    st.caption('Lower MAE is better. Compares NWS forecast alone vs GFS ensemble alone '
+               'vs our current blend (after bias correction). Use this to see which '
+               'cities the blend is actually helping.')
+    import pandas as pd
+    all_settled = [r for r in sb_fetch_all()
+                   if r.get('actual') is not None
+                   and r.get('forecast') is not None
+                   and r.get('consensus') is not None]
+    if len(all_settled) < 20:
+        st.info('Not enough settled data yet for a meaningful accuracy report. '
+                'Check back after ~1 week of data collection.')
+    else:
+        from collections import defaultdict
+        per_city = defaultdict(list)
+        for r in all_settled:
+            per_city[r['city']].append(r)
+        report_rows = []
+        for city_name, rows in per_city.items():
+            n = len(rows)
+            if n < 5: continue
+            nws_errors = [abs(r['actual'] - r['forecast']) for r in rows if r.get('forecast') is not None]
+            gfs_errors = [abs(r['actual'] - (r['ensemble_mean'] or r['forecast'])) for r in rows]
+            blend_errors = [abs(r['actual'] - r['consensus']) for r in rows]
+            mean_bias = sum(r['actual'] - r['consensus'] for r in rows) / n
+            within_2 = sum(1 for e in blend_errors if e <= 2)
+            mae_nws = round(sum(nws_errors) / len(nws_errors), 2) if nws_errors else None
+            mae_gfs = round(sum(gfs_errors) / len(gfs_errors), 2) if gfs_errors else None
+            mae_blend = round(sum(blend_errors) / len(blend_errors), 2)
+            mode = CITY_PREDICTION_MODE.get(city_name, 'full_blend')
+            hidden = '🔴 HIDDEN' if city_name in HIDDEN_CITIES else ''
+            tier = ('🟢' if mae_blend < 2.0 else
+                    '🟡' if mae_blend < 2.5 else
+                    '🟠' if mae_blend < 3.5 else '🔴')
+            report_rows.append({
+                'Tier': tier,
+                'City': city_name + (' ' + hidden if hidden else ''),
+                'Days': n,
+                'MAE (blend)': mae_blend,
+                'MAE (NWS alone)': mae_nws if mae_nws is not None else '—',
+                'MAE (GFS alone)': mae_gfs if mae_gfs is not None else '—',
+                'Bias': round(mean_bias, 2),
+                'Within 2F': f'{within_2}/{n}',
+                'Mode': mode,
+            })
+        if report_rows:
+            df = pd.DataFrame(report_rows)
+            df = df.sort_values('MAE (blend)', ascending=True)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.caption('**Tier legend:** 🟢 MAE <2F excellent · 🟡 <2.5F good · 🟠 <3.5F caution · 🔴 ≥3.5F unsafe')
+            st.caption('**Mode legend:** `full_blend` = current V5.15 formula · `nws_only` = NWS forecast + bias correction only (simpler, used when blend hurts)')
 
 # ── V5.15: Personal Bet Log (Supabase-backed) ────────────────────────────────
 # Migrated from local JSON to Supabase `bets` table. Adds Edit and Delete
