@@ -1,5 +1,12 @@
-# Kalshi High Temperature Model - V5.16
+# Kalshi High Temperature Model - V5.16.1
 #
+# V5.16.1 hotfix: Best Bets by Timezone banner was still showing hidden cities
+# in the header city list (e.g., "Chicago · Dallas · Austin · Houston" with
+# Chicago and Austin being hidden). Also the MT section showed up with just
+# "Denver" as the only city — Denver is hidden so the whole MT section should
+# disappear. Both bugs fixed.
+#
+# ── V5.16 original changelog ──
 # Major changes from V5.15 (DATA-DRIVEN REDESIGN based on 21-24 days of real
 # settlement data — MAE tier analysis):
 #
@@ -2032,7 +2039,10 @@ with st.sidebar:
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.16</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mph-section-header">🚀 V5.16.1</div>', unsafe_allow_html=True)
+    st.markdown('- Fix: hidden cities no longer appear in Best Bets banner')
+    st.markdown('- Fix: MT section hidden when only Denver present')
+    st.markdown('**V5.16:**')
     st.markdown('- Per-city prediction mode (data-driven)')
     st.markdown('- Time-gated obs_high (no more morning spike bug)')
     st.markdown('- 5 low-MAE cities hidden from bet list')
@@ -2052,7 +2062,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.16</span>
+                <span class="mph-version-badge">V5.16.1</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -2243,6 +2253,12 @@ _today_rows_banner = {r['city']: r for r in _all_rows_banner if r.get('date') ==
 _et_hour_now = get_et_hour()
 
 for tz_key, tz_info in TIMEZONE_GROUPS.items():
+    # V5.16.1: skip the whole timezone block if every city is hidden
+    # (e.g., MT is only Denver, which is hidden — so hide the MT section entirely)
+    visible_cities_in_tz = [c for c in tz_info['cities'] if c not in HIDDEN_CITIES]
+    if not visible_cities_in_tz:
+        continue
+
     status_text, status_color = window_status(tz_info['cutoff_et_hour'])
     mins_left = minutes_until_close(tz_info['cutoff_et_hour'])
     is_closed = mins_left <= 0
@@ -2318,7 +2334,8 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
     yes_signals.sort(key=lambda x: x[0], reverse=True)
     no_signals.sort(key=lambda x: x[0], reverse=True)
 
-    city_list_str = ' · '.join(tz_info['cities'])
+    # V5.16.1: filter the header city list to exclude hidden cities
+    city_list_str = ' · '.join([c for c in tz_info['cities'] if c not in HIDDEN_CITIES])
     static = TIMEZONE_STATIC_INFO.get(tz_key, {})
     sweet_spot_str = static.get('sweet_spot', '')
     peak_heat_str = static.get('peak_heat', '')
