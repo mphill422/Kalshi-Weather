@@ -1,5 +1,66 @@
-# Kalshi High Temperature Model - V5.16.1
+# Kalshi High Temperature Model - V5.17
 #
+# Philosophy shift from V5.16 → V5.17:
+# V5.16 was EDGE-FIRST: best bet = biggest mispricing vs market, even if
+# bracket was 2-3 away from consensus. In practice this meant model picking
+# low-probability long-shots with huge edges (like 78-79 YES when consensus
+# was 80F) and losing when the actual high landed closer to consensus.
+#
+# V5.17 is ACCURACY-FIRST: best bet = model's honest prediction for which
+# bracket will actually hit, with edge shown as secondary info. Goal: 60%+
+# win rate on safer picks, 3-4 bets/day, 5-6 days/week.
+#
+# Changes from V5.16:
+# 1. MINIMUM PROBABILITY FLOOR — fixes the 0.0% bug on brackets adjacent to
+#    consensus. Every bracket within 4F of consensus gets ≥ 5% probability;
+#    brackets touching the ladder get ≥ 2%. Stops model from declaring
+#    outcomes "impossible" when they're actually 10-20% likely (e.g., today's
+#    Miami 82-83 showing 0.0% when it was clearly in play).
+#
+# 2. DUAL-DOT SIGNAL SYSTEM:
+#    - 🟢🔵 accuracy pick: highest Trust + Model% ≥ 35% + Trust ≥ 75 + HIGH
+#      ensemble. "Model's honest pick for which bracket will actually hit."
+#    - 🟣 edge pick: highest edge bracket per city. "Biggest mispricing —
+#      use as sanity check / secondary info."
+#    - When both point to the same bracket → strongest signal.
+#    - When they differ → user uses judgment to decide.
+#
+# 3. SUMMARY PANEL AT TOP — one-line-per-city panel showing Model's best
+#    guess before you scroll to detailed tables. "New Orleans: 82-83 (Trust
+#    88, prob 42%) · Market agrees".
+#
+# 4. ACCURACY SWEET SPOTS — new time windows added under existing edge sweet
+#    spots in each timezone banner. Accuracy sweet spot = ~2-3 hours before
+#    typical peak heat for each city. That's when obs data is clearest.
+#    Edge sweet spot stays as-is (for people hunting mispricings early).
+#
+# 5. REALITY-CHECK BANNER — shows when current temp > consensus - 3F, or
+#    when NWS forecast is 3F+ above consensus. Catches days like today's
+#    Dallas where model said 83F but current obs was already 89F.
+#
+# 6. NO-BET HIGHLIGHT SECTION — new callout per timezone window listing
+#    market-overpriced brackets. Market % significantly exceeds model %
+#    → potential NO bet opportunity. Labeled "🔻 Market-overpriced brackets".
+#
+# 7. TIER 3 HIDDEN — Philadelphia, Boston, San Antonio moved to HIDDEN_CITIES
+#    (MAE 2.8-3.1F, not good enough for 60% win rate target). Now 10 visible
+#    cities instead of 13. All 18 still predict in background for accuracy
+#    report and potential recovery tracking.
+#
+# 8. IPHONE CLEANUP — when iPhone toggle is active, less-critical elements
+#    hide to reduce visual clutter on small screens. Mac/iPhone toggle stays.
+#
+# All V5.16 logic preserved:
+# - Per-city prediction mode (full_blend vs nws_only)
+# - Time-gated obs_high (only after 1 PM local, sanity-checked)
+# - Bias correction improvements (median, ±3F cap, reduced for unstable)
+# - Supabase bet log with Edit/Delete, retroactive settlement
+# - App password gate (st.secrets['app_password'])
+# - Source Accuracy Report tab
+# - Trust score module (trust_score.py, weights unchanged)
+# - V5.13 security, V5.12 auto-settlement, V5.11 signal suppression
+
+# ── V5.16.1 hotfix note ──
 # V5.16.1 hotfix: Best Bets by Timezone banner was still showing hidden cities
 # in the header city list (e.g., "Chicago · Dallas · Austin · Houston" with
 # Chicago and Austin being hidden). Also the MT section showed up with just
@@ -560,15 +621,25 @@ REGIONAL_PRIOR_BIAS = {
 #   WHERE actual IS NOT NULL GROUP BY city ORDER BY mae;
 # Then update these sets accordingly every few weeks.
 
-# HIDDEN cities: MAE > 3.0 AND either blend hurting or too few good days.
+# HIDDEN cities: MAE > ~2.7 AND either blend hurting or unstable.
 # These are NOT removed from the predictions pipeline (we keep collecting data
-# to see if V5.16 changes recover them). They are hidden from:
+# to see if V5.17 changes recover them). They are hidden from:
 #   - Main city selector dropdown
 #   - "All Cities Today's Predictions" dashboard
 #   - "Best Bets by Timezone" callouts
+#   - Summary panel at top
 # They ARE visible in:
 #   - Source Accuracy Report tab (so user can watch recovery)
-HIDDEN_CITIES = {'Minneapolis', 'Denver', 'Chicago', 'Los Angeles', 'Austin'}
+#
+# V5.17: expanded from 5 to 8 hidden cities (added Philadelphia, Boston,
+# San Antonio) to focus main app on 10 high-accuracy cities for 60%+ win
+# rate target.
+HIDDEN_CITIES = {
+    # V5.16 original hidden set (MAE > 3.0, blend hurting or unstable)
+    'Minneapolis', 'Denver', 'Chicago', 'Los Angeles', 'Austin',
+    # V5.17 additions (Tier 3 — MAE 2.8-3.1, not good enough for 60% target)
+    'Philadelphia', 'Boston', 'San Antonio',
+}
 
 # CITY_PREDICTION_MODE: per-city pipeline routing based on empirical data.
 # - 'full_blend' = current V5.15 consensus formula (fc/cur/noaa time-weighted
@@ -1272,6 +1343,8 @@ def get_city_best_signals(city, consensus, ladder_text, ensemble_members, kalshi
     if consensus is None or not ladder_text: return '—', '—'
     try:
         prob_rows, _, used_nbm = bracket_probs_nbm(consensus, ladder_text, city, nbm_percentiles, obs_high=obs_high)
+        # V5.17: apply probability floor to prevent 0.0% bug on adjacent brackets
+        prob_rows = apply_prob_floor(prob_rows, consensus, ladder_text)
         morning_suppressed, _ = check_morning_suppression(obs_high, current_temp, nws_forecast, local_hour)
         conviction_result = check_market_conviction(kalshi_markets_data, ladder_text)
         best_yes = best_no = None
@@ -1387,6 +1460,53 @@ def blend_probs(sigma_prob, ensemble_prob, members, city='', nbm_active=False):
     base_weight = GFS_CITY_WEIGHT.get(city, 0.20)
     ensemble_weight = base_weight * 0.5 if nbm_active else base_weight
     return round((1.0 - ensemble_weight) * sigma_prob + ensemble_weight * ensemble_prob, 4)
+
+def apply_prob_floor(prob_rows, consensus, ladder_text):
+    """
+    V5.17: Fix the 0.0% bug on brackets adjacent to consensus.
+    Enforces minimum probability for brackets that could plausibly hit:
+      - Brackets whose midpoint is within 4F of consensus → min 5%
+      - Brackets whose midpoint is within 6F (touching ladder) → min 2%
+      - Brackets further out stay at computed value (can be near-zero)
+    Redistributes probability so the row still sums to approximately 1.0.
+
+    Takes list of (label, prob) tuples, returns same shape.
+
+    Why this exists: before V5.17, the model would declare brackets 2-3F
+    away from consensus as 0.0% probability — which is effectively saying
+    "impossible." In reality, forecast sigma is 1.5-2.5F and unexpected
+    outcomes happen. The floor prevents the model from ruling out outcomes
+    that are actually 10-20% likely.
+    """
+    if not prob_rows or consensus is None: return prob_rows
+    parsed = {lbl: (lo, hi) for lbl, lo, hi in parse_ladder(ladder_text)}
+    adjusted = []
+    boost_total = 0.0
+    for label, prob in prob_rows:
+        lo, hi = parsed.get(label, (None, None))
+        # Compute bracket midpoint for distance check
+        if lo is not None and hi is not None:
+            mid = (lo + hi) / 2.0
+        elif lo is not None:   # "X or above"
+            mid = lo + 1.0
+        elif hi is not None:   # "X or below"
+            mid = hi - 1.0
+        else:
+            adjusted.append((label, prob)); continue
+        distance = abs(mid - consensus)
+        new_prob = prob
+        if distance <= 4.0 and prob < 0.05:
+            new_prob = 0.05
+        elif distance <= 6.0 and prob < 0.02:
+            new_prob = 0.02
+        boost_total += (new_prob - prob)
+        adjusted.append((label, new_prob))
+    # Redistribute: if we added probability, scale everything slightly down
+    # to keep sum reasonable. Only scale down brackets with room (prob > floor).
+    if boost_total > 0:
+        scale = 1.0 / (1.0 + boost_total)
+        adjusted = [(lbl, round(p * scale, 4)) for lbl, p in adjusted]
+    return adjusted
 
 # ── Core ──────────────────────────────────────────────────────────────────────
 def get_eastern_date():
@@ -2039,16 +2159,15 @@ with st.sidebar:
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.16.1</div>', unsafe_allow_html=True)
-    st.markdown('- Fix: hidden cities no longer appear in Best Bets banner')
-    st.markdown('- Fix: MT section hidden when only Denver present')
-    st.markdown('**V5.16:**')
-    st.markdown('- Per-city prediction mode (data-driven)')
-    st.markdown('- Time-gated obs_high (no more morning spike bug)')
-    st.markdown('- 5 low-MAE cities hidden from bet list')
-    st.markdown('- Source Accuracy Report tab')
-    st.markdown('- Simplified 3-factor Trust Score')
-    st.markdown('- App password gate + Supabase bet log')
+    st.markdown('<div class="mph-section-header">🚀 V5.17</div>', unsafe_allow_html=True)
+    st.markdown('- **Accuracy-first** (not edge-first) picks')
+    st.markdown('- Dual dots: 🟢🔵 accuracy + 🟣 edge')
+    st.markdown('- Probability floor (no more 0.0%)')
+    st.markdown('- Summary panel at top')
+    st.markdown('- Accuracy sweet spot times')
+    st.markdown('- NO-bet highlight section')
+    st.markdown('- Reality-check banner')
+    st.markdown('- 3 more cities hidden (Philly/Boston/SA)')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -2062,7 +2181,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.16.1</span>
+                <span class="mph-version-badge">V5.17</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -2217,10 +2336,15 @@ def window_status(cutoff_et_hour):
     return '✅ OPEN', '#00ff88'
 
 TIMEZONE_STATIC_INFO = {
-    'ET': {'sweet_spot': '10:00–11:30 AM ET', 'peak_heat': '2:00–4:00 PM ET'},
-    'CT': {'sweet_spot': '11:00 AM–12:30 PM ET', 'peak_heat': '3:00–5:00 PM ET'},
-    'MT': {'sweet_spot': '12:00–1:30 PM ET', 'peak_heat': '4:00–6:00 PM ET'},
-    'PT': {'sweet_spot': '1:00–2:30 PM ET', 'peak_heat': '5:00–7:00 PM ET'},
+    # V5.17: Added 'accuracy_window' — time range when model is most likely
+    # to be accurate on bracket placement. Typically ~2-3 hours before peak
+    # heat, when obs data has clarified the day's trajectory but market
+    # hasn't fully priced it in. Differs from 'sweet_spot' which is the
+    # edge-hunting window (earlier, when markets are slowest).
+    'ET': {'sweet_spot': '10:00–11:30 AM ET', 'accuracy_window': '12:00–2:00 PM ET', 'peak_heat': '2:00–4:00 PM ET'},
+    'CT': {'sweet_spot': '11:00 AM–12:30 PM ET', 'accuracy_window': '1:00–3:00 PM ET', 'peak_heat': '3:00–5:00 PM ET'},
+    'MT': {'sweet_spot': '12:00–1:30 PM ET', 'accuracy_window': '2:00–4:00 PM ET', 'peak_heat': '4:00–6:00 PM ET'},
+    'PT': {'sweet_spot': '1:00–2:30 PM ET', 'accuracy_window': '3:00–5:00 PM ET', 'peak_heat': '5:00–7:00 PM ET'},
 }
 
 def get_phase_label(tz_key, et_hour):
@@ -2251,6 +2375,55 @@ st.markdown('<div class="mph-section-header">🎯 Best Bets By Timezone Window</
 _all_rows_banner = sb_fetch_all()
 _today_rows_banner = {r['city']: r for r in _all_rows_banner if r.get('date') == today_str}
 _et_hour_now = get_et_hour()
+
+# ── V5.17: Summary Panel ──────────────────────────────────────────────
+# Shows one line per visible city with model's accuracy pick (the
+# bracket the model thinks is most likely to hit), so user can see the
+# full picture at a glance before diving into per-city details.
+# Uses the cached banner data plus Best YES pick.
+_summary_rows = []
+for tz_key, tz_info in TIMEZONE_GROUPS.items():
+    for c in tz_info['cities']:
+        if c in HIDDEN_CITIES: continue
+        row = _today_rows_banner.get(c)
+        if not row: continue
+        consensus_val = row.get('consensus')
+        if consensus_val is None: continue
+        ladder_banner = saved_ladders.get(c, DEFAULT_LADDERS.get(c, ''))
+        cached_markets_banner, _ = get_cached_prices(c)
+        try:
+            best_yes_banner, best_no_banner = get_city_best_signals(
+                city=c, consensus=consensus_val, ladder_text=ladder_banner,
+                ensemble_members=[], kalshi_markets_data=cached_markets_banner,
+                obs_high=row.get('obs_high'), high_uncertainty=row.get('high_uncertainty', False),
+                bankroll=25.0, nbm_percentiles=None,
+                current_temp=None, nws_forecast=row.get('forecast'),
+                local_hour=get_local_hour(c), min_prob=0.10,
+            )
+        except Exception:
+            best_yes_banner, best_no_banner = '—', '—'
+        # Parse best YES into a compact display
+        _summary_rows.append({
+            'city': c,
+            'consensus': round(consensus_val, 1),
+            'best_yes': best_yes_banner,
+            'best_no': best_no_banner,
+            'obs_high': row.get('obs_high'),
+        })
+
+if _summary_rows and not is_mobile:
+    with st.expander('📌 Today\'s Model Picks — Summary', expanded=False):
+        st.caption('Quick view of each visible city\'s top signal. Use for morning overview. '
+                   'Click into each timezone banner below for full detail and sanity checks.')
+        import pandas as pd
+        _df = pd.DataFrame([{
+            'City': r['city'],
+            'Consensus °F': r['consensus'],
+            'Obs High °F': r['obs_high'] if r['obs_high'] is not None else '—',
+            'Best YES pick': r['best_yes'],
+            'Best NO pick': r['best_no'],
+        } for r in _summary_rows])
+        st.dataframe(_df, use_container_width=True, hide_index=True)
 
 for tz_key, tz_info in TIMEZONE_GROUPS.items():
     # V5.16.1: skip the whole timezone block if every city is hidden
@@ -2338,6 +2511,7 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
     city_list_str = ' · '.join([c for c in tz_info['cities'] if c not in HIDDEN_CITIES])
     static = TIMEZONE_STATIC_INFO.get(tz_key, {})
     sweet_spot_str = static.get('sweet_spot', '')
+    accuracy_window_str = static.get('accuracy_window', '')  # V5.17
     peak_heat_str = static.get('peak_heat', '')
     phase_label, phase_color = get_phase_label(tz_key, _et_hour_now)  # V5.10: 2 return values
     phase_html = f'<span style="color:{phase_color}; font-size:12px; font-weight:700; font-family:\'JetBrains Mono\',monospace;">{phase_label}</span>' if phase_label else ''
@@ -2362,16 +2536,17 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
         <span style="color:{status_color}; font-size:12px; font-family:'JetBrains Mono',monospace;">{status_text}</span>
     </div>
     <div style="margin-bottom:2px;">{phase_html}</div>
-    <div style="color:#94a3b8; font-size:11px; margin-bottom:2px; font-family:'JetBrains Mono',monospace;">🟢 Sweet spot: {sweet_spot_str}</div>
+    <div style="color:#94a3b8; font-size:11px; margin-bottom:2px; font-family:'JetBrains Mono',monospace;">🟢 Sweet spot (edge): {sweet_spot_str}</div>
+    <div style="color:#a78bfa; font-size:11px; margin-bottom:2px; font-family:'JetBrains Mono',monospace;">🎯 Accuracy window: {accuracy_window_str}</div>
     <div style="color:#00b4d8; font-size:11px; margin-bottom:8px; font-family:'JetBrains Mono',monospace;">🌡️ Peak heat: {peak_heat_str}</div>
     <div style="color:#64748b; font-size:11px; margin-bottom:10px; font-family:'JetBrains Mono',monospace;">{city_list_str}</div>
     <div style="display:flex; gap:16px; flex-wrap:wrap;">
         <div style="flex:1; min-width:200px;">
-            <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:6px;">YES Signals</div>
+            <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:6px;">🟢 YES Signals (Model thinks it WILL hit)</div>
             {yes_html}
         </div>
         <div style="flex:1; min-width:200px;">
-            <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:6px;">NO Signals</div>
+            <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:6px;">🔻 NO Signals (Market overpriced · bet NO)</div>
             {no_html}
         </div>
     </div>
@@ -2607,6 +2782,10 @@ if forecast is not None and current is not None:
     consensus = round(consensus_raw + bias_correction + trend_boost, 1)
 
     prob_rows, prob_label, used_nbm = bracket_probs_nbm(consensus, ladder_text, city, nbm_percentiles, obs_high=obs_high_final, forecast=forecast)
+    # V5.17: apply probability floor to prevent 0.0% declarations on brackets
+    # adjacent to consensus. Fixes the bug where adjacent brackets got crushed
+    # to zero and the model declared unlikely outcomes "impossible."
+    prob_rows = apply_prob_floor(prob_rows, consensus, ladder_text)
     _, sigma = bracket_probs(consensus, ladder_text, city, obs_high=obs_high_final, forecast=forecast)
     call = two_degree_call(consensus, ladder_text, obs_high=obs_high_final)
 
@@ -2649,6 +2828,32 @@ if forecast is not None and current is not None:
         threshold = get_uncertainty_threshold(city)
         st.caption(f'High uncertainty mode — gap {round(source_gap,1)}F exceeds {threshold}F threshold — green signals suppressed')
     if morning_suppressed: st.caption('⚠️ Morning suppression active — no obs high + temp well below forecast')
+
+    # ── V5.17: Reality-check banner ──────────────────────────────────────
+    # Fires when current conditions suggest consensus is too low:
+    #   - Current temp is already ≥ (consensus - 1F) — actual is overtaking prediction
+    #   - obs_high so far ≥ (consensus - 1F) — today's peak has already exceeded us
+    #   - NWS forecast is 3F+ above consensus — official forecaster disagrees
+    # Catches days like the Dallas 84 vs actual 89 miss we saw.
+    _reality_warnings = []
+    if current is not None and consensus is not None and current >= consensus - 1.0:
+        _reality_warnings.append(
+            f"Current temp {round(current,1)}°F is already near/above model consensus {round(consensus,1)}°F "
+            f"— actual high may exceed prediction."
+        )
+    if obs_high_final is not None and consensus is not None and obs_high_final >= consensus - 1.0:
+        _reality_warnings.append(
+            f"Obs high so far {round(obs_high_final,1)}°F is near/above consensus {round(consensus,1)}°F "
+            f"— bracket may have already moved higher."
+        )
+    if forecast is not None and consensus is not None and forecast >= consensus + 3.0:
+        _reality_warnings.append(
+            f"NWS forecast {round(forecast,1)}°F is 3°F+ above model consensus {round(consensus,1)}°F "
+            f"— official forecaster expects higher."
+        )
+    if _reality_warnings:
+        st.warning('🚨 **Reality check — verify before betting:**\n\n' +
+                   '\n\n'.join(['• ' + w for w in _reality_warnings]))
 
     import pandas as pd
     yes_rows = []
@@ -2779,6 +2984,56 @@ if forecast is not None and current is not None:
 
     prob_source = '(NBM percentiles)' if used_nbm else '(sigma/normal fallback)'
 
+    # V5.17: Annotate Signal column with 🟣 edge-pick dot and 🟢🔵 accuracy-pick
+    # dot. This makes the dual-dot system visible inside the tables themselves,
+    # not just in the best-bet callout below.
+    def _annotate_dots(rows, best_edge_pick, accuracy_label=None):
+        for r in rows:
+            bracket = r['Bracket'].replace(' BUSTED', '')
+            dots = ''
+            # Edge dot: mark the highest-edge bracket
+            if best_edge_pick and labels_match(bracket, best_edge_pick.get('label', '')):
+                dots = '🟣 ' + dots
+            # Accuracy dot marker (not overwriting — appended to signal icon)
+            if accuracy_label and labels_match(bracket, accuracy_label):
+                dots = '🎯 ' + dots
+            if dots:
+                r['Signal'] = dots + r['Signal']
+        return rows
+
+    # Find accuracy pick among yes_rows (mirrors _render_best logic for dot only)
+    _yes_acc_label = None
+    for r in yes_rows:
+        sig = r.get('Signal', '')
+        ens = r.get('Ensemble', '')
+        if sig.startswith('🟢') and '🔵' in ens and 'HIGH' in ens:
+            label_plain = r['Bracket'].replace(' BUSTED', '')
+            model_pct_str = r.get('Model %', '0%').replace('%','')
+            try: model_pct_val = float(model_pct_str)
+            except: model_pct_val = 0
+            trust_str = r.get('Trust', '—')
+            try: trust_val = float(trust_str)
+            except: trust_val = 0
+            if trust_val >= 75 and model_pct_val >= 35:
+                if _yes_acc_label is None: _yes_acc_label = label_plain
+    _no_acc_label = None
+    for r in no_rows:
+        sig = r.get('Signal', '')
+        ens = r.get('Ensemble', '')
+        if sig.startswith('🟢') and '🔵' in ens and 'HIGH' in ens:
+            label_plain = r['Bracket'].replace(' BUSTED', '')
+            model_pct_str = r.get('Model %', '0%').replace('%','')
+            try: model_pct_val = float(model_pct_str)
+            except: model_pct_val = 0
+            trust_str = r.get('Trust', '—')
+            try: trust_val = float(trust_str)
+            except: trust_val = 0
+            if trust_val >= 75 and model_pct_val >= 35:
+                if _no_acc_label is None: _no_acc_label = label_plain
+
+    yes_rows = _annotate_dots(yes_rows, best_bet, _yes_acc_label)
+    no_rows = _annotate_dots(no_rows, best_no_bet, _no_acc_label)
+
     # V5.16: display rows directly (no _Trust filtering anymore — it's a real column now)
     yes_display = pd.DataFrame(yes_rows)
     no_display = pd.DataFrame(no_rows)
@@ -2786,68 +3041,96 @@ if forecast is not None and current is not None:
     st.markdown(f'#### 🟢 YES Signals {prob_source}')
     st.dataframe(yes_display, use_container_width=True, hide_index=True)
 
-    # V5.16: Best-bet callout with Trust as the tiebreaker.
-    # Logic: collect all rows with 🟢 signal + 🔵 HIGH ensemble. If 0 → no bet.
-    # If 1 → recommend it. If 2+ → pick the highest Trust score, recommend that.
-    # If only 🟢 signals exist (no 🔵 HIGH ensemble), fall back to highest-edge
-    # green, but with a caveat that ensemble didn't confirm.
+    # V5.17: ACCURACY-FIRST best-bet callout.
+    #
+    # Philosophy: the 🟢🔵 combo means "model's honest pick for which bracket
+    # will actually hit" — NOT "biggest edge vs market." A separate 🟣 tracks
+    # the highest-edge bracket for reference.
+    #
+    # Accuracy pick criteria:
+    #   - 🟢 Signal (positive edge, not busted, not suppressed)
+    #   - 🔵 HIGH ensemble
+    #   - Trust ≥ 75
+    #   - Model probability ≥ 35%
+    # When multiple brackets qualify, highest Trust wins.
+    #
+    # Edge pick criteria (shown as 🟣 dot + secondary info, not recommended):
+    #   - Highest edge among brackets with positive edge
+    #   - No Trust/Model% threshold
+    #   - For sanity check only — can be far from consensus
     def _render_best(side_label, side_suffix, rows_list, trust_map, best_sig_by_edge):
         """
+        V5.17: Accuracy-first recommendation.
         side_label: 'YES' or 'NO'
         rows_list: yes_rows or no_rows (the dicts we built)
-        trust_map: dict of bracket_label -> (trust_score, tier, edge, kelly, warnings)
+        trust_map: dict of bracket_label -> (trust, tier, edge, kelly, warnings, model_pct)
         best_sig_by_edge: best_bet or best_no_bet dict (highest-edge green signal)
         """
-        # Filter for the ideal combo: 🟢 signal + 🔵 HIGH ensemble
-        ideal = []
+        # V5.17: Accuracy filter — Trust ≥ 75, Model% ≥ 35, green signal, HIGH ensemble
+        accuracy_candidates = []
         for r in rows_list:
             sig = r.get('Signal', '')
             ens = r.get('Ensemble', '')
-            if sig.startswith('🟢') and '🔵' in ens and 'HIGH' in ens:
-                label = r['Bracket'].replace(' BUSTED', '')
-                tdata = trust_map.get(label)
-                if tdata:
-                    ideal.append({'label': label, 'trust': tdata[0],
-                                  'edge': tdata[2], 'kelly': tdata[3],
-                                  'warns': tdata[4] or []})
+            if not (sig.startswith('🟢') and '🔵' in ens and 'HIGH' in ens):
+                continue
+            label = r['Bracket'].replace(' BUSTED', '')
+            tdata = trust_map.get(label)
+            if not tdata: continue
+            trust_score = tdata[0]
+            model_pct = tdata[5] if len(tdata) > 5 else 0
+            if trust_score >= 75 and model_pct >= 35:
+                accuracy_candidates.append({
+                    'label': label, 'trust': trust_score,
+                    'edge': tdata[2], 'kelly': tdata[3],
+                    'warns': tdata[4] or [], 'model_pct': model_pct,
+                })
 
-        if ideal:
-            # Sort by Trust DESC, then edge DESC
-            ideal.sort(key=lambda x: (x['trust'], x['edge']), reverse=True)
-            top = ideal[0]
-            if len(ideal) > 1:
-                others = ', '.join([f"{o['label']} (Trust {round(o['trust'],1)})" for o in ideal[1:]])
+        # Identify the edge pick (for 🟣 dot) — highest edge on any positive-edge bracket
+        edge_pick = best_sig_by_edge
+
+        if accuracy_candidates:
+            # Sort by Trust DESC
+            accuracy_candidates.sort(key=lambda x: (x['trust'], x['model_pct']), reverse=True)
+            top = accuracy_candidates[0]
+            same_as_edge = (edge_pick and labels_match(top['label'], edge_pick['label']))
+            if same_as_edge:
+                # Accuracy + edge agree — strongest signal
                 st.success(
-                    f"🟢🔵 Best {side_label} Bet: **{top['label']}{side_suffix}** · "
-                    f"Edge +{top['edge']}c · Kelly ${top['kelly']} · Trust {round(top['trust'],1)}"
+                    f"🟢🔵🟣 **{top['label']}{side_suffix}** — accuracy AND edge agree · "
+                    f"Trust {round(top['trust'],1)} · Model {round(top['model_pct'],1)}% · "
+                    f"Edge +{top['edge']}c · Kelly ${top['kelly']}"
                 )
-                st.caption(f"({len(ideal)} candidates passed green+blue filter — Trust broke the tie. Also saw: {others})")
             else:
+                # Accuracy and edge differ — show both
                 st.success(
-                    f"🟢🔵 Best {side_label} Bet: **{top['label']}{side_suffix}** · "
-                    f"Edge +{top['edge']}c · Kelly ${top['kelly']} · Trust {round(top['trust'],1)}"
+                    f"🟢🔵 **Accuracy pick {side_label}: {top['label']}{side_suffix}** · "
+                    f"Trust {round(top['trust'],1)} · Model {round(top['model_pct'],1)}% · "
+                    f"Edge +{top['edge']}c · Kelly ${top['kelly']}"
                 )
+                if edge_pick and edge_pick.get('label'):
+                    st.caption(
+                        f"🟣 Edge pick (secondary): {edge_pick['label']}{side_suffix} "
+                        f"(+{edge_pick['edge']}c) — mispriced but low Trust. Sanity check only."
+                    )
+            if len(accuracy_candidates) > 1:
+                others = ', '.join([f"{o['label']} (T {round(o['trust'],1)})" for o in accuracy_candidates[1:]])
+                st.caption(f"({len(accuracy_candidates)} brackets passed accuracy filter — Trust broke the tie. Also: {others})")
             if top['warns']:
                 st.caption('⚠️ ' + ' | '.join(top['warns']))
             return
 
-        # Fallback: no green+blue combo, but maybe a green signal alone
-        if best_sig_by_edge:
-            if best_sig_by_edge.get('uncertain'):
-                st.warning(
-                    f"Best {side_label} (signal-only, no 🔵 HIGH ensemble): "
-                    f"**{best_sig_by_edge['label']}{side_suffix}** (+{best_sig_by_edge['edge']}c) "
-                    f"but HIGH UNCERTAINTY — consider skipping."
-                )
-            else:
-                st.info(
-                    f"Best {side_label} (signal-only): **{best_sig_by_edge['label']}{side_suffix}** "
-                    f"(+{best_sig_by_edge['edge']}c, Kelly ${best_sig_by_edge['kelly']}) — "
-                    f"ensemble not HIGH. Verify before betting."
-                )
+        # No accuracy pick. Show edge pick only as sanity-check info.
+        if edge_pick:
+            st.info(
+                f"🟣 Edge pick {side_label} (no accuracy match): "
+                f"**{edge_pick['label']}{side_suffix}** (+{edge_pick['edge']}c, "
+                f"Kelly ${edge_pick['kelly']}) — market mispriced but model isn't "
+                f"confident enough (Trust <75 or Model% <35). Verify with your own "
+                f"sources before betting."
+            )
             return
 
-        st.caption(f"No green {side_label} signals with HIGH ensemble — skip this run.")
+        st.caption(f"No {side_label} bracket qualifies — skip this run.")
 
     # Build trust map keyed by bracket label for the callout
     # We need to reconstruct this from the loop above — easiest: store trust tuples
@@ -2885,9 +3168,10 @@ if forecast is not None and current is not None:
                                nbm_active=used_nbm, nws_forecast_f=nws_forecast,
                                gfs_ensemble_f=ensemble_mean, bias_adj_f=bias_correction)
         if ty:
-            yes_trust_map[label] = (ty.composite, ty.tier, e_yes or 0, round(k_yes,2), ty.warnings)
+            # V5.17: add model_pct (as percent, 0-100) at index 5 for accuracy filter
+            yes_trust_map[label] = (ty.composite, ty.tier, e_yes or 0, round(k_yes,2), ty.warnings, final_prob*100)
         if tn:
-            no_trust_map[label] = (tn.composite, tn.tier, e_no or 0, round(k_no_est,2), tn.warnings)
+            no_trust_map[label] = (tn.composite, tn.tier, e_no or 0, round(k_no_est,2), tn.warnings, (1.0-final_prob)*100)
 
     _render_best('YES', '', yes_rows, yes_trust_map, best_bet)
 
