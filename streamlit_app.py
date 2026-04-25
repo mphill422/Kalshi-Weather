@@ -18,7 +18,7 @@
 #    Miami 82-83 showing 0.0% when it was clearly in play).
 #
 # 2. DUAL-DOT SIGNAL SYSTEM:
-#    - 🟢🔵 accuracy pick: highest Trust + Model% ≥ 35% + Trust ≥ 75 + HIGH
+#    - 🟢🔵 accuracy pick: highest Trust + Model% ≥ 30% + Trust ≥ 75 + HIGH
 #      ensemble. "Model's honest pick for which bracket will actually hit."
 #    - 🟣 edge pick: highest edge bracket per city. "Biggest mispricing —
 #      use as sanity check / secondary info."
@@ -3014,7 +3014,7 @@ if forecast is not None and current is not None:
             trust_str = r.get('Trust', '—')
             try: trust_val = float(trust_str)
             except: trust_val = 0
-            if trust_val >= 75 and model_pct_val >= 35:
+            if trust_val >= 75 and model_pct_val >= 30:
                 if _yes_acc_label is None: _yes_acc_label = label_plain
     _no_acc_label = None
     for r in no_rows:
@@ -3028,7 +3028,7 @@ if forecast is not None and current is not None:
             trust_str = r.get('Trust', '—')
             try: trust_val = float(trust_str)
             except: trust_val = 0
-            if trust_val >= 75 and model_pct_val >= 35:
+            if trust_val >= 75 and model_pct_val >= 30:
                 if _no_acc_label is None: _no_acc_label = label_plain
 
     yes_rows = _annotate_dots(yes_rows, best_bet, _yes_acc_label)
@@ -3066,7 +3066,7 @@ if forecast is not None and current is not None:
         trust_map: dict of bracket_label -> (trust, tier, edge, kelly, warnings, model_pct)
         best_sig_by_edge: best_bet or best_no_bet dict (highest-edge green signal)
         """
-        # V5.17: Accuracy filter — Trust ≥ 75, Model% ≥ 35, green signal, HIGH ensemble
+        # V5.17: Accuracy filter — Trust ≥ 75, Model% ≥ 30, green signal, HIGH ensemble
         accuracy_candidates = []
         for r in rows_list:
             sig = r.get('Signal', '')
@@ -3078,7 +3078,7 @@ if forecast is not None and current is not None:
             if not tdata: continue
             trust_score = tdata[0]
             model_pct = tdata[5] if len(tdata) > 5 else 0
-            if trust_score >= 75 and model_pct >= 35:
+            if trust_score >= 75 and model_pct >= 30:
                 accuracy_candidates.append({
                     'label': label, 'trust': trust_score,
                     'edge': tdata[2], 'kelly': tdata[3],
