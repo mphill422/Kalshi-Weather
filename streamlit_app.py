@@ -1,35 +1,38 @@
-# Kalshi High Temperature Model - V5.18
+# Kalshi High Temperature Model - V5.19
 #
+# Changes from V5.18:
+# 1. CITY WARM OFFSETS — Data-driven per-city consensus adjustments based on
+#    27+ days of real settlement history. Applied ON TOP of existing bias
+#    correction to correct systematic under/over-prediction patterns.
+#    Offsets derived from avg error analysis April 4-25 2026:
+#
+#    Miami:        +1.5F  (avg error +0.97F, skews warm on hot days)
+#    Atlanta:      +1.5F  (avg error +1.18F, consistent cold bias)
+#    Washington DC:+1.5F  (avg error +1.23F, 54% within 2F — worst calibrated)
+#    New York:     +1.0F  (avg error +0.65F, cold bias)
+#    Phoenix:      +1.0F  (avg error +0.63F, cold bias)
+#    All others:   0.0F   (calibrated — Houston, Dallas, New Orleans,
+#                          Las Vegas all within 0.25F avg error)
+#    OKC:          0.0F   (avg -0.02F after removing Apr-18 data outlier
+#                          of -14.4F which was a bad settlement, not real)
+#
+# 2. REALITY CHECK BANNER — threshold lowered from 3F to 2F gap between
+#    NWS forecast and consensus. Fires earlier to catch warm days sooner.
+#
+# 3. OKC DATA CLEANUP — removed bad settlement row id=343 (2026-04-18,
+#    actual=63F vs consensus=77.4F, error=-14.4F) from Supabase directly.
+#    This was a data error not a real settlement. OKC MAE now 2.52F.
+#
+# All V5.18 logic preserved — dual trust columns, 💎/🎯 symbols, clean
+# signal column, probability floor, accuracy-first picks, etc.
+
+# ── V5.18 original changelog preserved ──
 # Changes from V5.17:
-# 1. DUAL TRUST COLUMNS — Trust column split into two separate columns:
-#    - "Trust 💎" = edge-focused trust score
-#    - "Trust 🎯" = accuracy-focused trust score
-#    Both show 0-100. Same score for now at 30% threshold — infrastructure
-#    ready for when edge/accuracy thresholds diverge in future versions.
-#
-# 2. DIAMOND EDGE SYMBOL — 🟣 purple dot replaced with 💎 diamond throughout:
-#    - Table annotations, best-bet callouts, sidebar key
-#    - Timezone banners: 💎 (Edge) Sweet spot window
-#    - Accuracy line stays: 🎯 (Accuracy) Sweet spot window (purple color kept)
-#
-# 3. CLEAN SIGNAL COLUMN — Signal column now shows emoji only:
-#    - 🟢 BET (green)
-#    - 🟡 SKIP or CAUTION (yellow)
-#    - 🔴 AVOID (red)
-#    - ⚪ No price
-#    No trailing text in the cell — cleaner to scan.
-#
-# 4. REMOVED FAIR COLUMN — never used in practice, removed from YES/NO tables.
-#
-# 5. NARROWED MKT IMPLIED % — kept but column header shortened to "Mkt %"
-#    for tighter display.
-#
-# 6. SIDEBAR SIGNAL KEY — updated to reflect 💎/🎯 dual trust columns,
-#    new ensemble colors, and V5.18 changelog.
-#
-# All V5.17 logic preserved — accuracy-first picks, probability floor,
-# dual-dot system (now 💎/🎯), reality-check banner, hidden cities,
-# per-city routing, bias correction, auto-settlement, bet log, etc.
+# 1. DUAL TRUST COLUMNS — Trust 💎 (edge) + Trust 🎯 (accuracy)
+# 2. DIAMOND EDGE SYMBOL — 💎 replaces 🟣 throughout
+# 3. CLEAN SIGNAL COLUMN — emoji only
+# 4. REMOVED FAIR COLUMN
+# 5. NARROWED MKT % COLUMN
 
 # ── V5.17 original changelog preserved above in V5.17 header ──
 # ── V5.16.1 hotfix note preserved ──
@@ -86,7 +89,7 @@ def _check_app_password():
     }
     </style>
     <div class="mph-login-wrap">
-      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.18</span></div>
+      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.19</span></div>
       <div class="mph-login-sub">Private — enter access password to continue</div>
     </div>
     """, unsafe_allow_html=True)
@@ -418,6 +421,29 @@ CITY_PREDICTION_MODE = {
     'Austin':        'nws_only',
     'Minneapolis':   'nws_only',
     'Los Angeles':   'full_blend',
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# V5.19 CITY WARM OFFSETS — data-driven per-city consensus adjustments
+# ══════════════════════════════════════════════════════════════════════════════
+# Applied AFTER bias correction in compute_consensus. Based on 27+ days of
+# real settlement data showing systematic under/over-prediction per city.
+# Positive = model was running cold (add degrees to consensus)
+# Negative = model was running warm (subtract degrees from consensus)
+#
+# These are separate from bias_correction (which is rolling median of errors).
+# This is a fixed structural offset for cities with persistent directional bias
+# that the rolling median isn't fully capturing due to the ±3F cap.
+#
+# Revisit these monthly as more settlement data accumulates.
+CITY_WARM_OFFSET = {
+    'Miami':         1.5,   # avg error +0.97F, skews warm on hot days
+    'Atlanta':       1.5,   # avg error +1.18F, consistent cold bias
+    'Washington DC': 1.5,   # avg error +1.23F, only 54% within 2F
+    'New York':      1.0,   # avg error +0.65F, cold bias
+    'Phoenix':       1.0,   # avg error +0.63F, cold bias
+    # All others: 0.0F — calibrated (Houston +0.16, Dallas +0.2,
+    # New Orleans +0.25, Las Vegas +0.41, OKC -0.02 after data cleanup)
 }
 
 OBS_HIGH_TRUST_HOUR = 13
@@ -1263,6 +1289,12 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
         if current_for_check is not None and obs_high < current_for_check:
             obs_high_trusted = False
         if obs_high_trusted: consensus = obs_high
+
+    # V5.19: apply city-specific warm offset on top of everything else
+    warm_offset = CITY_WARM_OFFSET.get(city, 0.0)
+    if warm_offset != 0.0:
+        consensus = consensus + warm_offset
+
     return consensus
 
 def bracket_probs(mu, ladder_text, city, obs_high=None, forecast=None):
@@ -1696,13 +1728,12 @@ with st.sidebar:
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.18</div>', unsafe_allow_html=True)
-    st.markdown('- Split Trust into **Trust 💎** + **Trust 🎯**')
-    st.markdown('- 💎 replaces 🟣 as edge symbol')
-    st.markdown('- Clean Signal column (emoji only)')
-    st.markdown('- Removed Fair column')
-    st.markdown('- Narrowed Mkt % column')
-    st.markdown('- Timezone banners: 💎 edge / 🎯 accuracy')
+    st.markdown('<div class="mph-section-header">🚀 V5.19</div>', unsafe_allow_html=True)
+    st.markdown('- **City warm offsets** — data-driven per-city adjustments')
+    st.markdown('- Miami +1.5F · Atlanta +1.5F · DC +1.5F')
+    st.markdown('- New York +1.0F · Phoenix +1.0F')
+    st.markdown('- Reality check banner lowered 3F → 2F')
+    st.markdown('- OKC bad data row removed from Supabase')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1716,7 +1747,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.18</span>
+                <span class="mph-version-badge">V5.19</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -2073,6 +2104,13 @@ elif bias_n > 0:
 else:
     st.caption(f'Bias correction: no history yet for {city} — will activate after 3 settled days')
 
+# V5.19: show city warm offset if active
+warm_offset = CITY_WARM_OFFSET.get(city, 0.0)
+if warm_offset != 0.0:
+    sign = '+' if warm_offset > 0 else ''
+    st.info(f'🌡️ City offset active: {sign}{warm_offset}F structural adjustment '
+            f'(based on {city} avg error over 27+ settled days)')
+
 if city not in saved_ladders:
     saved_ladders[city] = DEFAULT_LADDERS.get(city, '')
 
@@ -2301,7 +2339,8 @@ if forecast is not None and current is not None:
         st.caption(f'High uncertainty mode — gap {round(source_gap,1)}F exceeds {threshold}F threshold — green signals suppressed')
     if morning_suppressed: st.caption('⚠️ Morning suppression active — no obs high + temp well below forecast')
 
-    # V5.17: Reality-check banner
+    # V5.19: Reality-check banner — threshold lowered from 3F to 2F
+    # Fires earlier to catch warm days before they run away
     _reality_warnings = []
     if current is not None and consensus is not None and current >= consensus - 1.0:
         _reality_warnings.append(
@@ -2311,9 +2350,9 @@ if forecast is not None and current is not None:
         _reality_warnings.append(
             f"Obs high so far {round(obs_high_final,1)}°F is near/above consensus {round(consensus,1)}°F "
             f"— bracket may have already moved higher.")
-    if forecast is not None and consensus is not None and forecast >= consensus + 3.0:
+    if forecast is not None and consensus is not None and forecast >= consensus + 2.0:
         _reality_warnings.append(
-            f"NWS forecast {round(forecast,1)}°F is 3°F+ above model consensus {round(consensus,1)}°F "
+            f"NWS forecast {round(forecast,1)}°F is 2°F+ above model consensus {round(consensus,1)}°F "
             f"— official forecaster expects higher.")
     if _reality_warnings:
         st.warning('🚨 **Reality check — verify before betting:**\n\n' +
