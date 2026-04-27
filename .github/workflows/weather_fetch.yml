@@ -1,0 +1,35 @@
+name: Weather Data Fetch
+
+on:
+  schedule:
+    # Every 25 minutes from 9am-5pm ET (14:00-22:00 UTC)
+    # UTC is 5 hours ahead of ET
+    - cron: '0,25,50 14-21 * * *'   # 9:00am - 9:50pm ET (covers open to 5pm ET)
+    - cron: '15,40 14-21 * * *'     # fills the 15/40 minute marks
+  workflow_dispatch:                  # allows manual trigger from GitHub UI
+
+jobs:
+  fetch-weather:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests pytz
+
+      - name: Run weather fetch
+        env:
+          WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python fetch_weather.py
