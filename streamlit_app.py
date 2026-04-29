@@ -1876,25 +1876,34 @@ def window_status(cutoff_et_hour):
 
 # V5.18: Updated labels — 💎 for edge sweet spot, 🎯 for accuracy window
 TIMEZONE_STATIC_INFO = {
-    'ET': {'sweet_spot': '10:00–11:30 AM ET', 'accuracy_window': '12:00–2:00 PM ET', 'peak_heat': '2:00–4:00 PM ET'},
-    'CT': {'sweet_spot': '11:00 AM–12:30 PM ET', 'accuracy_window': '1:00–3:00 PM ET', 'peak_heat': '3:00–5:00 PM ET'},
-    'MT': {'sweet_spot': '12:00–1:30 PM ET', 'accuracy_window': '2:00–4:00 PM ET', 'peak_heat': '4:00–6:00 PM ET'},
-    'PT': {'sweet_spot': '1:00–2:30 PM ET', 'accuracy_window': '3:00–5:00 PM ET', 'peak_heat': '5:00–7:00 PM ET'},
+    'ET': {'sweet_spot': '9:30–10:30 AM ET', 'accuracy_window': '11:00 AM–12:00 PM ET', 'peak_heat': '2:00–4:00 PM ET'},
+    'CT': {'sweet_spot': '10:00–11:00 AM ET', 'accuracy_window': '12:00–1:00 PM ET', 'peak_heat': '3:00–5:00 PM ET'},
+    'MT': {'sweet_spot': '12:00–1:00 PM ET', 'accuracy_window': '2:00–3:00 PM ET', 'peak_heat': '4:00–6:00 PM ET'},
+    'PT': {'sweet_spot': '11:00 AM–12:00 PM ET', 'accuracy_window': '2:00–3:00 PM ET', 'peak_heat': '5:00–7:00 PM ET'},
 }
 
 def get_phase_label(tz_key, et_hour):
     now_et = datetime.now(pytz.timezone('America/New_York'))
     et_hhmm = now_et.hour * 100 + now_et.minute
     phase_times = {
-        'ET': {'bet': (1000, 1130), 'peak': (1400, 1600)},
-        'CT': {'bet': (1100, 1230), 'peak': (1500, 1700)},
-        'MT': {'bet': (1200, 1330), 'peak': (1600, 1800)},
-        'PT': {'bet': (1300, 1430), 'peak': (1700, 1900)},
+        'ET': {'bet': (930, 1030), 'peak': (1400, 1600)},
+        'CT': {'bet': (1000, 1100), 'peak': (1500, 1700)},
+        'MT': {'bet': (1200, 1300), 'peak': (1600, 1800)},
+        'PT': {'bet': (1100, 1200), 'peak': (1700, 1900)},
+    }
+    conv_times = {
+        'ET': (1100, 1200),
+        'CT': (1200, 1300),
+        'MT': (1400, 1500),
+        'PT': (1400, 1500),
     }
     times = phase_times.get(tz_key, {})
+    conv = conv_times.get(tz_key, (0, 0))
     bet_start, bet_end = times.get('bet', (0, 0))
     peak_start, peak_end = times.get('peak', (0, 0))
-    if bet_start <= et_hhmm < bet_end: return '🟢 BET NOW', '#00ff88'
+    conv_start, conv_end = conv
+    if bet_start <= et_hhmm < bet_end: return '💎 EDGE WINDOW', '#00ff88'
+    if conv_start <= et_hhmm < conv_end: return '🎯 CONVICTION WINDOW', '#a78bfa'
     if peak_start <= et_hhmm < peak_end: return '🌡️ PEAK HEAT', '#00b4d8'
     if et_hhmm < bet_start: return '⏳ EARLY', '#94a3b8'
     return '', '#64748b'
