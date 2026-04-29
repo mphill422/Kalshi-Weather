@@ -1,30 +1,23 @@
-# Kalshi High Temperature Model - V5.19
+# Kalshi High Temperature Model - V5.20
 #
-# Changes from V5.18:
-# 1. CITY WARM OFFSETS — Data-driven per-city consensus adjustments based on
-#    27+ days of real settlement history. Applied ON TOP of existing bias
-#    correction to correct systematic under/over-prediction patterns.
-#    Offsets derived from avg error analysis April 4-25 2026:
+# Changes from V5.19:
+# 1. REFINED CITY OFFSETS — Updated based on full 27+ day settlement analysis.
+#    Changes from V5.19:
 #
-#    Miami:        +1.5F  (avg error +0.97F, skews warm on hot days)
-#    Atlanta:      +1.5F  (avg error +1.18F, consistent cold bias)
-#    Washington DC:+1.5F  (avg error +1.23F, 54% within 2F — worst calibrated)
-#    New York:     +1.0F  (avg error +0.65F, cold bias)
-#    Phoenix:      +1.0F  (avg error +0.63F, cold bias)
-#    All others:   0.0F   (calibrated — Houston, Dallas, New Orleans,
-#                          Las Vegas all within 0.25F avg error)
-#    OKC:          0.0F   (avg -0.02F after removing Apr-18 data outlier
-#                          of -14.4F which was a bad settlement, not real)
+#    Miami:        +1.5F → +2.5F  (avg error +2.59F over 27 days — was undercorrected)
+#    Las Vegas:    0.0F  → -1.0F  (avg error -1.00F — runs cold, needs negative offset)
+#    Atlanta:      +1.5F → 0.0F   (recent errors random, not directional — remove offset)
+#    Washington DC:+1.5F → 0.0F   (same — random not directional recently)
+#    New York:     +1.0F → 0.0F   (hiding NY from bets anyway, offset not needed)
+#    Phoenix:      +1.0F → +1.0F  (unchanged — avg error +0.94F supports it)
+#    Dallas:       0.0F  → 0.0F   (bias correction now negative, self-correcting)
+#    Houston:      0.0F  → 0.0F   (avg error -0.01F — perfectly calibrated)
+#    New Orleans:  0.0F  → 0.0F   (avg error -0.04F — perfectly calibrated)
+#    OKC:          0.0F  → 0.0F   (avg error -0.11F after data cleanup)
 #
-# 2. REALITY CHECK BANNER — threshold lowered from 3F to 2F gap between
-#    NWS forecast and consensus. Fires earlier to catch warm days sooner.
-#
-# 3. OKC DATA CLEANUP — removed bad settlement row id=343 (2026-04-18,
-#    actual=63F vs consensus=77.4F, error=-14.4F) from Supabase directly.
-#    This was a data error not a real settlement. OKC MAE now 2.52F.
-#
-# All V5.18 logic preserved — dual trust columns, 💎/🎯 symbols, clean
-# signal column, probability floor, accuracy-first picks, etc.
+# 2. All V5.19 logic preserved — reality check at 2F, dual trust columns,
+#    💎/🎯 symbols, clean signal column, probability floor, GitHub Action,
+#    auto-settlement, bet log, per-city routing, bias correction etc.
 
 # ── V5.18 original changelog preserved ──
 # Changes from V5.17:
@@ -89,7 +82,7 @@ def _check_app_password():
     }
     </style>
     <div class="mph-login-wrap">
-      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.19</span></div>
+      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.20</span></div>
       <div class="mph-login-sub">Private — enter access password to continue</div>
     </div>
     """, unsafe_allow_html=True)
@@ -437,13 +430,14 @@ CITY_PREDICTION_MODE = {
 #
 # Revisit these monthly as more settlement data accumulates.
 CITY_WARM_OFFSET = {
-    'Miami':         1.5,   # avg error +0.97F, skews warm on hot days
-    'Atlanta':       1.5,   # avg error +1.18F, consistent cold bias
-    'Washington DC': 1.5,   # avg error +1.23F, only 54% within 2F
-    'New York':      1.0,   # avg error +0.65F, cold bias
-    'Phoenix':       1.0,   # avg error +0.63F, cold bias
-    # All others: 0.0F — calibrated (Houston +0.16, Dallas +0.2,
-    # New Orleans +0.25, Las Vegas +0.41, OKC -0.02 after data cleanup)
+    'Miami':         2.5,   # avg error +2.59F over 27 days — increased from +1.5F
+    'Phoenix':       1.0,   # avg error +0.94F — unchanged
+    'Las Vegas':    -1.0,   # avg error -1.00F — runs cold, new negative offset
+    # Removed from V5.19: Atlanta, Washington DC, New York
+    # Atlanta: recent errors random not directional — offset removed
+    # Washington DC: same — random not directional
+    # New York: hiding from bets anyway — offset removed
+    # Dallas, Houston, New Orleans, OKC: all calibrated, no offset needed
 }
 
 OBS_HIGH_TRUST_HOUR = 13
@@ -1728,12 +1722,13 @@ with st.sidebar:
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.19</div>', unsafe_allow_html=True)
-    st.markdown('- **City warm offsets** — data-driven per-city adjustments')
-    st.markdown('- Miami +1.5F · Atlanta +1.5F · DC +1.5F')
-    st.markdown('- New York +1.0F · Phoenix +1.0F')
-    st.markdown('- Reality check banner lowered 3F → 2F')
-    st.markdown('- OKC bad data row removed from Supabase')
+    st.markdown('<div class="mph-section-header">🚀 V5.20</div>', unsafe_allow_html=True)
+    st.markdown('- Miami offset +1.5F → **+2.5F** (avg error +2.59F)')
+    st.markdown('- Las Vegas **-1.0F** offset (avg error -1.00F, runs cold)')
+    st.markdown('- Atlanta offset removed (random not directional)')
+    st.markdown('- DC offset removed (random not directional)')
+    st.markdown('- NY offset removed (not betting anyway)')
+    st.markdown('- Dallas/Houston/New Orleans/OKC: no change (calibrated)')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1747,7 +1742,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.19</span>
+                <span class="mph-version-badge">V5.20</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
