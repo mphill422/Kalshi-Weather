@@ -80,11 +80,9 @@ CLI_STATIONS = {
 
 # V5.19 city warm offsets (mirrors streamlit_app.py)
 CITY_WARM_OFFSET = {
-    'Miami':         1.5,
-    'Atlanta':       1.5,
-    'Washington DC': 1.5,
-    'New York':      1.0,
-    'Phoenix':       1.0,
+    'Miami':         2.5,   # avg error +2.59F over 27 days
+    'Phoenix':       1.0,   # avg error +0.94F
+    'Las Vegas':    -1.0,   # avg error -1.00F — runs cold
 }
 
 CITY_PREDICTION_MODE = {
