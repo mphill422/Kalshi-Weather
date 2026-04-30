@@ -467,6 +467,11 @@ HIDDEN_CITIES = {
     # LA unhidden V5.21 — model beats NWS by 0.55F
 }
 
+SPRING_WIDE_THRESHOLD_CITIES = {'New York', 'Philadelphia', 'Boston', 'Washington DC', 'Los Angeles'}
+NORTHEAST_CITIES = {'New York', 'Philadelphia', 'Boston', 'Washington DC'}
+DESERT_CITIES = {'Phoenix', 'Las Vegas'}
+REGIONAL_PRIOR_BIAS = {'Chicago': 'Minneapolis'}
+
 CITY_PREDICTION_MODE = {
     # full_blend — model BEATS NWS (data-proven over 27+ days)
     'New York':     'full_blend',   # model +2.90F better than NWS
