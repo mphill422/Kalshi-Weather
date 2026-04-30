@@ -1,4 +1,4 @@
-# Kalshi High Temperature Model - V5.21
+# Kalshi High Temperature Model - V5.22
 #
 # Changes from V5.20:
 # 1. CITY PREDICTION MODE UPDATES — Based on 27+ day SQL analysis comparing
@@ -119,7 +119,7 @@ def _check_app_password():
     }
     </style>
     <div class="mph-login-wrap">
-      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.21</span></div>
+      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.22</span></div>
       <div class="mph-login-sub">Private — enter access password to continue</div>
     </div>
     """, unsafe_allow_html=True)
@@ -438,21 +438,33 @@ BASE_SIGMA = {
 DESERT_CITIES = {'Phoenix', 'Las Vegas'}
 FORECAST_HEAVY_CITIES = {'Dallas', 'Austin', 'Houston', 'San Antonio', 'Oklahoma City'}
 
+# V5.21: GFS weights — only Houston benefits from GFS (MAE 1.57F vs NWS 1.89F)
+# All other cities: GFS hurts accuracy per 27+ day SQL analysis — weight set to 0
 GFS_CITY_WEIGHT = {
-    'Phoenix': 0.10, 'Las Vegas': 0.10, 'Los Angeles': 0.12,
-    'Miami': 0.18, 'Houston': 0.18, 'New Orleans': 0.18,
-    'Dallas': 0.25, 'Austin': 0.25, 'San Antonio': 0.25, 'Oklahoma City': 0.25,
-    'Atlanta': 0.22, 'Denver': 0.22, 'Minneapolis': 0.22, 'Chicago': 0.22,
-    'New York': 0.15, 'Philadelphia': 0.15, 'Boston': 0.15, 'Washington DC': 0.15,
+    'Houston':       0.18,  # only city where GFS beats NWS
+    'Phoenix':       0.0,   # GFS MAE 3.94F vs NWS 1.21F — removed
+    'Las Vegas':     0.0,   # GFS MAE 3.64F vs NWS 1.71F — removed
+    'Los Angeles':   0.0,   # GFS MAE 2.44F vs NWS 2.25F — removed
+    'Miami':         0.0,   # GFS MAE 3.67F vs NWS 1.75F — removed
+    'New Orleans':   0.0,   # GFS MAE 1.90F vs NWS 1.21F — removed
+    'Dallas':        0.0,   # GFS MAE 1.83F vs NWS 1.65F — marginal, removed
+    'Austin':        0.0,
+    'San Antonio':   0.0,
+    'Oklahoma City': 0.0,
+    'Atlanta':       0.0,
+    'Denver':        0.0,
+    'Minneapolis':   0.0,
+    'Chicago':       0.0,
+    'New York':      0.0,
+    'Philadelphia':  0.0,
+    'Boston':        0.0,
+    'Washington DC': 0.0,
 }
 
-SPRING_WIDE_THRESHOLD_CITIES = {'New York', 'Philadelphia', 'Boston', 'Washington DC', 'Los Angeles'}
-NORTHEAST_CITIES = {'New York', 'Philadelphia', 'Boston', 'Washington DC'}
-REGIONAL_PRIOR_BIAS = {'Chicago': 'Minneapolis'}
-
 HIDDEN_CITIES = {
-    'Minneapolis', 'Denver', 'Chicago', 'Los Angeles', 'Austin',
+    'Minneapolis', 'Denver', 'Chicago', 'Austin',
     'Philadelphia', 'Boston', 'San Antonio',
+    # LA unhidden V5.21 — model beats NWS by 0.55F
 }
 
 CITY_PREDICTION_MODE = {
@@ -1066,6 +1078,52 @@ def compute_row_trust(
         )
         return compute_trust_score(inp)
     except Exception: return None
+
+def compute_edge_trust(model_pct, yes_ask, ensemble_tier):
+    """
+    V5.22: Trust 💎 — measures market MISPRICING, not prediction accuracy.
+    High score = market is significantly underpricing this bracket.
+
+    Scoring:
+    - Market price component (0-50 pts): lower price = higher score
+      ≤5c  = 50pts | ≤10c = 40pts | ≤15c = 30pts | ≤20c = 15pts | >20c = 0pts
+    - Model vs market gap (0-35 pts): higher gap = higher score
+      gap ≥25% = 35pts | ≥20% = 28pts | ≥15% = 20pts | ≥10% = 10pts | <10% = 0pts
+    - Ensemble confirmation (0-15 pts):
+      HIGH = 15pts | MED = 8pts | LOW = 0pts
+    """
+    if yes_ask is None or model_pct is None:
+        return 0.0
+    try:
+        yes_ask = float(yes_ask)
+        model_pct = float(model_pct)
+        market_implied = yes_ask  # yes_ask is already in cents = % implied
+
+        # Market price component
+        if yes_ask <= 5:   price_score = 50
+        elif yes_ask <= 10: price_score = 40
+        elif yes_ask <= 15: price_score = 30
+        elif yes_ask <= 20: price_score = 15
+        else:               price_score = 0
+
+        # Model vs market gap
+        gap = model_pct - market_implied
+        if gap >= 25:   gap_score = 35
+        elif gap >= 20: gap_score = 28
+        elif gap >= 15: gap_score = 20
+        elif gap >= 10: gap_score = 10
+        else:           gap_score = 0
+
+        # Ensemble confirmation
+        ens = str(ensemble_tier or '').upper()
+        if 'HIGH' in ens:   ens_score = 15
+        elif 'MED' in ens:  ens_score = 8
+        else:               ens_score = 0
+
+        total = price_score + gap_score + ens_score
+        return round(min(100.0, total), 1)
+    except Exception:
+        return 0.0
 
 def trust_tier_icon(tier):
     if tier == 'BET': return '🟢'
@@ -1784,13 +1842,14 @@ with st.sidebar:
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.21</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mph-section-header">🚀 V5.22</div>', unsafe_allow_html=True)
+    st.markdown('- **Trust 💎 now measures market mispricing** (separate from 🎯)')
+    st.markdown('- Trust 🎯 = prediction accuracy · Trust 💎 = edge/mispricing')
     st.markdown('- Trust threshold raised **75 → 80** (LOW tier kills)')
-    st.markdown('- **HIGH tier ≥85** = 2× bet size · **MID 80-84** = 1× size')
+    st.markdown('- **HIGH tier ≥85** = 2× bet · **MID 80-84** = 1× bet')
     st.markdown('- 💎 Edge + 🎯 Conviction banners with bet sizing')
     st.markdown('- **GFS removed** from consensus (hurts 15/18 cities)')
-    st.markdown('- San Antonio → nws_only (data proven)')
-    st.markdown('- **LA unhidden** (model beats NWS by 0.55F)')
+    st.markdown('- San Antonio → nws_only · **LA unhidden**')
     st.markdown('- **Ventusky** added as visual sanity check link')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
@@ -1805,7 +1864,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.21</span>
+                <span class="mph-version-badge">V5.22</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -2479,12 +2538,26 @@ if forecast is not None and current is not None:
         trust_y_score = round(trust_yes.composite, 1) if trust_yes else None
         trust_n_score = round(trust_no.composite, 1) if trust_no else None
 
+        # V5.21: Trust 💎 now measures MARKET MISPRICING (edge score)
+        # Trust 🎯 measures PREDICTION ACCURACY (unchanged)
+        edge_trust_yes = compute_edge_trust(
+            model_pct=final_prob * 100,
+            yes_ask=yes_ask,
+            ensemble_tier=ens_tier_for_trust,
+        )
+        edge_trust_no = compute_edge_trust(
+            model_pct=(1.0 - final_prob) * 100,
+            yes_ask=no_ask,
+            ensemble_tier=ens_tier_for_trust,
+        )
+
         # V5.18: Signal column — emoji ONLY, no trailing text
         signal_cell = signal_icon if signal_icon else '—'
         no_signal_cell = no_icon if no_icon else '—'
 
-        # V5.18: Trust split into two columns — Trust 💎 (edge) and Trust 🎯 (accuracy)
-        # Both use the same computed score for now (30% threshold for both)
+        # Trust 💎 = edge/mispricing score | Trust 🎯 = accuracy score
+        trust_y_edge_cell = str(round(edge_trust_yes, 1)) if edge_trust_yes is not None else '—'
+        trust_n_edge_cell = str(round(edge_trust_no, 1)) if edge_trust_no is not None else '—'
         trust_y_cell = str(trust_y_score) if trust_y_score is not None else '—'
         trust_n_cell = str(trust_n_score) if trust_n_score is not None else '—'
 
@@ -2492,24 +2565,24 @@ if forecast is not None and current is not None:
             'Signal': signal_cell,
             'Bracket': label + (' BUSTED' if busted else ''),
             'Model %': str(round(final_prob*100, 1))+'%',
-            'Mkt %': str(round(yes_ask, 1))+'%' if yes_ask else '—',  # V5.18: narrowed header
+            'Mkt %': str(round(yes_ask, 1))+'%' if yes_ask else '—',
             'YES ask': str(yes_ask)+'c' if yes_ask is not None else '—',
             'Edge': edge_str,
             'Kelly': ('$'+str(kelly)) if kelly > 0 else '—',
-            'Trust 💎': trust_y_cell,   # V5.18: edge trust column
-            'Trust 🎯': trust_y_cell,   # V5.18: accuracy trust column (same score for now)
+            'Trust 💎': trust_y_edge_cell,   # V5.21: market mispricing score
+            'Trust 🎯': trust_y_cell,         # V5.21: prediction accuracy score
             'Ensemble': ens_conf,
         })
         no_rows.append({
             'Signal': no_signal_cell,
             'Bracket': label + (' BUSTED' if busted else ''),
             'Model %': str(round(final_prob*100, 1))+'%',
-            'Mkt %': str(round(no_ask, 1))+'%' if no_ask else '—',  # V5.18: narrowed header
+            'Mkt %': str(round(no_ask, 1))+'%' if no_ask else '—',
             'NO ask': str(no_ask)+'c' if no_ask is not None else '—',
             'NO Edge': no_edge_str,
             'Kelly NO': ('$'+str(kelly_no)) if kelly_no > 0 else '—',
-            'Trust 💎': trust_n_cell,   # V5.18: edge trust column
-            'Trust 🎯': trust_n_cell,   # V5.18: accuracy trust column (same score for now)
+            'Trust 💎': trust_n_edge_cell,   # V5.21: market mispricing score
+            'Trust 🎯': trust_n_cell,         # V5.21: prediction accuracy score
             'Ensemble': ens_conf,
         })
 
@@ -2606,14 +2679,75 @@ if forecast is not None and current is not None:
             label = r['Bracket'].replace(' BUSTED', '')
             tdata = trust_map.get(label)
             if not tdata: continue
-            trust_score = tdata[0]
+            trust_score = tdata[0]   # accuracy trust
             model_pct = tdata[5] if len(tdata) > 5 else 0
-            if trust_score >= 75 and model_pct >= 30:
+            edge_trust = tdata[6] if len(tdata) > 6 else 0
+            if trust_score >= 80 and model_pct >= 30:
                 accuracy_candidates.append({
                     'label': label, 'trust': trust_score,
+                    'edge_trust': edge_trust,
                     'edge': tdata[2], 'kelly': tdata[3],
                     'warns': tdata[4] or [], 'model_pct': model_pct,
+                    'yes_ask': next((r.get('YES ask','').replace('c','') for r in rows_list if r.get('Bracket','').replace(' BUSTED','') == label), None),
                 })
+
+        edge_pick = best_sig_by_edge
+
+        if accuracy_candidates:
+            accuracy_candidates.sort(key=lambda x: (x['trust'], x['model_pct']), reverse=True)
+            top = accuracy_candidates[0]
+            same_as_edge = (edge_pick and labels_match(top['label'], edge_pick['label']))
+            if same_as_edge:
+                st.success(
+                    f"🟢🔵💎🎯 **{top['label']}{side_suffix}** — accuracy AND edge agree · "
+                    f"Trust 🎯 {round(top['trust'],1)} · Trust 💎 {round(top['edge_trust'],1)} · "
+                    f"Model {round(top['model_pct'],1)}% · Edge +{top['edge']}c · Kelly ${top['kelly']}"
+                )
+            else:
+                st.success(
+                    f"🟢🔵🎯 **Accuracy pick {side_label}: {top['label']}{side_suffix}** · "
+                    f"Trust 🎯 {round(top['trust'],1)} · Trust 💎 {round(top['edge_trust'],1)} · "
+                    f"Model {round(top['model_pct'],1)}% · Edge +{top['edge']}c · Kelly ${top['kelly']}"
+                )
+                if edge_pick and edge_pick.get('label'):
+                    st.caption(
+                        f"💎 Edge pick (secondary): {edge_pick['label']}{side_suffix} "
+                        f"(+{edge_pick['edge']}c) — mispriced but low Trust 🎯. Sanity check only."
+                    )
+
+            # V5.21: Betting signal banner with tier-based sizing
+            trust_val = round(top['trust'], 1)
+            edge_trust_val = round(top['edge_trust'], 1)
+            now_et = datetime.now(pytz.timezone('America/New_York'))
+            et_hhmm = now_et.hour * 100 + now_et.minute
+            tz_key = 'ET' if city in ['Miami','Atlanta','Washington DC','New York','Philadelphia','Boston'] else \
+                     'CT' if city in ['Dallas','Houston','New Orleans','Oklahoma City','Chicago','Austin','San Antonio','Minneapolis'] else 'PT'
+            edge_windows = {'ET': (930,1030), 'CT': (1000,1100), 'PT': (1100,1200)}
+            conv_windows = {'ET': (1100,1200), 'CT': (1200,1300), 'PT': (1400,1500)}
+            ew = edge_windows.get(tz_key, (930,1030))
+            cw = conv_windows.get(tz_key, (1100,1200))
+            in_edge = ew[0] <= et_hhmm < ew[1]
+            in_conv = cw[0] <= et_hhmm < cw[1]
+
+            if trust_val >= 85 and in_conv:
+                st.error(f"🎯 **HIGH CONVICTION — {top['label']}{side_suffix}** · Trust 🎯 {trust_val} · Trust 💎 {edge_trust_val} · Suggested bet: **$15-20** (HIGH tier 2×)")
+            elif trust_val >= 80 and in_conv:
+                st.warning(f"🎯 **MID CONVICTION — {top['label']}{side_suffix}** · Trust 🎯 {trust_val} · Trust 💎 {edge_trust_val} · Suggested bet: **$8-10** (MID tier 1×)")
+            elif trust_val < 80 and in_conv:
+                st.caption(f"⛔ Trust 🎯 {trust_val} < 80 — LOW tier. Skip this bet.")
+            if same_as_edge and in_edge and top.get('model_pct', 0) >= 30:
+                try:
+                    yes_ask_val = float(top.get('yes_ask') or 99)
+                except: yes_ask_val = 99
+                if yes_ask_val <= 15:
+                    st.info(f"💎 **EDGE OPPORTUNITY — {top['label']}{side_suffix}** · Trust 💎 {edge_trust_val} · Market {yes_ask_val}c · Model {round(top['model_pct'],1)}% · Suggested bet: **$3-5**")
+
+            if len(accuracy_candidates) > 1:
+                others = ', '.join([f"{o['label']} (🎯{round(o['trust'],1)} 💎{round(o['edge_trust'],1)})" for o in accuracy_candidates[1:]])
+                st.caption(f"({len(accuracy_candidates)} brackets passed — also: {others})")
+            if top['warns']:
+                st.caption('⚠️ ' + ' | '.join(top['warns']))
+            return
 
         edge_pick = best_sig_by_edge
 
@@ -2708,9 +2842,11 @@ if forecast is not None and current is not None:
                                nbm_active=used_nbm, nws_forecast_f=nws_forecast,
                                gfs_ensemble_f=ensemble_mean, bias_adj_f=bias_correction)
         if ty:
-            yes_trust_map[label] = (ty.composite, ty.tier, e_yes or 0, round(k_yes,2), ty.warnings, final_prob*100)
+            edge_t_yes = compute_edge_trust(final_prob*100, yes_ask, ens_tier_tmp)
+            yes_trust_map[label] = (ty.composite, ty.tier, e_yes or 0, round(k_yes,2), ty.warnings, final_prob*100, edge_t_yes)
         if tn:
-            no_trust_map[label] = (tn.composite, tn.tier, e_no or 0, round(k_no_est,2), tn.warnings, (1.0-final_prob)*100)
+            edge_t_no = compute_edge_trust((1.0-final_prob)*100, no_ask, ens_tier_tmp)
+            no_trust_map[label] = (tn.composite, tn.tier, e_no or 0, round(k_no_est,2), tn.warnings, (1.0-final_prob)*100, edge_t_no)
 
     _render_best('YES', '', yes_rows, yes_trust_map, best_bet)
 
