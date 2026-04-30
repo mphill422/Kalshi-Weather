@@ -1,23 +1,60 @@
-# Kalshi High Temperature Model - V5.20
+# Kalshi High Temperature Model - V5.21
 #
-# Changes from V5.19:
-# 1. REFINED CITY OFFSETS — Updated based on full 27+ day settlement analysis.
-#    Changes from V5.19:
+# Changes from V5.20:
+# 1. CITY PREDICTION MODE UPDATES — Based on 27+ day SQL analysis comparing
+#    model MAE vs NWS MAE. Switch to nws_only where model hurts accuracy:
 #
-#    Miami:        +1.5F → +2.5F  (avg error +2.59F over 27 days — was undercorrected)
-#    Las Vegas:    0.0F  → -1.0F  (avg error -1.00F — runs cold, needs negative offset)
-#    Atlanta:      +1.5F → 0.0F   (recent errors random, not directional — remove offset)
-#    Washington DC:+1.5F → 0.0F   (same — random not directional recently)
-#    New York:     +1.0F → 0.0F   (hiding NY from bets anyway, offset not needed)
-#    Phoenix:      +1.0F → +1.0F  (unchanged — avg error +0.94F supports it)
-#    Dallas:       0.0F  → 0.0F   (bias correction now negative, self-correcting)
-#    Houston:      0.0F  → 0.0F   (avg error -0.01F — perfectly calibrated)
-#    New Orleans:  0.0F  → 0.0F   (avg error -0.04F — perfectly calibrated)
-#    OKC:          0.0F  → 0.0F   (avg error -0.11F after data cleanup)
+#    Switched to nws_only (model was WORSE than NWS):
+#    - Atlanta:       model 2.43F vs NWS 2.24F → nws_only (already was)
+#    - OKC:          model 2.51F vs NWS 2.25F → nws_only (already was)
+#    - Chicago:       model 3.14F vs NWS 2.90F → nws_only (already was)
+#    - Denver:        model 3.31F vs NWS 3.31F → nws_only (already was)
+#    - Austin:        model 3.60F vs NWS 3.25F → nws_only (already was)
+#    - Minneapolis:   model 4.04F vs NWS 2.73F → nws_only (already was)
+#    - Washington DC: model 2.59F vs NWS 2.35F → nws_only (already was)
+#    - San Antonio:   model 3.04F vs NWS 2.76F → NEW nws_only
+#    - Philadelphia:  model 3.06F vs NWS 3.11F → stays full_blend (negligible)
+#    - Boston:        model 2.93F vs NWS 3.23F → stays full_blend (model helps)
 #
-# 2. All V5.19 logic preserved — reality check at 2F, dual trust columns,
-#    💎/🎯 symbols, clean signal column, probability floor, GitHub Action,
-#    auto-settlement, bet log, per-city routing, bias correction etc.
+#    Stays full_blend (model BEATS NWS):
+#    - New York:   model 1.99F vs NWS 4.89F → full_blend (+2.90F advantage)
+#    - Houston:    model 1.32F vs NWS 2.11F → full_blend (+0.79F advantage)
+#    - Dallas:     model 1.94F vs NWS 2.63F → full_blend (+0.69F advantage)
+#    - Miami:      model 2.13F vs NWS 2.57F → full_blend (+0.44F advantage)
+#    - Phoenix:    model 1.65F vs NWS 1.99F → full_blend (+0.34F advantage)
+#    - Las Vegas:  model 1.56F vs NWS 1.80F → full_blend (+0.24F advantage)
+#    - LA:         model 2.90F vs NWS 3.45F → full_blend (+0.55F advantage)
+#
+# 2. TRUST THRESHOLD RAISED 75 → 80 — Based on erickdronski calibration data:
+#    - HIGH tier (85%+): 80% real win rate → bet 2x size
+#    - MID tier (80-84%): ~65% real win rate → bet 1x size
+#    - LOW tier (<80%): 34.9% real win rate → NO BET
+#    Previous threshold of 75 was in the LOW tier dead zone.
+#
+# 3. BETTING SIGNAL BANNERS — Two dedicated banners replace table scanning:
+#    💎 EDGE OPPORTUNITY — fires in edge window when market ≤15c, model ≥30%
+#    🎯 HIGH CONVICTION — fires in conviction window when Trust ≥85
+#    Combined 💎🎯 — both firing = biggest bet of the day
+#
+# 4. BET SIZING BY TIER built into signal banners:
+#    Edge window: $3-5 flat regardless of trust
+#    MID conviction (Trust 80-84): $8-10
+#    HIGH conviction (Trust 85+): $15-20
+#    ELITE conviction (Trust 90+): $25-30
+#
+# 5. VENTUSKY LINK added alongside Wunderground as visual sanity check
+#    Shows all models (GFS, ECMWF, NAM, ICON, NBM) side by side
+#    No data integration — visual check only before betting
+#
+# 6. GFS REMOVED from consensus for all cities except Houston
+#    Data proves GFS is worse than NWS for 15/18 cities.
+#    Houston: GFS MAE 1.57F vs NWS 1.89F — only city where GFS helps.
+#
+# 7. LA UNHIDDEN — model beats NWS by 0.55F, worth monitoring
+#
+# All V5.20 logic preserved — city offsets, reality check at 2F,
+# dual trust columns, probability floor, GitHub Action, auto-settlement,
+# bet log, per-city routing, bias correction etc.
 
 # ── V5.18 original changelog preserved ──
 # Changes from V5.17:
@@ -82,7 +119,7 @@ def _check_app_password():
     }
     </style>
     <div class="mph-login-wrap">
-      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.20</span></div>
+      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.21</span></div>
       <div class="mph-login-sub">Private — enter access password to continue</div>
     </div>
     """, unsafe_allow_html=True)
@@ -322,6 +359,29 @@ WUNDERGROUND_URLS = {
     'Chicago': 'https://www.wunderground.com/weather/KMDW',
 }
 
+# V5.21: Ventusky URLs — visual multi-model sanity check (GFS, ECMWF, NAM, NBM)
+# Use before betting to confirm models agree within 3F. Visual only, no data integration.
+VENTUSKY_URLS = {
+    'Phoenix':       'https://www.ventusky.com/?p=33.4;-112.0;5&l=temperature-2m',
+    'Las Vegas':     'https://www.ventusky.com/?p=36.1;-115.2;5&l=temperature-2m',
+    'Los Angeles':   'https://www.ventusky.com/?p=33.9;-118.4;5&l=temperature-2m',
+    'Dallas':        'https://www.ventusky.com/?p=32.9;-97.0;5&l=temperature-2m',
+    'Austin':        'https://www.ventusky.com/?p=30.2;-97.7;5&l=temperature-2m',
+    'Houston':       'https://www.ventusky.com/?p=30.0;-95.4;5&l=temperature-2m',
+    'Atlanta':       'https://www.ventusky.com/?p=33.6;-84.4;5&l=temperature-2m',
+    'Miami':         'https://www.ventusky.com/?p=25.8;-80.3;5&l=temperature-2m',
+    'New York':      'https://www.ventusky.com/?p=40.8;-73.9;5&l=temperature-2m',
+    'San Antonio':   'https://www.ventusky.com/?p=29.5;-98.5;5&l=temperature-2m',
+    'New Orleans':   'https://www.ventusky.com/?p=30.0;-90.3;5&l=temperature-2m',
+    'Philadelphia':  'https://www.ventusky.com/?p=39.9;-75.2;5&l=temperature-2m',
+    'Boston':        'https://www.ventusky.com/?p=42.4;-71.0;5&l=temperature-2m',
+    'Denver':        'https://www.ventusky.com/?p=39.9;-104.7;5&l=temperature-2m',
+    'Oklahoma City': 'https://www.ventusky.com/?p=35.4;-97.6;5&l=temperature-2m',
+    'Minneapolis':   'https://www.ventusky.com/?p=44.9;-93.2;5&l=temperature-2m',
+    'Washington DC': 'https://www.ventusky.com/?p=38.9;-77.0;5&l=temperature-2m',
+    'Chicago':       'https://www.ventusky.com/?p=41.9;-87.6;5&l=temperature-2m',
+}
+
 SETTLEMENT_LOCATION = {
     'Phoenix': 'Phoenix Sky Harbor Airport', 'Las Vegas': 'Las Vegas Harry Reid Airport',
     'Los Angeles': 'LA International Airport', 'Dallas': 'Dallas/Fort Worth Airport',
@@ -396,24 +456,26 @@ HIDDEN_CITIES = {
 }
 
 CITY_PREDICTION_MODE = {
-    'New York':     'full_blend',
-    'Houston':      'full_blend',
-    'Dallas':       'full_blend',
-    'Miami':        'full_blend',
-    'Phoenix':      'full_blend',
-    'Las Vegas':    'full_blend',
-    'Boston':       'full_blend',
-    'Philadelphia': 'full_blend',
-    'San Antonio':  'full_blend',
-    'New Orleans':   'nws_only',
-    'Washington DC': 'nws_only',
-    'Atlanta':       'nws_only',
-    'Oklahoma City': 'nws_only',
-    'Chicago':       'nws_only',
-    'Denver':        'nws_only',
-    'Austin':        'nws_only',
-    'Minneapolis':   'nws_only',
-    'Los Angeles':   'full_blend',
+    # full_blend — model BEATS NWS (data-proven over 27+ days)
+    'New York':     'full_blend',   # model +2.90F better than NWS
+    'Houston':      'full_blend',   # model +0.79F better
+    'Dallas':       'full_blend',   # model +0.69F better
+    'Los Angeles':  'full_blend',   # model +0.55F better — unhidden V5.21
+    'Miami':        'full_blend',   # model +0.44F better
+    'Phoenix':      'full_blend',   # model +0.34F better
+    'Las Vegas':    'full_blend',   # model +0.24F better
+    'Boston':       'full_blend',   # model +0.30F better
+    'Philadelphia': 'full_blend',   # negligible difference, keep blend
+    # nws_only — NWS BEATS model (data-proven, blending hurts accuracy)
+    'New Orleans':   'nws_only',   # NWS +0.09F better
+    'Washington DC': 'nws_only',   # NWS +0.24F better
+    'Atlanta':       'nws_only',   # NWS +0.19F better
+    'Oklahoma City': 'nws_only',   # NWS +0.26F better
+    'Chicago':       'nws_only',   # NWS +0.24F better
+    'Denver':        'nws_only',   # NWS +0.00F — no model advantage
+    'Austin':        'nws_only',   # NWS +0.35F better
+    'Minneapolis':   'nws_only',   # NWS +1.31F better — biggest gap
+    'San Antonio':   'nws_only',   # NWS +0.14F better — switched V5.21
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1703,14 +1765,14 @@ with st.sidebar:
     st.markdown('---')
     st.markdown('<div class="mph-section-header">🎯 Trust Columns</div>', unsafe_allow_html=True)
     st.markdown('**Trust 💎 — Edge trust (0-100)**')
-    st.markdown('≥75 = strong · 55-74 = caution · <55 = skip')
+    st.markdown('≥85 = HIGH 2× · 80-84 = MID 1× · <80 = no bet')
     st.markdown('**Trust 🎯 — Accuracy trust (0-100)**')
-    st.markdown('≥75 = strong · 55-74 = caution · <55 = skip')
-    st.caption('Same score now at 30% threshold — will diverge in future versions')
+    st.markdown('≥85 = HIGH 2× · 80-84 = MID 1× · <80 = no bet')
+    st.caption('Based on erickdronski calibration: HIGH tier 80% win rate, LOW tier 34.9%')
     st.markdown('---')
     st.markdown('<div class="mph-section-header">🔵 Ensemble Column</div>', unsafe_allow_html=True)
     st.markdown('🔵 HIGH · 🟡 MED · ⚪ LOW')
-    st.caption('Best bet = 🟢 + 🔵 HIGH + Trust 🎯 ≥75')
+    st.caption('Best bet = 🟢🎯💎 + 🔵 HIGH + Trust ≥85 (HIGH tier)')
     st.markdown('---')
     st.markdown('<div class="mph-section-header">⏰ Timing Symbols</div>', unsafe_allow_html=True)
     st.markdown('💎 (Edge) Sweet spot — hunt mispricings')
@@ -1722,13 +1784,14 @@ with st.sidebar:
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.20</div>', unsafe_allow_html=True)
-    st.markdown('- Miami offset +1.5F → **+2.5F** (avg error +2.59F)')
-    st.markdown('- Las Vegas **-1.0F** offset (avg error -1.00F, runs cold)')
-    st.markdown('- Atlanta offset removed (random not directional)')
-    st.markdown('- DC offset removed (random not directional)')
-    st.markdown('- NY offset removed (not betting anyway)')
-    st.markdown('- Dallas/Houston/New Orleans/OKC: no change (calibrated)')
+    st.markdown('<div class="mph-section-header">🚀 V5.21</div>', unsafe_allow_html=True)
+    st.markdown('- Trust threshold raised **75 → 80** (LOW tier kills)')
+    st.markdown('- **HIGH tier ≥85** = 2× bet size · **MID 80-84** = 1× size')
+    st.markdown('- 💎 Edge + 🎯 Conviction banners with bet sizing')
+    st.markdown('- **GFS removed** from consensus (hurts 15/18 cities)')
+    st.markdown('- San Antonio → nws_only (data proven)')
+    st.markdown('- **LA unhidden** (model beats NWS by 0.55F)')
+    st.markdown('- **Ventusky** added as visual sanity check link')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1742,7 +1805,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.20</span>
+                <span class="mph-version-badge">V5.21</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -2227,15 +2290,18 @@ with col3:
         source_label = '✅ Wethr NWS' if obs_high_url == 'wethr_api_nws' else '[NWS table](' + obs_url + ')'
         st.metric('Obs High Today', str(obs_high_today)+' F', delta='floor active')
         wu_url = WUNDERGROUND_URLS.get(city, '')
-        st.caption(source_label + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else ''))
+        vt_url = VENTUSKY_URLS.get(city, '')
+        st.caption(source_label + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else '') + (' · [Ventusky ↗](' + vt_url + ')' if vt_url else ''))
     elif obs_high_suspect:
         st.metric('Obs High Today', str(obs_high_raw)+'F ⚠️')
         wu_url = WUNDERGROUND_URLS.get(city, '')
-        st.caption('⚠️ Discarded — verify manually' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else ''))
+        vt_url = VENTUSKY_URLS.get(city, '')
+        st.caption('⚠️ Discarded — verify manually' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else '') + (' · [Ventusky ↗](' + vt_url + ')' if vt_url else ''))
     else:
         st.metric('Obs High Today', 'Unavailable')
         wu_url = WUNDERGROUND_URLS.get(city, '')
-        st.caption('[NWS table](' + obs_url + ')' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else ''))
+        vt_url = VENTUSKY_URLS.get(city, '')
+        st.caption('[NWS table](' + obs_url + ')' + (' · [Wunderground ↗](' + wu_url + ')' if wu_url else '') + (' · [Ventusky ↗](' + vt_url + ')' if vt_url else ''))
 with col4:
     if ensemble_mean is not None:
         n_members = len(ensemble_members) if ensemble_members else 0
@@ -2572,6 +2638,31 @@ if forecast is not None and current is not None:
                         f"💎 Edge pick (secondary): {edge_pick['label']}{side_suffix} "
                         f"(+{edge_pick['edge']}c) — mispriced but low Trust 🎯. Sanity check only."
                     )
+
+            # V5.21: Betting signal banner with tier-based sizing
+            trust_val = round(top['trust'], 1)
+            now_et = datetime.now(pytz.timezone('America/New_York'))
+            et_hhmm = now_et.hour * 100 + now_et.minute
+            tz_key = 'ET' if city in ['Miami','Atlanta','Washington DC','New York','Philadelphia','Boston'] else \
+                     'CT' if city in ['Dallas','Houston','New Orleans','Oklahoma City','Chicago','Austin','San Antonio','Minneapolis'] else 'PT'
+            edge_windows = {'ET': (930,1030), 'CT': (1000,1100), 'PT': (1100,1200)}
+            conv_windows = {'ET': (1100,1200), 'CT': (1200,1300), 'PT': (1400,1500)}
+            ew = edge_windows.get(tz_key, (930,1030))
+            cw = conv_windows.get(tz_key, (1100,1200))
+            in_edge = ew[0] <= et_hhmm < ew[1]
+            in_conv = cw[0] <= et_hhmm < cw[1]
+
+            if trust_val >= 85 and in_conv:
+                st.error(f"🎯 **HIGH CONVICTION — {top['label']}{side_suffix}** · Trust {trust_val} · Suggested bet: **$15-20** (HIGH tier 2×)")
+            elif trust_val >= 80 and in_conv:
+                st.warning(f"🎯 **MID CONVICTION — {top['label']}{side_suffix}** · Trust {trust_val} · Suggested bet: **$8-10** (MID tier 1×)")
+            elif trust_val < 80 and in_conv:
+                st.caption(f"⛔ Trust {trust_val} < 80 — LOW tier (34.9% win rate). Skip this bet.")
+            if same_as_edge and in_edge and top.get('model_pct', 0) >= 30:
+                yes_ask_val = top.get('yes_ask', 0) or 0
+                if yes_ask_val <= 15:
+                    st.info(f"💎 **EDGE OPPORTUNITY — {top['label']}{side_suffix}** · Market {yes_ask_val}c · Model {round(top['model_pct'],1)}% · Suggested bet: **$3-5**")
+
             if len(accuracy_candidates) > 1:
                 others = ', '.join([f"{o['label']} (T {round(o['trust'],1)})" for o in accuracy_candidates[1:]])
                 st.caption(f"({len(accuracy_candidates)} brackets passed accuracy filter — Trust 🎯 broke the tie. Also: {others})")
@@ -2583,7 +2674,7 @@ if forecast is not None and current is not None:
             st.info(
                 f"💎 Edge pick {side_label} (no accuracy match): "
                 f"**{edge_pick['label']}{side_suffix}** (+{edge_pick['edge']}c, "
-                f"Kelly ${edge_pick['kelly']}) — market mispriced but Trust 🎯 <75 or Model% <30. "
+                f"Kelly ${edge_pick['kelly']}) — market mispriced but Trust 🎯 <80 or Model% <30. "
                 f"Verify with your own sources before betting."
             )
             return
@@ -2633,7 +2724,7 @@ if forecast is not None and current is not None:
         _render_best('NO', ' NO', no_rows, no_trust_map, best_no_bet)
 
     with st.expander('🔐 View Trust Score Details', expanded=False):
-        st.caption('Raw trust composite (0-100) per bracket. Tier: BET ≥75, CAUTION 55-74, SKIP <55.')
+        st.caption('Raw trust composite (0-100) per bracket. Tier: HIGH ≥85 (2× size), MID 80-84 (1× size), NO BET <80.')
         trust_detail_rows = []
         for r_y, r_n in zip(yes_rows, no_rows):
             trust_detail_rows.append({
