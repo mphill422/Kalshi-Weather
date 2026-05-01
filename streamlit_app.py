@@ -1666,7 +1666,7 @@ def settle_bet_log(settled_rows):
     if not settled_rows: return []
     bet_log = sb_fetch_bets()
     if not bet_log: return []
-    now_iso = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d %H:%M:%S ET')
+    now_iso = datetime.now(pytz.timezone('America/New_York')).isoformat()
     just_settled = []
     for s in settled_rows:
         s_city = s.get('city'); s_date = s.get('date'); s_actual = s.get('actual')
@@ -1709,7 +1709,7 @@ def settle_pending_bets_retroactive():
         if s.get('actual') is not None:
             key = (s.get('city'), str(s.get('date')))
             settlement_map[key] = s['actual']
-    now_iso = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d %H:%M:%S ET')
+    now_iso = datetime.now(pytz.timezone('America/New_York')).isoformat()
     just_settled = []
     for b in pending:
         key = (b.get('city'), str(b.get('date')))
@@ -2854,7 +2854,7 @@ with st.expander('➕ Log a Bet', expanded=False):
                 'profit': None,
                 'payout': None,
                 'settled_at': None,
-                'created_at': datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d %H:%M:%S ET'),
+                'created_at': datetime.now(pytz.timezone('America/New_York')).isoformat(),
             }
             saved = sb_insert_bet(new_bet)
             if saved:
