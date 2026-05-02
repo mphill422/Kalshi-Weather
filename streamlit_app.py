@@ -1,11 +1,16 @@
-# Kalshi High Temperature Model - V5.24
-# V5.24 Changes:
-#   1. CRITICAL: Real-time temp accuracy — fetch timestamps, staleness warnings,
-#      cache-busting refresh buttons, "Force Refresh Weather" button on city page
-#   2. Re-added password gate to bet log section
-#   3. Edit-bet form (enter ID → load → modify → save)
-#   4. Bias correction window 7d → 10d (less reactive to single-day swings)
-#   5. NWS_BIAS_BOOST multiplier 1.5x → 1.2x (was overcorrecting)
+# Kalshi High Temperature Model - V5.25
+# V5.25 Changes:
+#   1. CRITICAL: Reordered Current Temp source priority for fresher data
+#      NWS direct (fastest) → Iowa Mesonet (cross-check) → Wethr.net obs (fallback) → NWS grid (last resort)
+#   2. Source quality badge under Current Temp: 🟢 NWS Direct / 🟢 Iowa Mesonet / 🟡 Wethr / 🔴 Grid
+#   3. Observation timestamp age display: "obs 12m ago" tells you how old the underlying METAR is
+#   4. Bet log password gate now spans entire bet log section (form + history + edit + delete)
+# V5.24 Changes (kept):
+#   - Real-time temp accuracy (5-min cache, force refresh button, fetch timestamps, stall detection)
+#   - Bet log password gate
+#   - Edit-bet form
+#   - Bias correction window 7d → 10d
+#   - NWS_BIAS_BOOST 1.5x → 1.2x
 #
 # Changes from V5.22:
 # 1. VENTUSKY LINK REMOVED — multi-tab visual sanity check was a hassle.
@@ -80,7 +85,7 @@ def _check_app_password():
     }
     </style>
     <div class="mph-login-wrap">
-      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.24</span></div>
+      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.25</span></div>
       <div class="mph-login-sub">Private — enter access password to continue</div>
     </div>
     """, unsafe_allow_html=True)
@@ -897,6 +902,10 @@ def fetch_nws_forecast(lat, lon):
     except Exception: pass
     return None, None
 
+# V5.25: Rewrote source priority for Current Temp viewing.
+# NWS direct first (~2-3 min after METAR publish), then Iowa Mesonet (cross-check),
+# then Wethr.net obs (fallback, ~5-15 min lag), then NWS grid (last resort).
+# Returns (station, temp, source_label, obs_timestamp_iso) so UI can show data freshness.
 def fetch_nws_current(lat, lon, station_id):
     city_name = None
     best_dist = float('inf')
@@ -907,6 +916,53 @@ def fetch_nws_current(lat, lon, station_id):
             city_name = c
     wethr_station = WETHR_STATIONS.get(city_name)
 
+    # 🟢 TIER 1: NWS direct (fastest METAR ingestion)
+    if station_id:
+        obs = safe_get('https://api.weather.gov/stations/' + station_id + '/observations/latest')
+        if obs:
+            props = obs.get('properties', {})
+            temp_c = props.get('temperature', {}).get('value')
+            obs_ts = props.get('timestamp')
+            if temp_c is not None:
+                return station_id, float(c_to_f(temp_c)), 'nws_direct', obs_ts
+
+    # 🟢 TIER 2: Iowa Mesonet ASOS (cross-check, comparable speed)
+    if station_id:
+        try:
+            now_utc = datetime.utcnow()
+            sts_iso = (now_utc - timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%SZ')
+            r = requests.get(
+                'https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py',
+                params={
+                    'station': station_id,
+                    'data': 'tmpf',
+                    'sts': sts_iso,
+                    'format': 'onlycomma',
+                    'tz': 'UTC',
+                    'missing': 'empty',
+                    'latlon': 'no',
+                    'report_type': '3,4',  # routine + special METAR
+                },
+                timeout=10
+            )
+            if r.status_code == 200 and r.text:
+                lines = [ln.strip() for ln in r.text.strip().split('\n') if ln.strip()]
+                # Skip header, find last valid row
+                for line in reversed(lines[1:] if len(lines) > 1 else []):
+                    parts = line.split(',')
+                    if len(parts) >= 3:
+                        ts_str, _, tmpf_str = parts[1], parts[0], parts[2]
+                        try:
+                            tmpf = float(tmpf_str)
+                            if -50 <= tmpf <= 140:
+                                # Parse timestamp ('YYYY-MM-DD HH:MM' UTC)
+                                ts_iso = ts_str.replace(' ', 'T') + 'Z'
+                                return station_id, round(tmpf, 1), 'iowa_mesonet', ts_iso
+                        except (ValueError, IndexError):
+                            continue
+        except Exception: pass
+
+    # 🟡 TIER 3: Wethr.net observations (fallback, slower lag)
     if wethr_station:
         try:
             r = requests.get(
@@ -917,28 +973,27 @@ def fetch_nws_current(lat, lon, station_id):
             if r.status_code == 200:
                 data = r.json()
                 temp_display = data.get('temperature_display')
+                obs_ts = data.get('observation_time') or data.get('timestamp')
                 if temp_display is not None:
-                    return wethr_station, round(float(temp_display), 1)
+                    return wethr_station, round(float(temp_display), 1), 'wethr_obs', obs_ts
         except Exception: pass
 
-    if station_id:
-        obs = safe_get('https://api.weather.gov/stations/' + station_id + '/observations/latest')
-        if obs:
-            temp_c = obs.get('properties', {}).get('temperature', {}).get('value')
-            if temp_c is not None: return station_id, float(c_to_f(temp_c))
+    # 🔴 TIER 4: NWS grid (last resort — forecast-derived, not real obs)
     points = safe_get('https://api.weather.gov/points/' + str(lat) + ',' + str(lon))
-    if not points: return station_id, None
+    if not points: return station_id, None, None, None
     stations_url = points.get('properties', {}).get('observationStations')
-    if not stations_url: return station_id, None
+    if not stations_url: return station_id, None, None, None
     stations = safe_get(stations_url)
-    if not stations or not stations.get('observationStations'): return station_id, None
+    if not stations or not stations.get('observationStations'): return station_id, None, None, None
     first = stations['observationStations'][0]
     sid = first.rstrip('/').split('/')[-1]
     obs = safe_get(first + '/observations/latest')
-    if not obs: return sid, None
-    temp_c = obs.get('properties', {}).get('temperature', {}).get('value')
-    if temp_c is None: return sid, None
-    return sid, float(c_to_f(temp_c))
+    if not obs: return sid, None, None, None
+    props = obs.get('properties', {})
+    temp_c = props.get('temperature', {}).get('value')
+    obs_ts = props.get('timestamp')
+    if temp_c is None: return sid, None, None, None
+    return sid, float(c_to_f(temp_c)), 'nws_grid', obs_ts
 
 def kelly_bet(model_prob, market_price_cents, bankroll, fractional=0.15, max_pct=0.05, max_dollars=100):
     if market_price_cents is None or market_price_cents <= 0 or market_price_cents >= 100: return 0.0
@@ -1578,7 +1633,7 @@ def fetch_city_weather(city):
     coords = CITIES[city]
     lat, lon = coords['lat'], coords['lon']
     nws_fc, _ = fetch_nws_forecast(lat, lon)
-    _, current_temp = fetch_nws_current(lat, lon, STATIONS[city])
+    _, current_temp, _, _ = fetch_nws_current(lat, lon, STATIONS[city])
     obs_high_raw, six_hr_max, _ = fetch_obs_high_today(OBHISTORY_STATIONS[city])
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
     nbm_percentiles = fetch_nbm_percentiles(lat, lon)
@@ -1781,7 +1836,7 @@ with st.sidebar:
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.24</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mph-section-header">🚀 V5.25</div>', unsafe_allow_html=True)
     st.markdown('- **Bias correction faster** (14d → 7d window)')
     st.markdown('- **NWS-only mode boost** for DC, OKC, Denver, Austin, SATX')
     st.markdown('- **Miami warm offset removed** (was over-correcting)')
@@ -1801,7 +1856,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.24</span>
+                <span class="mph-version-badge">V5.25</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -2258,7 +2313,7 @@ with fr_col2:
 with st.spinner('Fetching weather data...'):
     _wx_fetch_start = time.time()
     nws_forecast, _ = fetch_nws_forecast(lat, lon)
-    noaa_station, noaa_obs = fetch_nws_current(lat, lon, station)
+    noaa_station, noaa_obs, noaa_source, noaa_obs_ts = fetch_nws_current(lat, lon, station)
     obs_high_raw, six_hr_max, obs_high_url = fetch_obs_high_today(obs_icao)
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
     nbm_percentiles = fetch_nbm_percentiles(lat, lon)
@@ -2327,6 +2382,7 @@ with col2:
         _temp_hist_key = f'_temp_hist_{city}_{get_eastern_date()}'
         _temp_hist = st.session_state.get(_temp_hist_key, [])
         stall_warning = ''
+        stall_age = 0
         if len(_temp_hist) >= 3:
             last_3 = _temp_hist[-3:]
             unique_temps = set(round(h['temp'], 1) for h in last_3)
@@ -2335,15 +2391,52 @@ with col2:
                 if stall_age >= 600:  # 10+ min same reading
                     stall_warning = f' ⚠️ {stall_age//60}m stall'
         st.metric('Current Temp', str(round(noaa_obs, 1))+' F' + stall_warning)
-        # V5.24: Show fetch age inline so you always know how fresh
+
+        # V5.24: Show fetch age inline
         last_fetch_ts = st.session_state.get(f'_wx_last_fetch_{city}')
         age_str = ''
         if last_fetch_ts:
             age_sec = int(time.time() - last_fetch_ts)
             if age_sec < 60: age_str = f' · {age_sec}s old'
             else: age_str = f' · {age_sec//60}m old'
-        st.caption('Station: ' + noaa_station + age_str)
-        # V5.24: Stall guidance — KNYC METAR updates at :51 each hour
+
+        # V5.25: Source quality badge
+        source_badges = {
+            'nws_direct':   ('🟢', 'NWS Direct',   'Fastest METAR ingestion (~1-3 min lag)'),
+            'iowa_mesonet': ('🟢', 'Iowa Mesonet', 'Cross-check source (~1-5 min lag)'),
+            'wethr_obs':    ('🟡', 'Wethr.net',    'Fallback source (~5-15 min lag)'),
+            'nws_grid':     ('🔴', 'NWS Grid',     'Forecast-derived, NOT real obs — verify manually'),
+        }
+        badge = source_badges.get(noaa_source, ('⚪', 'Unknown', ''))
+
+        # V5.25: Calculate observation timestamp age (how old is the underlying data?)
+        obs_age_str = ''
+        if noaa_obs_ts:
+            try:
+                # Parse ISO timestamp (handle both 'Z' and '+00:00' suffixes)
+                ts_clean = noaa_obs_ts.replace('Z', '+00:00')
+                obs_dt = datetime.fromisoformat(ts_clean)
+                if obs_dt.tzinfo is None:
+                    obs_dt = obs_dt.replace(tzinfo=pytz.UTC)
+                obs_age_sec = int((datetime.now(pytz.UTC) - obs_dt).total_seconds())
+                if obs_age_sec < 60:
+                    obs_age_str = f' · obs {obs_age_sec}s ago'
+                elif obs_age_sec < 3600:
+                    obs_age_str = f' · obs {obs_age_sec//60}m ago'
+                else:
+                    obs_age_str = f' · obs {obs_age_sec//3600}h{(obs_age_sec%3600)//60}m ago'
+            except Exception:
+                pass
+
+        st.caption(f'{badge[0]} {badge[1]} · Station: {noaa_station}{age_str}{obs_age_str}')
+
+        # V5.25: Show source quality tooltip-style line
+        if noaa_source == 'nws_grid':
+            st.error(f'🔴 Current temp from NWS grid (last resort) — {badge[2]}. Verify manually before betting.')
+        elif noaa_source == 'wethr_obs':
+            st.caption(f'🟡 {badge[2]}')
+
+        # V5.24: Stall guidance — METAR stations update hourly at :51
         if stall_warning:
             st.caption(f'⚠️ Same temp {stall_age//60} min — source API may be stale (METAR stations update hourly at :51)')
     else: st.metric('Current Temp', 'Unavailable')
@@ -3117,4 +3210,4 @@ else:
         st.caption('No bets logged yet. Use the form above to track your bets.')
 
 st.markdown('---')
-st.caption(f'MPH Weather Model V5.24 · Last refresh: {get_eastern_datetime().strftime("%I:%M %p ET")} · Auto-refresh every 10 min')
+st.caption(f'MPH Weather Model V5.25 · Last refresh: {get_eastern_datetime().strftime("%I:%M %p ET")} · Auto-refresh every 10 min')
