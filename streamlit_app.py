@@ -1,4 +1,11 @@
-# Kalshi High Temperature Model - V5.23
+# Kalshi High Temperature Model - V5.24
+# V5.24 Changes:
+#   1. CRITICAL: Real-time temp accuracy — fetch timestamps, staleness warnings,
+#      cache-busting refresh buttons, "Force Refresh Weather" button on city page
+#   2. Re-added password gate to bet log section
+#   3. Edit-bet form (enter ID → load → modify → save)
+#   4. Bias correction window 7d → 10d (less reactive to single-day swings)
+#   5. NWS_BIAS_BOOST multiplier 1.5x → 1.2x (was overcorrecting)
 #
 # Changes from V5.22:
 # 1. VENTUSKY LINK REMOVED — multi-tab visual sanity check was a hassle.
@@ -73,7 +80,7 @@ def _check_app_password():
     }
     </style>
     <div class="mph-login-wrap">
-      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.23</span></div>
+      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.24</span></div>
       <div class="mph-login-sub">Private — enter access password to continue</div>
     </div>
     """, unsafe_allow_html=True)
@@ -428,9 +435,10 @@ CITY_WARM_OFFSET = {
     'Las Vegas':    -1.0,   # avg error -1.00F — runs cold
 }
 
-# V5.23: NWS-only mode bias boost — for cities with persistent NWS forecast
+# V5.24: NWS-only mode bias boost — for cities with persistent NWS forecast
 # error >2.5F MAE that simple bias correction isn't catching fast enough.
-# Based on 8-day SQL analysis (4/23-4/30). Apply 1.5x multiplier.
+# Based on 8-day SQL analysis (4/23-4/30). V5.23 used 1.5x but overcorrected on
+# May 2 (DC, OKC, Austin, SATX all flagged with NWS gap warnings). Reduced to 1.2x.
 NWS_BIAS_BOOST_CITIES = {
     'Washington DC',   # 3.53F MAE
     'Oklahoma City',   # 3.25F MAE
@@ -438,7 +446,7 @@ NWS_BIAS_BOOST_CITIES = {
     'Austin',          # 2.76F MAE
     'San Antonio',     # 2.65F MAE
 }
-NWS_BIAS_BOOST_MULTIPLIER = 1.5
+NWS_BIAS_BOOST_MULTIPLIER = 1.2
 
 OBS_HIGH_TRUST_HOUR = 13
 OBS_HIGH_MAX_OVERSHOOT = 10.0
@@ -603,8 +611,9 @@ def run_auto_settlement():
             settled.append({'city': city, 'date': row_date, 'actual': actual, 'error': error})
     return len(settled), settled
 
-# V5.23: Bias correction — 7-day window (was 14), no dampener, NWS boost
-def compute_bias_correction_db(city, n_recent=7):
+# V5.24: Bias correction — 10-day window (was 7), middle ground after V5.23
+# 7-day was too reactive to single warm/cold slates and over-rotated on May 2 NYC
+def compute_bias_correction_db(city, n_recent=10):
     import statistics
     rows = sb_fetch_city(city)
     complete = [r for r in rows if r.get('actual') is not None and r.get('consensus') is not None]
@@ -648,7 +657,7 @@ def get_uncertainty_threshold(city):
     if city in DESERT_CITIES: return 6.0
     return 5.0
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=300)  # V5.24: 30min → 5min (stale data caused real-money loss on May 2)
 def fetch_nbm_percentiles(lat, lon):
     city_name = None
     best_dist = float('inf')
@@ -1564,7 +1573,7 @@ def sync_all_ladders(saved_ladders, force=False):
     progress.empty()
     return saved_ladders, {'synced': synced, 'failed': failed}
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=300)  # V5.24: 30min → 5min for fresher data
 def fetch_city_weather(city):
     coords = CITIES[city]
     lat, lon = coords['lat'], coords['lon']
@@ -1772,7 +1781,7 @@ with st.sidebar:
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.23</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mph-section-header">🚀 V5.24</div>', unsafe_allow_html=True)
     st.markdown('- **Bias correction faster** (14d → 7d window)')
     st.markdown('- **NWS-only mode boost** for DC, OKC, Denver, Austin, SATX')
     st.markdown('- **Miami warm offset removed** (was over-correcting)')
@@ -1792,7 +1801,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.23</span>
+                <span class="mph-version-badge">V5.24</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -1847,8 +1856,12 @@ else:
                    str(len(last_sync_data.get('synced', []))) + ' cities loaded')
     with col_btn:
         if st.button('Refresh All'):
+            # V5.24: Also clear @st.cache_data to bust stale weather caches
+            try:
+                st.cache_data.clear()
+            except Exception: pass
             saved_ladders, results = sync_all_ladders(saved_ladders, force=True)
-            st.success('Re-synced ' + str(len(results.get('synced', []))) + '/' + str(len(SERIES)) + ' city ladders')
+            st.success('Re-synced ' + str(len(results.get('synced', []))) + '/' + str(len(SERIES)) + ' city ladders + cleared weather cache')
             if results.get('failed'): st.warning('Could not fetch: ' + ', '.join(results['failed']))
             st.rerun()
 
@@ -2148,7 +2161,7 @@ bias_correction, bias_n = compute_bias_correction_db(city)
 if bias_n >= 3:
     direction = 'warm' if bias_correction > 0 else 'cold'
     sign = '+' if bias_correction > 0 else ''
-    boost_note = ' (1.5× boost active)' if city in NWS_BIAS_BOOST_CITIES else ''
+    boost_note = ' (1.2× boost active)' if city in NWS_BIAS_BOOST_CITIES else ''
     st.info(f'Bias correction active: {sign}{bias_correction}F applied to consensus '
             f'(model ran {direction} by avg {abs(bias_correction)}F over last {bias_n} days{boost_note})')
 elif bias_n > 0:
@@ -2189,6 +2202,10 @@ else:
 
 if st.button('Refresh Prices'):
     clear_city_cache(city)
+    # V5.24: Also clear weather cache so next render fetches fresh APIs
+    try:
+        st.cache_data.clear()
+    except Exception: pass
     st.rerun()
 
 box_values = ladder_to_boxes(saved_ladders[city])
@@ -2209,12 +2226,52 @@ st.caption('Current ladder: ' + ladder_text)
 
 
 st.markdown('<div class="mph-section-header">🌤️ Live Weather</div>', unsafe_allow_html=True)
+
+# V5.24: Force-refresh button — clears st.cache_data so next fetch hits APIs fresh
+fr_col1, fr_col2 = st.columns([1, 3])
+with fr_col1:
+    if st.button('🔄 Force Refresh Weather', key=f'force_wx_{city}', use_container_width=True):
+        try:
+            st.cache_data.clear()
+        except Exception: pass
+        # Bump session counter to force re-render
+        st.session_state[f'_wx_refresh_count_{city}'] = st.session_state.get(f'_wx_refresh_count_{city}', 0) + 1
+        st.rerun()
+with fr_col2:
+    last_fetch_ts = st.session_state.get(f'_wx_last_fetch_{city}')
+    if last_fetch_ts:
+        age_sec = int(time.time() - last_fetch_ts)
+        if age_sec < 60:
+            age_str = f'{age_sec}s ago'
+            age_color = '#22c55e'
+        elif age_sec < 600:
+            age_str = f'{age_sec//60}m {age_sec%60}s ago'
+            age_color = '#22c55e'
+        elif age_sec < 1800:
+            age_str = f'{age_sec//60}m ago'
+            age_color = '#eab308'
+        else:
+            age_str = f'{age_sec//60}m ago ⚠️ STALE'
+            age_color = '#ef4444'
+        st.markdown(f'<div style="padding:8px 0;color:{age_color};font-size:13px;">Weather last fetched: <strong>{age_str}</strong></div>', unsafe_allow_html=True)
+
 with st.spinner('Fetching weather data...'):
+    _wx_fetch_start = time.time()
     nws_forecast, _ = fetch_nws_forecast(lat, lon)
     noaa_station, noaa_obs = fetch_nws_current(lat, lon, station)
     obs_high_raw, six_hr_max, obs_high_url = fetch_obs_high_today(obs_icao)
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
     nbm_percentiles = fetch_nbm_percentiles(lat, lon)
+    # V5.24: Record fetch timestamp for staleness display
+    st.session_state[f'_wx_last_fetch_{city}'] = time.time()
+    # V5.24: Track current_temp history to detect stalls (helps diagnose stale data)
+    _temp_hist_key = f'_temp_hist_{city}_{get_eastern_date()}'
+    _temp_hist = st.session_state.get(_temp_hist_key, [])
+    if noaa_obs is not None:
+        _temp_hist.append({'t': time.time(), 'temp': noaa_obs})
+        # Keep last 20 readings
+        _temp_hist = _temp_hist[-20:]
+        st.session_state[_temp_hist_key] = _temp_hist
 
 nws_trend_key = f'nws_prev_{city}_{get_eastern_date()}'
 nws_trend_up = False
@@ -2266,8 +2323,29 @@ with col1:
     else: st.metric('NWS Forecast', 'Unavailable')
 with col2:
     if noaa_obs is not None:
-        st.metric('Current Temp', str(round(noaa_obs, 1))+' F')
-        st.caption('Station: ' + noaa_station)
+        # V5.24: Detect temp stalls — same value across 3+ consecutive fetches
+        _temp_hist_key = f'_temp_hist_{city}_{get_eastern_date()}'
+        _temp_hist = st.session_state.get(_temp_hist_key, [])
+        stall_warning = ''
+        if len(_temp_hist) >= 3:
+            last_3 = _temp_hist[-3:]
+            unique_temps = set(round(h['temp'], 1) for h in last_3)
+            if len(unique_temps) == 1:
+                stall_age = int(time.time() - last_3[0]['t'])
+                if stall_age >= 600:  # 10+ min same reading
+                    stall_warning = f' ⚠️ {stall_age//60}m stall'
+        st.metric('Current Temp', str(round(noaa_obs, 1))+' F' + stall_warning)
+        # V5.24: Show fetch age inline so you always know how fresh
+        last_fetch_ts = st.session_state.get(f'_wx_last_fetch_{city}')
+        age_str = ''
+        if last_fetch_ts:
+            age_sec = int(time.time() - last_fetch_ts)
+            if age_sec < 60: age_str = f' · {age_sec}s old'
+            else: age_str = f' · {age_sec//60}m old'
+        st.caption('Station: ' + noaa_station + age_str)
+        # V5.24: Stall guidance — KNYC METAR updates at :51 each hour
+        if stall_warning:
+            st.caption(f'⚠️ Same temp {stall_age//60} min — source API may be stale (METAR stations update hourly at :51)')
     else: st.metric('Current Temp', 'Unavailable')
 with col3:
     # V5.23: Ventusky link removed — only Wunderground
@@ -2803,7 +2881,7 @@ with st.expander('🔬 Source Accuracy Report (per-city)', expanded=False):
         winner = 'NWS' if nws_mae < cons_mae else ('Consensus' if cons_mae < nws_mae else 'Tie')
         diff = round(abs(nws_mae - cons_mae), 2)
         mode = CITY_PREDICTION_MODE.get(c, 'full_blend')
-        boost = ' 🚀1.5x' if c in NWS_BIAS_BOOST_CITIES else ''
+        boost = ' 🚀1.2x' if c in NWS_BIAS_BOOST_CITIES else ''
         src_rows.append({
             'City': c,
             'Mode': mode + boost,
@@ -2816,104 +2894,227 @@ with st.expander('🔬 Source Accuracy Report (per-city)', expanded=False):
     if src_rows:
         src_rows.sort(key=lambda x: x['Diff'], reverse=True)
         st.dataframe(pd.DataFrame(src_rows), use_container_width=True, hide_index=True)
-        st.caption('🚀 = NWS_BIAS_BOOST_CITIES (1.5x bias multiplier active)')
+        st.caption('🚀 = NWS_BIAS_BOOST_CITIES (1.2x bias multiplier active)')
     else:
         st.caption('Need 5+ settled days per city for source comparison.')
 
 # ── Personal Bet Log ──────────────────────────────────────────────────────────
 st.markdown('<div class="mph-section-header">💰 Personal Bet Log</div>', unsafe_allow_html=True)
 
-bet_log = load_bet_log()
+# V5.24: Password gate on bet log — re-added after V5.23 regression
+# Uses same app_password secret; one unlock covers form + history + edit/delete
+def _check_betlog_password():
+    try:
+        correct_pw = st.secrets.get('app_password', None)
+    except Exception:
+        correct_pw = None
+    if not correct_pw:
+        return True
+    if st.session_state.get('_betlog_authed') is True:
+        return True
+    return False
 
-with st.expander('➕ Log a Bet', expanded=False):
-    st.caption('Bets are auto-settled when their date settles in the database.')
-    bcol1, bcol2, bcol3 = st.columns(3)
-    with bcol1:
-        bet_city = st.selectbox('City', list(CITIES.keys()), key='bet_city_input')
-        bet_direction = st.selectbox('Direction', ['YES', 'NO'], key='bet_dir_input')
-    with bcol2:
-        bet_bracket = st.text_input('Bracket (e.g., 79-80, 83 or above)', key='bet_bracket_input')
-        bet_price = st.number_input('Price (cents)', min_value=1, max_value=99, value=50, key='bet_price_input')
-    with bcol3:
-        bet_amount = st.number_input('Amount ($)', min_value=0.5, max_value=1000.0, value=10.0, step=0.5, key='bet_amount_input')
-        bet_date = st.text_input('Date (YYYY-MM-DD)', value=get_eastern_date(), key='bet_date_input')
+_betlog_unlocked = _check_betlog_password()
 
-    if st.button('💾 Save Bet'):
-        if not bet_bracket.strip():
-            st.error('Bracket required')
-        else:
-            new_bet = {
-                'date': bet_date.strip(),
-                'city': bet_city,
-                'bracket': normalize_label(bet_bracket.strip()),
-                'direction': bet_direction,
-                'price': float(bet_price),
-                'amount': float(bet_amount),
-                'result': 'Pending',
-                'actual': None,
-                'profit': None,
-                'payout': None,
-                'settled_at': None,
-                'created_at': datetime.now(pytz.timezone('America/New_York')).isoformat(),
-            }
-            saved = sb_insert_bet(new_bet)
-            if saved:
-                st.success(f'✅ Logged: {bet_city} {bet_bracket} {bet_direction} @ {bet_price}c · ${bet_amount}')
+if not _betlog_unlocked:
+    bl_col1, bl_col2 = st.columns([2, 1])
+    with bl_col1:
+        bl_pw = st.text_input('🔒 Bet log password', type='password', key='_betlog_pw_input',
+                              placeholder='Enter access password to view/edit bet log')
+    with bl_col2:
+        st.write('')  # vertical spacing
+        if st.button('🔓 Unlock', key='_betlog_unlock_btn'):
+            try:
+                correct = st.secrets.get('app_password', None)
+            except Exception:
+                correct = None
+            if bl_pw and correct and bl_pw == correct:
+                st.session_state['_betlog_authed'] = True
                 st.rerun()
+            else:
+                st.error('Incorrect password.')
+    st.caption('Bet log is password-protected to prevent accidental edits and protect bet history.')
+else:
+    bet_log = load_bet_log()
 
-if bet_log:
-    pending = [b for b in bet_log if b.get('result') == 'Pending']
-    won = [b for b in bet_log if b.get('result') == 'Won']
-    lost = [b for b in bet_log if b.get('result') == 'Lost']
-    total_wagered = sum(float(b.get('amount', 0) or 0) for b in won + lost)
-    total_profit = sum(float(b.get('profit', 0) or 0) for b in won + lost)
-    roi = round((total_profit / total_wagered) * 100, 1) if total_wagered > 0 else 0.0
+    with st.expander('➕ Log a Bet', expanded=False):
+        st.caption('Bets are auto-settled when their date settles in the database.')
+        bcol1, bcol2, bcol3 = st.columns(3)
+        with bcol1:
+            bet_city = st.selectbox('City', list(CITIES.keys()), key='bet_city_input')
+            bet_direction = st.selectbox('Direction', ['YES', 'NO'], key='bet_dir_input')
+        with bcol2:
+            bet_bracket = st.text_input('Bracket (e.g., 79-80, 83 or above)', key='bet_bracket_input')
+            bet_price = st.number_input('Price (cents)', min_value=1, max_value=99, value=50, key='bet_price_input')
+        with bcol3:
+            bet_amount = st.number_input('Amount ($)', min_value=0.5, max_value=1000.0, value=10.0, step=0.5, key='bet_amount_input')
+            bet_date = st.text_input('Date (YYYY-MM-DD)', value=get_eastern_date(), key='bet_date_input')
 
-    bc1, bc2, bc3, bc4, bc5 = st.columns(5)
-    with bc1: st.metric('Total Bets', len(bet_log))
-    with bc2: st.metric('Pending', len(pending))
-    with bc3: st.metric('Won', len(won))
-    with bc4: st.metric('Lost', len(lost))
-    with bc5:
-        prefix = '+' if total_profit >= 0 else ''
-        st.metric('P&L', prefix + '$' + str(round(total_profit, 2)), delta=str(roi) + '% ROI')
+        if st.button('💾 Save Bet'):
+            if not bet_bracket.strip():
+                st.error('Bracket required')
+            else:
+                new_bet = {
+                    'date': bet_date.strip(),
+                    'city': bet_city,
+                    'bracket': normalize_label(bet_bracket.strip()),
+                    'direction': bet_direction,
+                    'price': float(bet_price),
+                    'amount': float(bet_amount),
+                    'result': 'Pending',
+                    'actual': None,
+                    'profit': None,
+                    'payout': None,
+                    'settled_at': None,
+                    'created_at': datetime.now(pytz.timezone('America/New_York')).isoformat(),
+                }
+                saved = sb_insert_bet(new_bet)
+                if saved:
+                    st.success(f'✅ Logged: {bet_city} {bet_bracket} {bet_direction} @ {bet_price}c · ${bet_amount}')
+                    st.rerun()
 
-    import pandas as pd
-    bet_rows = []
-    for b in reversed(bet_log[-50:]):
-        result_str = b.get('result', 'Pending')
-        if result_str == 'Won': result_icon = '✅ Won'
-        elif result_str == 'Lost': result_icon = '❌ Lost'
-        else: result_icon = '⏳ Pending'
-        profit_val = b.get('profit')
-        profit_str = (('+' if profit_val >= 0 else '') + '$' + str(round(profit_val, 2))) if profit_val is not None else '—'
-        bet_rows.append({
-            'ID': b.get('id'),
-            'Date': b.get('date', ''),
-            'City': b.get('city', ''),
-            'Bracket': b.get('bracket', ''),
-            'Dir': b.get('direction', ''),
-            'Price': str(b.get('price', '')) + 'c',
-            'Stake': '$' + str(b.get('amount', '')),
-            'Result': result_icon,
-            'Actual': b.get('actual') if b.get('actual') is not None else '—',
-            'P&L': profit_str,
-        })
-    st.dataframe(pd.DataFrame(bet_rows), use_container_width=True, hide_index=True)
+    if bet_log:
+        pending = [b for b in bet_log if b.get('result') == 'Pending']
+        won = [b for b in bet_log if b.get('result') == 'Won']
+        lost = [b for b in bet_log if b.get('result') == 'Lost']
+        total_wagered = sum(float(b.get('amount', 0) or 0) for b in won + lost)
+        total_profit = sum(float(b.get('profit', 0) or 0) for b in won + lost)
+        roi = round((total_profit / total_wagered) * 100, 1) if total_wagered > 0 else 0.0
 
-    with st.expander('🗑️ Edit / Delete Bets', expanded=False):
-        if not bet_log:
-            st.caption('No bets to manage.')
-        else:
-            del_id = st.number_input('Bet ID to delete', min_value=1, step=1, key='del_bet_id')
-            if st.button('🗑️ Delete Bet'):
-                if sb_delete_bet(int(del_id)):
-                    st.success(f'Deleted bet #{int(del_id)}')
+        bc1, bc2, bc3, bc4, bc5 = st.columns(5)
+        with bc1: st.metric('Total Bets', len(bet_log))
+        with bc2: st.metric('Pending', len(pending))
+        with bc3: st.metric('Won', len(won))
+        with bc4: st.metric('Lost', len(lost))
+        with bc5:
+            prefix = '+' if total_profit >= 0 else ''
+            st.metric('P&L', prefix + '$' + str(round(total_profit, 2)), delta=str(roi) + '% ROI')
+
+        import pandas as pd
+        bet_rows = []
+        for b in reversed(bet_log[-50:]):
+            result_str = b.get('result', 'Pending')
+            if result_str == 'Won': result_icon = '✅ Won'
+            elif result_str == 'Lost': result_icon = '❌ Lost'
+            else: result_icon = '⏳ Pending'
+            profit_val = b.get('profit')
+            profit_str = (('+' if profit_val >= 0 else '') + '$' + str(round(profit_val, 2))) if profit_val is not None else '—'
+            bet_rows.append({
+                'ID': b.get('id'),
+                'Date': b.get('date', ''),
+                'City': b.get('city', ''),
+                'Bracket': b.get('bracket', ''),
+                'Dir': b.get('direction', ''),
+                'Price': str(b.get('price', '')) + 'c',
+                'Stake': '$' + str(b.get('amount', '')),
+                'Result': result_icon,
+                'Actual': b.get('actual') if b.get('actual') is not None else '—',
+                'P&L': profit_str,
+            })
+        st.dataframe(pd.DataFrame(bet_rows), use_container_width=True, hide_index=True)
+
+        # V5.24: Edit-bet form — enter ID → load → modify → save
+        with st.expander('✏️ Edit Bet', expanded=False):
+            edit_id = st.number_input('Bet ID to edit', min_value=1, step=1, key='edit_bet_id')
+            edit_load = st.button('📂 Load Bet', key='edit_load_btn')
+            if edit_load:
+                target = next((b for b in bet_log if b.get('id') == int(edit_id)), None)
+                if target:
+                    st.session_state['_edit_bet_target'] = target
+                    st.session_state['_edit_bet_loaded_id'] = int(edit_id)
                     st.rerun()
                 else:
-                    st.error('Delete failed')
-else:
-    st.caption('No bets logged yet. Use the form above to track your bets.')
+                    st.error(f'Bet #{int(edit_id)} not found')
+
+            loaded = st.session_state.get('_edit_bet_target')
+            loaded_id = st.session_state.get('_edit_bet_loaded_id')
+            if loaded and loaded_id == int(edit_id):
+                st.info(f'Editing bet #{loaded_id}')
+                ec1, ec2, ec3 = st.columns(3)
+                with ec1:
+                    city_opts = list(CITIES.keys())
+                    cur_city = loaded.get('city', city_opts[0])
+                    e_city = st.selectbox('City', city_opts,
+                                          index=city_opts.index(cur_city) if cur_city in city_opts else 0,
+                                          key='e_city')
+                    e_dir = st.selectbox('Direction', ['YES', 'NO'],
+                                         index=0 if loaded.get('direction') == 'YES' else 1,
+                                         key='e_dir')
+                with ec2:
+                    e_bracket = st.text_input('Bracket', value=loaded.get('bracket', ''), key='e_bracket')
+                    e_price = st.number_input('Price (cents)', min_value=1, max_value=99,
+                                              value=int(loaded.get('price') or 50), key='e_price')
+                with ec3:
+                    e_amount = st.number_input('Amount ($)', min_value=0.5, max_value=1000.0,
+                                               value=float(loaded.get('amount') or 10.0), step=0.5, key='e_amount')
+                    e_date = st.text_input('Date (YYYY-MM-DD)', value=loaded.get('date', ''), key='e_date')
+
+                # V5.24: Allow result + profit overrides for partial cash-outs / corrections
+                ec4, ec5, ec6 = st.columns(3)
+                with ec4:
+                    res_opts = ['Pending', 'Won', 'Lost']
+                    cur_res = loaded.get('result', 'Pending')
+                    e_result = st.selectbox('Result', res_opts,
+                                            index=res_opts.index(cur_res) if cur_res in res_opts else 0,
+                                            key='e_result')
+                with ec5:
+                    e_actual_str = st.text_input('Actual high (F, blank if pending)',
+                                                 value=str(loaded.get('actual')) if loaded.get('actual') is not None else '',
+                                                 key='e_actual')
+                with ec6:
+                    e_profit_str = st.text_input('Profit override (blank = auto)',
+                                                 value=str(loaded.get('profit')) if loaded.get('profit') is not None else '',
+                                                 key='e_profit')
+
+                save_col, cancel_col = st.columns(2)
+                with save_col:
+                    if st.button('💾 Save Changes', key='e_save_btn'):
+                        updates = {
+                            'date': e_date.strip(),
+                            'city': e_city,
+                            'bracket': normalize_label(e_bracket.strip()),
+                            'direction': e_dir,
+                            'price': float(e_price),
+                            'amount': float(e_amount),
+                            'result': e_result,
+                        }
+                        try:
+                            updates['actual'] = float(e_actual_str) if e_actual_str.strip() else None
+                        except ValueError:
+                            st.error('Actual high must be a number or blank'); st.stop()
+                        try:
+                            updates['profit'] = float(e_profit_str) if e_profit_str.strip() else None
+                        except ValueError:
+                            st.error('Profit must be a number or blank'); st.stop()
+                        if sb_update_bet(int(loaded_id), updates):
+                            st.success(f'✅ Updated bet #{loaded_id}')
+                            st.session_state.pop('_edit_bet_target', None)
+                            st.session_state.pop('_edit_bet_loaded_id', None)
+                            st.rerun()
+                        else:
+                            st.error('Update failed')
+                with cancel_col:
+                    if st.button('✖️ Cancel', key='e_cancel_btn'):
+                        st.session_state.pop('_edit_bet_target', None)
+                        st.session_state.pop('_edit_bet_loaded_id', None)
+                        st.rerun()
+            else:
+                st.caption('Enter a bet ID and click "Load Bet" to populate the form.')
+
+        with st.expander('🗑️ Delete Bet', expanded=False):
+            if not bet_log:
+                st.caption('No bets to manage.')
+            else:
+                del_id = st.number_input('Bet ID to delete', min_value=1, step=1, key='del_bet_id')
+                st.warning('⚠️ Delete is permanent. Verify the ID in the table above.')
+                if st.button('🗑️ Delete Bet'):
+                    if sb_delete_bet(int(del_id)):
+                        st.success(f'Deleted bet #{int(del_id)}')
+                        st.rerun()
+                    else:
+                        st.error('Delete failed')
+    else:
+        st.caption('No bets logged yet. Use the form above to track your bets.')
 
 st.markdown('---')
-st.caption(f'MPH Weather Model V5.23 · Last refresh: {get_eastern_datetime().strftime("%I:%M %p ET")} · Auto-refresh every 10 min')
+st.caption(f'MPH Weather Model V5.24 · Last refresh: {get_eastern_datetime().strftime("%I:%M %p ET")} · Auto-refresh every 10 min')
