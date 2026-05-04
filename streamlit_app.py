@@ -1,16 +1,39 @@
-# Kalshi High Temperature Model - V5.25
-# V5.25 Changes:
-#   1. CRITICAL: Reordered Current Temp source priority for fresher data
-#      NWS direct (fastest) → Iowa Mesonet (cross-check) → Wethr.net obs (fallback) → NWS grid (last resort)
-#   2. Source quality badge under Current Temp: 🟢 NWS Direct / 🟢 Iowa Mesonet / 🟡 Wethr / 🔴 Grid
-#   3. Observation timestamp age display: "obs 12m ago" tells you how old the underlying METAR is
-#   4. Bet log password gate now spans entire bet log section (form + history + edit + delete)
+# Kalshi High Temperature Model - V5.26
+# V5.26 PHILOSOPHY: Measurement before correction.
+# This version DOES NOT change any predictions, weights, bias formulas, or Trust scores.
+# It adds a measurement layer that tells you when to TRUST the existing model vs when to be skeptical.
+#
+# V5.26 Changes:
+#   1. Quality Score (per city) — observes recent calibration health
+#      🟢 HIGH = stable & tight errors → bet at full Kelly
+#      🟡 MED = moderate volatility → bet at half Kelly or skip
+#      🔴 LOW = recent regime shift / volatile errors → skip
+#      Displayed prominently above Model Output on city detail page.
+#   2. Diagnostic Dashboard expander at top of app — three panels:
+#      a. Regime Indicator (yesterday's miss pattern across all 18 cities)
+#      b. Per-City Quality Scores (sortable table with last 3 errors, recent bias direction)
+#      c. Bet Calibration (does "high confidence" actually predict wins?)
+#   3. NO changes to bias correction, Trust scores, Model %, edge, or Kelly logic.
+#      Existing model continues to work exactly as it did in V5.25.
+#
+# Why this approach:
+#   - Stacking more correction layers (V5.23 → V5.24 → V5.25) made the model harder to reason about.
+#   - Without measurement, we can't tell if changes are helping or just shifting losses around.
+#   - Quality score lets the user gate bets on signal RELIABILITY, not just signal strength.
+#   - Diagnostic dashboard reveals patterns (regime shifts, per-city instability) that were hidden.
+#
+# V5.25 Changes (kept):
+#   - Source priority NWS Direct → Iowa Mesonet → Wethr.net → NWS Grid (last resort)
+#   - Source quality badge under Current Temp
+#   - Observation timestamp age display
 # V5.24 Changes (kept):
-#   - Real-time temp accuracy (5-min cache, force refresh button, fetch timestamps, stall detection)
+#   - 5-minute cache TTL on weather fetches
+#   - Force Refresh Weather button
+#   - Stall detection on current temp
 #   - Bet log password gate
 #   - Edit-bet form
-#   - Bias correction window 7d → 10d
-#   - NWS_BIAS_BOOST 1.5x → 1.2x
+#   - Bias correction window 10 days
+#   - NWS_BIAS_BOOST 1.2x
 #
 # Changes from V5.22:
 # 1. VENTUSKY LINK REMOVED — multi-tab visual sanity check was a hassle.
@@ -85,7 +108,7 @@ def _check_app_password():
     }
     </style>
     <div class="mph-login-wrap">
-      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.25</span></div>
+      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.26</span></div>
       <div class="mph-login-sub">Private — enter access password to continue</div>
     </div>
     """, unsafe_allow_html=True)
@@ -661,6 +684,183 @@ def get_uncertainty_threshold(city):
     if city in SPRING_WIDE_THRESHOLD_CITIES and 3 <= month <= 5: return 6.5
     if city in DESERT_CITIES: return 6.0
     return 5.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# V5.26 — PURE MEASUREMENT FUNCTIONS
+# These functions OBSERVE the model. They do not modify it.
+# Goal: tell the user when to trust the model's confidence vs when to be skeptical.
+# Philosophy: existing layers (bias correction, NBM percentiles, Trust scores) continue
+# unchanged. V5.26 just measures whether THOSE layers are likely reliable today.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_quality_score(city):
+    """
+    Returns (score 0-100, tier '🟢/🟡/🔴', reasons_list).
+    Pure observational metric. Does NOT change Model %, Trust scores, or any predictions.
+
+    Quality is high when:
+      - Recent settlements are tightly clustered (low stdev of errors)
+      - Bias is stable (small range of recent errors — not wildly different day to day)
+      - Sample size is sufficient (7+ recent settlements)
+      - Regime is consistent (recent errors all same direction or all near zero)
+
+    Quality is low when:
+      - Errors swing wildly (e.g. -2, +3, -1, +4 = unpredictable)
+      - Sample size is low (<5 settlements)
+      - Recent regime shift detected (last 3 errors all same direction with magnitude >2F)
+    """
+    import statistics
+    rows = sb_fetch_city(city)
+    complete = [r for r in rows if r.get('actual') is not None and r.get('consensus') is not None]
+
+    reasons = []
+
+    # Sample size check first — can't trust calibration without data
+    n_complete = len(complete)
+    if n_complete < 5:
+        reasons.append(f'Only {n_complete} settlement(s) on record — insufficient for confident quality assessment')
+        return 35, '🟡', reasons  # MED by default, not LOW (don't punish new cities)
+
+    recent = complete[-7:]  # last 7 settlements
+    errors = [r['actual'] - r['consensus'] for r in recent]
+    abs_errors = [abs(e) for e in errors]
+
+    score = 100
+    # ── Component 1: tightness (stdev of errors) — lower is better
+    err_stdev = statistics.stdev(errors) if len(errors) >= 2 else 0
+    if err_stdev > 3.0:
+        score -= 35
+        reasons.append(f'Errors very volatile (stdev {err_stdev:.1f}°F) — model unpredictable lately')
+    elif err_stdev > 2.0:
+        score -= 20
+        reasons.append(f'Errors moderately volatile (stdev {err_stdev:.1f}°F)')
+    elif err_stdev > 1.0:
+        score -= 8
+        reasons.append(f'Errors mildly volatile (stdev {err_stdev:.1f}°F) — normal range')
+    else:
+        reasons.append(f'Errors tightly clustered (stdev {err_stdev:.1f}°F) — strong calibration')
+
+    # ── Component 2: range of recent errors — wide range = unpredictable
+    err_range = max(errors) - min(errors)
+    if err_range > 6.0:
+        score -= 25
+        reasons.append(f'Last 7 errors span {err_range:.1f}°F — wild swings')
+    elif err_range > 4.0:
+        score -= 12
+        reasons.append(f'Last 7 errors span {err_range:.1f}°F — meaningful swings')
+
+    # ── Component 3: regime shift detection — last 3 errors in same direction with magnitude
+    if len(complete) >= 3:
+        last_3 = complete[-3:]
+        last_3_errors = [r['actual'] - r['consensus'] for r in last_3]
+        if all(e > 1.5 for e in last_3_errors):
+            score -= 25
+            reasons.append(f'⚠️ REGIME SHIFT — last 3 errors all warm: {", ".join("+"+f"{e:.1f}" for e in last_3_errors)}°F. Model running cold.')
+        elif all(e < -1.5 for e in last_3_errors):
+            score -= 25
+            reasons.append(f'⚠️ REGIME SHIFT — last 3 errors all cold: {", ".join(f"{e:.1f}" for e in last_3_errors)}°F. Model running warm.')
+
+    # ── Component 4: yesterday's miss is leading indicator — last error magnitude
+    if errors:
+        last_err = errors[-1]
+        if abs(last_err) > 3.0:
+            score -= 15
+            reasons.append(f'Yesterday errored {("+ " if last_err > 0 else "")}{last_err:.1f}°F — large miss reduces today confidence')
+
+    # ── Component 5: sample size bonus
+    if n_complete >= 14:
+        reasons.append(f'{n_complete} historical settlements — ample sample size')
+    elif n_complete < 7:
+        score -= 8
+        reasons.append(f'Only {n_complete} historical settlements — sample size limits confidence')
+
+    # ── Tier assignment
+    score = max(0, min(100, score))
+    if score >= 75:
+        tier = '🟢'
+    elif score >= 50:
+        tier = '🟡'
+    else:
+        tier = '🔴'
+
+    return score, tier, reasons
+
+
+def compute_regime_indicator():
+    """
+    Returns (warm_count, cold_count, total_with_data, message).
+    Looks at YESTERDAY's settlements across ALL cities and counts directional miss patterns.
+    If many cities erred warm (model cold) yesterday, today is at risk of similar pattern.
+    """
+    yesterday_str = (datetime.now(pytz.timezone('America/New_York')) - timedelta(days=1)).strftime('%Y-%m-%d')
+    all_rows = sb_fetch_all() or []
+    yesterday_rows = [r for r in all_rows if r.get('date') == yesterday_str
+                      and r.get('actual') is not None and r.get('consensus') is not None]
+    if not yesterday_rows:
+        return 0, 0, 0, 'No settled data from yesterday yet'
+
+    warm_misses = sum(1 for r in yesterday_rows if (r['actual'] - r['consensus']) > 1.5)
+    cold_misses = sum(1 for r in yesterday_rows if (r['actual'] - r['consensus']) < -1.5)
+    total = len(yesterday_rows)
+
+    if warm_misses >= 4 and warm_misses / total >= 0.4:
+        msg = f'⚠️ WARM REGIME — {warm_misses}/{total} cities settled warmer than model yesterday. Today predictions may run cold.'
+    elif cold_misses >= 4 and cold_misses / total >= 0.4:
+        msg = f'⚠️ COLD REGIME — {cold_misses}/{total} cities settled cooler than model yesterday. Today predictions may run warm.'
+    else:
+        msg = f'Stable regime — yesterday {warm_misses} warm misses, {cold_misses} cold misses across {total} cities.'
+
+    return warm_misses, cold_misses, total, msg
+
+
+def compute_calibration_buckets():
+    """
+    Returns dict of confidence buckets to win rate stats.
+    Reads bet log to assess: when model said 90%+, did you actually win 90% of the time?
+    This is the most important diagnostic — does the confidence number mean anything?
+    """
+    bets = sb_fetch_bets() or []
+    settled = [b for b in bets if b.get('result') in ('Won', 'Lost')]
+
+    buckets = {
+        '90-100%': {'wins': 0, 'losses': 0, 'bets': []},
+        '70-89%':  {'wins': 0, 'losses': 0, 'bets': []},
+        '50-69%':  {'wins': 0, 'losses': 0, 'bets': []},
+        '30-49%':  {'wins': 0, 'losses': 0, 'bets': []},
+        '0-29%':   {'wins': 0, 'losses': 0, 'bets': []},
+    }
+
+    for bet in settled:
+        # The bet log stores price (cents) which is the MARKET's implied probability.
+        # We don't currently store the model's claimed probability at time of bet.
+        # Use price as a proxy for now — flag this as a V5.27 improvement.
+        price = bet.get('price')
+        if price is None: continue
+        try:
+            p = float(price)
+        except Exception:
+            continue
+        # Convert market price to implied probability (as decimal 0-1)
+        if bet.get('direction') == 'YES':
+            implied = p / 100.0
+        else:
+            implied = 1.0 - (p / 100.0)
+        implied_pct = implied * 100
+
+        # Bucket assignment
+        if implied_pct >= 90: bucket = '90-100%'
+        elif implied_pct >= 70: bucket = '70-89%'
+        elif implied_pct >= 50: bucket = '50-69%'
+        elif implied_pct >= 30: bucket = '30-49%'
+        else: bucket = '0-29%'
+
+        if bet['result'] == 'Won':
+            buckets[bucket]['wins'] += 1
+        else:
+            buckets[bucket]['losses'] += 1
+        buckets[bucket]['bets'].append(bet)
+
+    return buckets
 
 @st.cache_data(ttl=300)  # V5.24: 30min → 5min (stale data caused real-money loss on May 2)
 def fetch_nbm_percentiles(lat, lon):
@@ -1836,13 +2036,15 @@ with st.sidebar:
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.25</div>', unsafe_allow_html=True)
-    st.markdown('- **Bias correction faster** (14d → 7d window)')
-    st.markdown('- **NWS-only mode boost** for DC, OKC, Denver, Austin, SATX')
-    st.markdown('- **Miami warm offset removed** (was over-correcting)')
-    st.markdown('- **Best YES bracket fix** — must contain consensus')
-    st.markdown('- **Ventusky link removed** (was a hassle)')
-    st.markdown('- Denver stays nws_only (GFS = NWS MAE)')
+    st.markdown('<div class="mph-section-header">🚀 V5.26</div>', unsafe_allow_html=True)
+    st.markdown('**Measurement, not correction.**')
+    st.markdown('- **Quality Score** per city (🟢/🟡/🔴) above Model Output')
+    st.markdown('- **Diagnostic Dashboard** at top of app')
+    st.markdown('- **Regime Indicator** — yesterday\'s miss pattern')
+    st.markdown('- **Bet Calibration** — does confidence predict wins?')
+    st.markdown('---')
+    st.caption('V5.26 does NOT change predictions. It tells you when to TRUST them.')
+    st.caption('Use Quality + Regime as a gate on existing signals.')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1856,7 +2058,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.25</span>
+                <span class="mph-version-badge">V5.26</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -1950,6 +2152,110 @@ st.markdown(f"""
 
 import streamlit.components.v1 as components
 components.html('<script>setTimeout(function(){window.location.reload();}, 600000);</script>', height=0)
+
+# ── V5.26 DIAGNOSTIC DASHBOARD ────────────────────────────────────────────────
+# Pure measurement layer. Tells you WHEN to trust the model, not what to bet.
+# Three sub-panels:
+#   1. Regime indicator — yesterday's miss pattern across all cities
+#   2. Per-city quality scores — sortable table with calibration health
+#   3. Bet calibration — does "high confidence" actually predict wins?
+with st.expander('🔬 V5.26 Diagnostic Dashboard — Trust the Model?', expanded=False):
+    st.caption('This panel measures whether the model deserves your trust today. '
+               'It does NOT change any predictions — it tells you when predictions are likely reliable vs likely flawed.')
+
+    # ─── Panel 1: Regime indicator ────────────────────────────────
+    st.markdown('### 🌡️ Today\'s Regime')
+    warm_misses, cold_misses, total_yesterday, regime_msg = compute_regime_indicator()
+    if total_yesterday == 0:
+        st.info(regime_msg)
+    elif '⚠️' in regime_msg:
+        st.error(regime_msg + '  Recommendation: reduce stakes 50% or skip until pattern stabilizes.')
+    else:
+        st.success(regime_msg)
+    st.caption(f'Yesterday: {warm_misses} warm misses, {cold_misses} cold misses out of {total_yesterday} settled cities.')
+
+    st.markdown('---')
+
+    # ─── Panel 2: Per-city quality scores ─────────────────────────
+    st.markdown('### 🎯 Per-City Quality Scores (today)')
+    st.caption('Quality measures whether THIS city\'s recent calibration justifies trusting today\'s prediction. '
+               'High quality = recent errors small and stable. Low quality = recent errors large or volatile.')
+
+    import pandas as pd
+    quality_rows = []
+    for c in CITIES.keys():
+        score, tier, reasons = compute_quality_score(c)
+        # Get recent error summary
+        rows_c = sb_fetch_city(c)
+        complete_c = [r for r in rows_c if r.get('actual') is not None and r.get('consensus') is not None]
+        last_3_errs = []
+        if len(complete_c) >= 1:
+            last_3 = complete_c[-3:]
+            last_3_errs = [r['actual'] - r['consensus'] for r in last_3]
+        last_3_str = ', '.join(('+' if e > 0 else '') + f'{e:.1f}' for e in last_3_errs) if last_3_errs else '—'
+
+        # Direction of recent bias
+        if last_3_errs:
+            avg_recent = sum(last_3_errs) / len(last_3_errs)
+            if avg_recent > 1.5: direction = '🔥 warm'
+            elif avg_recent < -1.5: direction = '❄️ cold'
+            else: direction = '✅ stable'
+        else:
+            direction = '—'
+
+        quality_rows.append({
+            'Tier': tier,
+            'City': c,
+            'Score': score,
+            'Last 3 Errors': last_3_str,
+            'Recent Bias': direction,
+            'N': len(complete_c),
+        })
+
+    # Sort: HIGH quality first, then by score descending
+    quality_rows_sorted = sorted(quality_rows, key=lambda x: (-x['Score'],))
+    st.dataframe(pd.DataFrame(quality_rows_sorted), use_container_width=True, hide_index=True)
+
+    high_count = sum(1 for r in quality_rows if r['Tier'] == '🟢')
+    med_count = sum(1 for r in quality_rows if r['Tier'] == '🟡')
+    low_count = sum(1 for r in quality_rows if r['Tier'] == '🔴')
+    st.caption(f'Today\'s breakdown: {high_count} 🟢 HIGH · {med_count} 🟢 MED · {low_count} 🔴 LOW quality cities. '
+               f'Recommendation: bet only 🟢 HIGH cities at full Kelly. 🟡 MED cities at half Kelly. 🔴 LOW cities skip.')
+
+    st.markdown('---')
+
+    # ─── Panel 3: Bet calibration ─────────────────────────────────
+    st.markdown('### 📊 Bet Calibration — Does Confidence Predict Wins?')
+    st.caption('When you bet at 70%+ market price (high confidence picks), did you actually win that often? '
+               'If win rate matches the price bucket, the model is well calibrated. If not, confidence is misleading.')
+
+    buckets = compute_calibration_buckets()
+    bucket_rows = []
+    for label, data in buckets.items():
+        n = data['wins'] + data['losses']
+        if n == 0:
+            win_rate_str = '—'
+            calibration = '—'
+        else:
+            wr = (data['wins'] / n) * 100
+            win_rate_str = f'{wr:.0f}% ({data["wins"]}/{n})'
+            # Compare to bucket midpoint
+            bucket_mid = {
+                '90-100%': 95, '70-89%': 80, '50-69%': 60, '30-49%': 40, '0-29%': 15
+            }[label]
+            diff = wr - bucket_mid
+            if abs(diff) < 10: calibration = '✅ Good'
+            elif diff < -15: calibration = '🔴 Overconfident'
+            elif diff > 15: calibration = '🟢 Underconfident'
+            else: calibration = '🟡 Off'
+        bucket_rows.append({
+            'Confidence Bucket': label,
+            'Win Rate': win_rate_str,
+            'Sample': n,
+            'Calibration': calibration,
+        })
+    st.dataframe(pd.DataFrame(bucket_rows), use_container_width=True, hide_index=True)
+    st.caption('Note: V5.26 uses MARKET PRICE as proxy for confidence. V5.27 will store the model\'s claimed probability at time of bet for true model calibration.')
 
 view_mode = st.radio('View', ['📊 Mac', '📱 iPhone'], horizontal=True, label_visibility='collapsed')
 is_mobile = view_mode == '📱 iPhone'
@@ -2530,6 +2836,30 @@ if forecast is not None and current is not None:
                                     high_uncertainty=high_uncertainty, obs_high=obs_high_final,
                                     bias_correction=bias_correction)
     if not save_ok: st.caption('⚠️ Could not save prediction to database')
+
+    # ── V5.26: Quality Score for THIS city ────────────────────────────────────
+    # Tells you whether to trust the model's confidence on this specific city today.
+    # Pure observational metric — does not change Model %, edge, or Trust scores below.
+    _q_score, _q_tier, _q_reasons = compute_quality_score(city)
+    _q_color_map = {'🟢': '#22c55e', '🟡': '#eab308', '🔴': '#ef4444'}
+    _q_label_map = {'🟢': 'HIGH QUALITY — full Kelly OK', '🟡': 'MED QUALITY — cut stake 50%', '🔴': 'LOW QUALITY — skip or paper-trade'}
+    _q_color = _q_color_map.get(_q_tier, '#94a3b8')
+    _q_label = _q_label_map.get(_q_tier, '')
+    st.markdown(
+        f'<div style="padding:12px 16px;border-radius:8px;background:rgba(0,0,0,0.25);'
+        f'border-left:4px solid {_q_color};margin:12px 0;">'
+        f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">'
+        f'<div style="font-size:14px;font-weight:600;color:{_q_color};">{_q_tier} {city} Quality Score: {_q_score}/100</div>'
+        f'<div style="font-size:12px;color:#94a3b8;">{_q_label}</div></div></div>',
+        unsafe_allow_html=True
+    )
+    if _q_reasons:
+        with st.expander(f'Why quality is {_q_score}/100 for {city}', expanded=(_q_tier == '🔴')):
+            for r in _q_reasons:
+                st.markdown(f'- {r}')
+            st.caption('Quality measures whether the model deserves trust today based on recent calibration. '
+                       'It does NOT modify Model %, Trust scores, or edge below — those are unchanged. '
+                       'Use quality to decide whether to act on otherwise-strong signals.')
 
     st.markdown('<div class="mph-section-header">🎯 Model Output</div>', unsafe_allow_html=True)
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -3210,4 +3540,4 @@ else:
         st.caption('No bets logged yet. Use the form above to track your bets.')
 
 st.markdown('---')
-st.caption(f'MPH Weather Model V5.25 · Last refresh: {get_eastern_datetime().strftime("%I:%M %p ET")} · Auto-refresh every 10 min')
+st.caption(f'MPH Weather Model V5.26 · Last refresh: {get_eastern_datetime().strftime("%I:%M %p ET")} · Auto-refresh every 10 min')
