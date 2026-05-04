@@ -1,4 +1,8 @@
-# Kalshi High Temperature Model - V5.26
+# Kalshi High Temperature Model - V5.26.1
+# V5.26.1 patch: added manual background collection button to diagnostic dashboard.
+# Press once per morning to log predictions for all 18 cities, populating calibration data.
+# Allows focused betting (5-9 cities) while keeping calibration data wide (all 18).
+#
 # V5.26 PHILOSOPHY: Measurement before correction.
 # This version DOES NOT change any predictions, weights, bias formulas, or Trust scores.
 # It adds a measurement layer that tells you when to TRUST the existing model vs when to be skeptical.
@@ -108,7 +112,7 @@ def _check_app_password():
     }
     </style>
     <div class="mph-login-wrap">
-      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.26</span></div>
+      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.26.1</span></div>
       <div class="mph-login-sub">Private — enter access password to continue</div>
     </div>
     """, unsafe_allow_html=True)
@@ -2036,8 +2040,9 @@ with st.sidebar:
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.26</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mph-section-header">🚀 V5.26.1</div>', unsafe_allow_html=True)
     st.markdown('**Measurement, not correction.**')
+    st.markdown('- **📡 Collect All 18 Cities** button (in dashboard) — log all predictions in background')
     st.markdown('- **Quality Score** per city (🟢/🟡/🔴) above Model Output')
     st.markdown('- **Diagnostic Dashboard** at top of app')
     st.markdown('- **Regime Indicator** — yesterday\'s miss pattern')
@@ -2058,7 +2063,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.26</span>
+                <span class="mph-version-badge">V5.26.1</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -2162,6 +2167,56 @@ components.html('<script>setTimeout(function(){window.location.reload();}, 60000
 with st.expander('🔬 V5.26 Diagnostic Dashboard — Trust the Model?', expanded=False):
     st.caption('This panel measures whether the model deserves your trust today. '
                'It does NOT change any predictions — it tells you when predictions are likely reliable vs likely flawed.')
+
+    # ─── V5.26.1: Manual Background Collection Button ─────────────
+    st.markdown('### 📡 Background Data Collection')
+    _today_logged = sb_fetch_all() or []
+    _today_logged = [r for r in _today_logged if r.get('date') == today_str]
+    _logged_cities = set(r.get('city') for r in _today_logged)
+    _missing_cities = [c for c in CITIES.keys() if c not in _logged_cities]
+
+    bcol1, bcol2 = st.columns([1, 2])
+    with bcol1:
+        if st.button(f'📡 Collect All 18 Cities', key='_v526_collect_all', use_container_width=True):
+            try:
+                st.cache_data.clear()
+            except Exception: pass
+            progress = st.progress(0, text='Starting...')
+            results = {'logged': [], 'failed': []}
+            cities_list = list(CITIES.keys())
+            for i, c in enumerate(cities_list):
+                try:
+                    progress.progress((i + 1) / len(cities_list),
+                                      text=f'Fetching {c} ({i+1}/{len(cities_list)})...')
+                    weather = fetch_city_weather(c)
+                    consensus, ok = save_city_prediction(c, weather, saved_ladders)
+                    if ok:
+                        results['logged'].append(f'{c} (consensus {consensus}F)')
+                    else:
+                        results['failed'].append(c)
+                except Exception as e:
+                    results['failed'].append(f'{c} ({str(e)[:40]})')
+            progress.empty()
+            if results['logged']:
+                st.success(f'✅ Logged predictions for {len(results["logged"])} cities')
+                with st.expander('Cities logged', expanded=False):
+                    for line in results['logged']:
+                        st.markdown(f'- {line}')
+            if results['failed']:
+                st.warning(f'⚠️ Could not log {len(results["failed"])} cities: ' + ', '.join(results['failed']))
+            st.rerun()
+    with bcol2:
+        if _missing_cities:
+            st.warning(f'⚠️ {len(_missing_cities)} of 18 cities have no prediction logged for today: '
+                       + ', '.join(_missing_cities[:8])
+                       + ('...' if len(_missing_cities) > 8 else ''))
+        else:
+            st.success(f'✅ All 18 cities have predictions logged for {today_str}')
+        st.caption('Press the button each morning to log predictions for all 18 cities. '
+                   'This populates the calibration database in the background — needed for accurate quality scores. '
+                   '(Future V5.27: this will run automatically via GitHub Action at 7am ET.)')
+
+    st.markdown('---')
 
     # ─── Panel 1: Regime indicator ────────────────────────────────
     st.markdown('### 🌡️ Today\'s Regime')
@@ -3540,4 +3595,4 @@ else:
         st.caption('No bets logged yet. Use the form above to track your bets.')
 
 st.markdown('---')
-st.caption(f'MPH Weather Model V5.26 · Last refresh: {get_eastern_datetime().strftime("%I:%M %p ET")} · Auto-refresh every 10 min')
+st.caption(f'MPH Weather Model V5.26.1 · Last refresh: {get_eastern_datetime().strftime("%I:%M %p ET")} · Auto-refresh every 10 min')
