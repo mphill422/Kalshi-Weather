@@ -503,19 +503,40 @@ def sb_insert(row):
         return r.status_code in (200, 201)
     except Exception: return False
 
-def sb_fetch_all():
+# ─────────────────────────────────────────────────────────────────────────────
+# V5.27 — Cached Supabase reads (massive speed boost)
+# ─────────────────────────────────────────────────────────────────────────────
+def _bust_bets_cache():
+    try: _sb_fetch_bets_cached.clear()
+    except Exception: pass
+
+def _bust_settlements_cache():
+    try:
+        _sb_fetch_all_cached.clear()
+        _sb_fetch_city_cached.clear()
+    except Exception: pass
+
+@st.cache_data(ttl=60)
+def _sb_fetch_all_cached():
     try:
         r = requests.get(sb_url('settlements'), headers=get_sb_headers(),
                          params={'order': 'date.asc', 'limit': '1000'}, timeout=10)
         return r.json() if r.status_code == 200 else []
     except Exception: return []
 
-def sb_fetch_city(city):
+def sb_fetch_all():
+    return _sb_fetch_all_cached()
+
+@st.cache_data(ttl=60)
+def _sb_fetch_city_cached(city):
     try:
         r = requests.get(sb_url('settlements'), headers=get_sb_headers(),
                          params={'city': 'eq.' + city, 'order': 'date.asc', 'limit': '200'}, timeout=10)
         return r.json() if r.status_code == 200 else []
     except Exception: return []
+
+def sb_fetch_city(city):
+    return _sb_fetch_city_cached(city)
 
 def sb_fetch_unsettled():
     try:
@@ -1886,17 +1907,22 @@ def save_city_prediction(city, weather, saved_ladders):
                                     bias_correction=bias_correction)
     return consensus, save_ok
 
-def sb_fetch_bets():
+@st.cache_data(ttl=30)
+def _sb_fetch_bets_cached():
     try:
         r = requests.get(sb_url('bets'), headers=get_sb_headers(),
                          params={'order': 'id.asc', 'limit': '1000'}, timeout=10)
         return r.json() if r.status_code == 200 else []
     except Exception: return []
 
+def sb_fetch_bets():
+    return _sb_fetch_bets_cached()
+
 def sb_insert_bet(bet_dict):
     try:
         r = requests.post(sb_url('bets'), headers=get_sb_headers(), json=bet_dict, timeout=10)
         if r.status_code in (200, 201):
+            _bust_bets_cache()
             rows = r.json()
             return rows[0] if rows else None
         st.error(f'Bet insert failed: {r.status_code} — {r.text[:200]}')
@@ -1909,7 +1935,20 @@ def sb_update_bet(bet_id, updates):
     try:
         r = requests.patch(sb_url('bets') + '?id=eq.' + str(bet_id),
                            headers=get_sb_headers(), json=updates, timeout=10)
-        return r.status_code in (200, 204)
+        if r.status_code in (200, 204):
+            _bust_bets_cache()
+            return True
+        return False
+    except Exception: return False
+
+def sb_delete_bet(bet_id):
+    try:
+        r = requests.delete(sb_url('bets') + '?id=eq.' + str(bet_id),
+                            headers=get_sb_headers(), timeout=10)
+        if r.status_code in (200, 204):
+            _bust_bets_cache()
+            return True
+        return False
     except Exception: return False
 
 def sb_delete_bet(bet_id):
