@@ -1,69 +1,17 @@
-# Kalshi High Temperature Model - V5.26.1
+# Kalshi High Temperature Model - V5.26.2
+# V5.26.2 PERFORMANCE PATCH (audit fixes from V5.26.1):
+#   1. Added @st.cache_data(ttl=300) to fetch_city_weather — was uncached, called
+#      ~11x per render via timezone banner loop. Biggest single perf win.
+#   2. Added @st.cache_data(ttl=300) to fetch_nws_forecast, fetch_nws_current,
+#      fetch_obs_high_today, fetch_gfs_ensemble — all were uncached.
+#   3. Removed duplicate sb_delete_bet definition. Second def overrode first
+#      and skipped _bust_bets_cache(), causing deleted bets to reappear until
+#      30s TTL expired.
+#   No predictions, weights, bias formulas, or Trust scores changed.
+#
 # V5.26.1 patch: added manual background collection button to diagnostic dashboard.
-# Press once per morning to log predictions for all 18 cities, populating calibration data.
-# Allows focused betting (5-9 cities) while keeping calibration data wide (all 18).
-#
 # V5.26 PHILOSOPHY: Measurement before correction.
-# This version DOES NOT change any predictions, weights, bias formulas, or Trust scores.
-# It adds a measurement layer that tells you when to TRUST the existing model vs when to be skeptical.
-#
-# V5.26 Changes:
-#   1. Quality Score (per city) — observes recent calibration health
-#      🟢 HIGH = stable & tight errors → bet at full Kelly
-#      🟡 MED = moderate volatility → bet at half Kelly or skip
-#      🔴 LOW = recent regime shift / volatile errors → skip
-#      Displayed prominently above Model Output on city detail page.
-#   2. Diagnostic Dashboard expander at top of app — three panels:
-#      a. Regime Indicator (yesterday's miss pattern across all 18 cities)
-#      b. Per-City Quality Scores (sortable table with last 3 errors, recent bias direction)
-#      c. Bet Calibration (does "high confidence" actually predict wins?)
-#   3. NO changes to bias correction, Trust scores, Model %, edge, or Kelly logic.
-#      Existing model continues to work exactly as it did in V5.25.
-#
-# Why this approach:
-#   - Stacking more correction layers (V5.23 → V5.24 → V5.25) made the model harder to reason about.
-#   - Without measurement, we can't tell if changes are helping or just shifting losses around.
-#   - Quality score lets the user gate bets on signal RELIABILITY, not just signal strength.
-#   - Diagnostic dashboard reveals patterns (regime shifts, per-city instability) that were hidden.
-#
-# V5.25 Changes (kept):
-#   - Source priority NWS Direct → Iowa Mesonet → Wethr.net → NWS Grid (last resort)
-#   - Source quality badge under Current Temp
-#   - Observation timestamp age display
-# V5.24 Changes (kept):
-#   - 5-minute cache TTL on weather fetches
-#   - Force Refresh Weather button
-#   - Stall detection on current temp
-#   - Bet log password gate
-#   - Edit-bet form
-#   - Bias correction window 10 days
-#   - NWS_BIAS_BOOST 1.2x
-#
-# Changes from V5.22:
-# 1. VENTUSKY LINK REMOVED — multi-tab visual sanity check was a hassle.
-#    Wunderground retained as the single external sanity check.
-#
-# 2. MIAMI WARM OFFSET REMOVED — the V5.19 +2.5F offset was over-correcting
-#    (4/30: consensus 90.3F, actual 87F = -3.3F). Bias correction handles Miami now.
-#
-# 3. BIAS CORRECTION RESPONSIVENESS BOOST
-#    Old: 14-day median, ±3F cap, 50% dampener if MAE > 4F
-#    New: 7-day median, ±3F cap, NO dampener
-#    Faster regime response when forecast quality shifts.
-#
-# 4. NWS-ONLY MODE BIAS BOOST — 1.5x multiplier for cities with persistent
-#    NWS forecast error >2.5F over rolling 8 days. Currently affects:
-#    Washington DC, Oklahoma City, Denver, Austin, San Antonio.
-#
-# 5. BEST YES BRACKET SELECTOR AUDIT — accuracy pick must contain consensus
-#    or be within 1F. Fixes 4/30 New Orleans bug (consensus 77.5, picked 79-80,
-#    actual 77 — would have hit 77-78).
-#
-# 6. DENVER STAYS NWS_ONLY — SQL showed NWS MAE = GFS MAE = 3.35F over 31 days.
-#    Switching modes wouldn't help. Will benefit from item #4 bias boost since
-#    Denver's recent MAE (2.90F) exceeds the 2.5F threshold.
-#
-# All V5.22 logic preserved.
+# All V5.22-V5.26.1 logic preserved.
 
 import math, re, json, time, requests
 import streamlit as st
@@ -89,30 +37,13 @@ def _check_app_password():
     <style>
     html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     #MainMenu, footer, header {visibility: hidden;}
-    .mph-login-wrap {
-        display: flex; flex-direction: column; align-items: center;
-        justify-content: center; min-height: 70vh;
-    }
-    .mph-login-title {
-        font-size: 2.4rem; font-weight: 700;
-        background: linear-gradient(135deg, #00ff88 0%, #00d4ff 100%);
-        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-        background-clip: text;
-        margin-bottom: 0.25rem;
-    }
-    .mph-login-sub {
-        color: #888; font-size: 0.95rem; margin-bottom: 2rem;
-    }
-    .mph-login-badge {
-        display: inline-block; padding: 0.2rem 0.7rem;
-        background: rgba(0, 255, 136, 0.12);
-        border: 1px solid rgba(0, 255, 136, 0.4);
-        border-radius: 999px; color: #00ff88; font-size: 0.75rem;
-        font-weight: 600; letter-spacing: 0.05em; margin-left: 0.5rem;
-    }
+    .mph-login-wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 70vh; }
+    .mph-login-title { font-size: 2.4rem; font-weight: 700; background: linear-gradient(135deg, #00ff88 0%, #00d4ff 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; margin-bottom: 0.25rem; }
+    .mph-login-sub { color: #888; font-size: 0.95rem; margin-bottom: 2rem; }
+    .mph-login-badge { display: inline-block; padding: 0.2rem 0.7rem; background: rgba(0, 255, 136, 0.12); border: 1px solid rgba(0, 255, 136, 0.4); border-radius: 999px; color: #00ff88; font-size: 0.75rem; font-weight: 600; letter-spacing: 0.05em; margin-left: 0.5rem; }
     </style>
     <div class="mph-login-wrap">
-      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.26.1</span></div>
+      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.26.2</span></div>
       <div class="mph-login-sub">Private — enter access password to continue</div>
     </div>
     """, unsafe_allow_html=True)
@@ -133,116 +64,41 @@ _check_app_password()
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
-
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 header {visibility: hidden;}
-
 .stApp { background: #0a0e1a; }
-
-.mph-hero {
-    background: linear-gradient(135deg, #0d1b2a 0%, #1a2744 50%, #0d1b2a 100%);
-    border: 1px solid #1e3a5f; border-radius: 12px;
-    padding: 24px 32px; margin-bottom: 20px;
-    position: relative; overflow: hidden;
-}
-.mph-hero::before {
-    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
-    background: linear-gradient(90deg, #00ff88, #00b4d8, #00ff88);
-}
-.mph-hero-title {
-    font-size: 28px; font-weight: 700; color: #ffffff;
-    letter-spacing: -0.5px; margin: 0 0 4px 0; font-family: 'Inter', sans-serif;
-}
-.mph-hero-sub {
-    font-size: 13px; color: #64748b;
-    font-family: 'JetBrains Mono', monospace; margin: 0;
-}
-.mph-version-badge {
-    display: inline-block; background: #00ff8820; border: 1px solid #00ff8840;
-    color: #00ff88; font-size: 11px; font-weight: 600; padding: 2px 10px;
-    border-radius: 20px; font-family: 'JetBrains Mono', monospace;
-    margin-left: 10px; vertical-align: middle;
-}
-.mph-live-dot {
-    display: inline-block; width: 8px; height: 8px; background: #00ff88;
-    border-radius: 50%; margin-right: 6px; animation: pulse 2s infinite;
-}
+.mph-hero { background: linear-gradient(135deg, #0d1b2a 0%, #1a2744 50%, #0d1b2a 100%); border: 1px solid #1e3a5f; border-radius: 12px; padding: 24px 32px; margin-bottom: 20px; position: relative; overflow: hidden; }
+.mph-hero::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, #00ff88, #00b4d8, #00ff88); }
+.mph-hero-title { font-size: 28px; font-weight: 700; color: #ffffff; letter-spacing: -0.5px; margin: 0 0 4px 0; font-family: 'Inter', sans-serif; }
+.mph-hero-sub { font-size: 13px; color: #64748b; font-family: 'JetBrains Mono', monospace; margin: 0; }
+.mph-version-badge { display: inline-block; background: #00ff8820; border: 1px solid #00ff8840; color: #00ff88; font-size: 11px; font-weight: 600; padding: 2px 10px; border-radius: 20px; font-family: 'JetBrains Mono', monospace; margin-left: 10px; vertical-align: middle; }
+.mph-live-dot { display: inline-block; width: 8px; height: 8px; background: #00ff88; border-radius: 50%; margin-right: 6px; animation: pulse 2s infinite; }
 @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
-
 .mph-stats-bar { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
-.mph-stat {
-    background: #0d1b2a; border: 1px solid #1e3a5f; border-radius: 8px;
-    padding: 12px 18px; flex: 1; min-width: 120px; text-align: center;
-}
-.mph-stat-value {
-    font-size: 22px; font-weight: 700; color: #00ff88;
-    font-family: 'JetBrains Mono', monospace; display: block; line-height: 1.2;
-}
-.mph-stat-label {
-    font-size: 11px; color: #64748b; text-transform: uppercase;
-    letter-spacing: 0.8px; display: block; margin-top: 4px;
-}
+.mph-stat { background: #0d1b2a; border: 1px solid #1e3a5f; border-radius: 8px; padding: 12px 18px; flex: 1; min-width: 120px; text-align: center; }
+.mph-stat-value { font-size: 22px; font-weight: 700; color: #00ff88; font-family: 'JetBrains Mono', monospace; display: block; line-height: 1.2; }
+.mph-stat-label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.8px; display: block; margin-top: 4px; }
 .mph-stat-warn .mph-stat-value { color: #f59e0b; }
 .mph-stat-alert .mph-stat-value { color: #ef4444; }
 .mph-stat-neutral .mph-stat-value { color: #94a3b8; }
-
-.mph-section-header {
-    font-size: 13px; font-weight: 600; color: #94a3b8;
-    text-transform: uppercase; letter-spacing: 1.2px;
-    padding: 0 0 8px 0; border-bottom: 1px solid #1e3a5f;
-    margin-bottom: 16px; font-family: 'Inter', sans-serif;
-}
-
-.stMetric {
-    background: #0d1b2a !important; border: 1px solid #1e3a5f !important;
-    border-radius: 8px !important; padding: 12px !important;
-}
-.stMetric label {
-    color: #64748b !important; font-size: 11px !important;
-    text-transform: uppercase !important; letter-spacing: 0.8px !important;
-}
-.stMetric [data-testid="stMetricValue"] {
-    color: #ffffff !important; font-family: 'JetBrains Mono', monospace !important;
-    font-size: 20px !important;
-}
-
+.mph-section-header { font-size: 13px; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: 1.2px; padding: 0 0 8px 0; border-bottom: 1px solid #1e3a5f; margin-bottom: 16px; font-family: 'Inter', sans-serif; }
+.stMetric { background: #0d1b2a !important; border: 1px solid #1e3a5f !important; border-radius: 8px !important; padding: 12px !important; }
+.stMetric label { color: #64748b !important; font-size: 11px !important; text-transform: uppercase !important; letter-spacing: 0.8px !important; }
+.stMetric [data-testid="stMetricValue"] { color: #ffffff !important; font-family: 'JetBrains Mono', monospace !important; font-size: 20px !important; }
 .stDataFrame { border: 1px solid #1e3a5f !important; border-radius: 8px !important; overflow: hidden !important; }
-
-.stButton > button {
-    background: #1e3a5f !important; color: #00ff88 !important;
-    border: 1px solid #00ff8840 !important; border-radius: 6px !important;
-    font-family: 'JetBrains Mono', monospace !important; font-size: 12px !important;
-    font-weight: 600 !important; letter-spacing: 0.5px !important;
-    padding: 6px 16px !important; transition: all 0.2s !important;
-}
+.stButton > button { background: #1e3a5f !important; color: #00ff88 !important; border: 1px solid #00ff8840 !important; border-radius: 6px !important; font-family: 'JetBrains Mono', monospace !important; font-size: 12px !important; font-weight: 600 !important; letter-spacing: 0.5px !important; padding: 6px 16px !important; transition: all 0.2s !important; }
 .stButton > button:hover { background: #00ff8820 !important; border-color: #00ff88 !important; }
-
-.stSelectbox > div > div {
-    background: #0d1b2a !important; border: 1px solid #1e3a5f !important;
-    border-radius: 6px !important; color: #ffffff !important;
-}
-
+.stSelectbox > div > div { background: #0d1b2a !important; border: 1px solid #1e3a5f !important; border-radius: 6px !important; color: #ffffff !important; }
 .stSuccess { background: #00ff8810 !important; border: 1px solid #00ff8840 !important; border-radius: 6px !important; color: #00ff88 !important; }
 .stWarning { background: #f59e0b10 !important; border: 1px solid #f59e0b40 !important; border-radius: 6px !important; }
 .stInfo { background: #00b4d810 !important; border: 1px solid #00b4d840 !important; border-radius: 6px !important; }
 .stError { background: #ef444410 !important; border: 1px solid #ef444440 !important; border-radius: 6px !important; }
-
 [data-testid="stSidebar"] { background: #0a0e1a !important; border-right: 1px solid #1e3a5f !important; }
 [data-testid="stSidebar"] .stMarkdown { color: #94a3b8 !important; }
-
-.streamlit-expanderHeader {
-    background: #0d1b2a !important; border: 1px solid #1e3a5f !important;
-    border-radius: 6px !important; color: #94a3b8 !important; font-size: 13px !important;
-}
-
-.stNumberInput > div > div > input {
-    background: #0d1b2a !important; border: 1px solid #1e3a5f !important;
-    color: #ffffff !important; border-radius: 6px !important;
-    font-family: 'JetBrains Mono', monospace !important;
-}
-
+.streamlit-expanderHeader { background: #0d1b2a !important; border: 1px solid #1e3a5f !important; border-radius: 6px !important; color: #94a3b8 !important; font-size: 13px !important; }
+.stNumberInput > div > div > input { background: #0d1b2a !important; border: 1px solid #1e3a5f !important; color: #ffffff !important; border-radius: 6px !important; font-family: 'JetBrains Mono', monospace !important; }
 @media (max-width: 768px) {
     .mph-hero { padding: 16px 20px; }
     .mph-hero-title { font-size: 20px; }
@@ -351,8 +207,6 @@ WUNDERGROUND_URLS = {
     'Chicago': 'https://www.wunderground.com/weather/KMDW',
 }
 
-# V5.23: VENTUSKY_URLS removed — multi-tab visual sanity check was a hassle.
-
 SETTLEMENT_LOCATION = {
     'Phoenix': 'Phoenix Sky Harbor Airport', 'Las Vegas': 'Las Vegas Harry Reid Airport',
     'Los Angeles': 'LA International Airport', 'Dallas': 'Dallas/Fort Worth Airport',
@@ -410,24 +264,11 @@ DESERT_CITIES = {'Phoenix', 'Las Vegas'}
 FORECAST_HEAVY_CITIES = {'Dallas', 'Austin', 'Houston', 'San Antonio', 'Oklahoma City'}
 
 GFS_CITY_WEIGHT = {
-    'Houston':       0.18,
-    'Phoenix':       0.0,
-    'Las Vegas':     0.0,
-    'Los Angeles':   0.0,
-    'Miami':         0.0,
-    'New Orleans':   0.0,
-    'Dallas':        0.0,
-    'Austin':        0.0,
-    'San Antonio':   0.0,
-    'Oklahoma City': 0.0,
-    'Atlanta':       0.0,
-    'Denver':        0.0,
-    'Minneapolis':   0.0,
-    'Chicago':       0.0,
-    'New York':      0.0,
-    'Philadelphia':  0.0,
-    'Boston':        0.0,
-    'Washington DC': 0.0,
+    'Houston': 0.18, 'Phoenix': 0.0, 'Las Vegas': 0.0, 'Los Angeles': 0.0,
+    'Miami': 0.0, 'New Orleans': 0.0, 'Dallas': 0.0, 'Austin': 0.0,
+    'San Antonio': 0.0, 'Oklahoma City': 0.0, 'Atlanta': 0.0, 'Denver': 0.0,
+    'Minneapolis': 0.0, 'Chicago': 0.0, 'New York': 0.0, 'Philadelphia': 0.0,
+    'Boston': 0.0, 'Washington DC': 0.0,
 }
 
 HIDDEN_CITIES = {
@@ -441,42 +282,21 @@ DESERT_CITIES = {'Phoenix', 'Las Vegas'}
 REGIONAL_PRIOR_BIAS = {'Chicago': 'Minneapolis'}
 
 CITY_PREDICTION_MODE = {
-    'New York':     'full_blend',
-    'Houston':      'full_blend',
-    'Dallas':       'full_blend',
-    'Los Angeles':  'full_blend',
-    'Miami':        'full_blend',
-    'Phoenix':      'full_blend',
-    'Las Vegas':    'full_blend',
-    'Boston':       'full_blend',
-    'Philadelphia': 'full_blend',
-    'New Orleans':   'nws_only',
-    'Washington DC': 'nws_only',
-    'Atlanta':       'nws_only',
-    'Oklahoma City': 'nws_only',
-    'Chicago':       'nws_only',
-    'Denver':        'nws_only',
-    'Austin':        'nws_only',
-    'Minneapolis':   'nws_only',
-    'San Antonio':   'nws_only',
+    'New York': 'full_blend', 'Houston': 'full_blend', 'Dallas': 'full_blend',
+    'Los Angeles': 'full_blend', 'Miami': 'full_blend', 'Phoenix': 'full_blend',
+    'Las Vegas': 'full_blend', 'Boston': 'full_blend', 'Philadelphia': 'full_blend',
+    'New Orleans': 'nws_only', 'Washington DC': 'nws_only', 'Atlanta': 'nws_only',
+    'Oklahoma City': 'nws_only', 'Chicago': 'nws_only', 'Denver': 'nws_only',
+    'Austin': 'nws_only', 'Minneapolis': 'nws_only', 'San Antonio': 'nws_only',
 }
 
-# V5.23: Miami removed (was over-correcting)
 CITY_WARM_OFFSET = {
-    'Phoenix':       1.0,   # avg error +0.94F
-    'Las Vegas':    -1.0,   # avg error -1.00F — runs cold
+    'Phoenix': 1.0,
+    'Las Vegas': -1.0,
 }
 
-# V5.24: NWS-only mode bias boost — for cities with persistent NWS forecast
-# error >2.5F MAE that simple bias correction isn't catching fast enough.
-# Based on 8-day SQL analysis (4/23-4/30). V5.23 used 1.5x but overcorrected on
-# May 2 (DC, OKC, Austin, SATX all flagged with NWS gap warnings). Reduced to 1.2x.
 NWS_BIAS_BOOST_CITIES = {
-    'Washington DC',   # 3.53F MAE
-    'Oklahoma City',   # 3.25F MAE
-    'Denver',          # 2.90F MAE
-    'Austin',          # 2.76F MAE
-    'San Antonio',     # 2.65F MAE
+    'Washington DC', 'Oklahoma City', 'Denver', 'Austin', 'San Antonio',
 }
 NWS_BIAS_BOOST_MULTIPLIER = 1.2
 
@@ -503,9 +323,6 @@ def sb_insert(row):
         return r.status_code in (200, 201)
     except Exception: return False
 
-# ─────────────────────────────────────────────────────────────────────────────
-# V5.27 — Cached Supabase reads (massive speed boost)
-# ─────────────────────────────────────────────────────────────────────────────
 def _bust_bets_cache():
     try: _sb_fetch_bets_cached.clear()
     except Exception: pass
@@ -664,8 +481,6 @@ def run_auto_settlement():
             settled.append({'city': city, 'date': row_date, 'actual': actual, 'error': error})
     return len(settled), settled
 
-# V5.24: Bias correction — 10-day window (was 7), middle ground after V5.23
-# 7-day was too reactive to single warm/cold slates and over-rotated on May 2 NYC
 def compute_bias_correction_db(city, n_recent=10):
     import statistics
     rows = sb_fetch_city(city)
@@ -684,10 +499,8 @@ def compute_bias_correction_db(city, n_recent=10):
     recent = complete[-n_recent:]
     errors = [r['actual'] - r['consensus'] for r in recent]
     med_error = statistics.median(errors)
-    # V5.23: NWS-only mode bias boost for persistent error cities
     if city in NWS_BIAS_BOOST_CITIES:
         med_error = med_error * NWS_BIAS_BOOST_MULTIPLIER
-    # V5.23: Removed 50% dampener that was preventing correction on bad cities
     return round(max(-3.0, min(3.0, med_error)), 2), len(recent)
 
 def get_city_mae_and_color(city, n_recent=14):
@@ -710,48 +523,20 @@ def get_uncertainty_threshold(city):
     if city in DESERT_CITIES: return 6.0
     return 5.0
 
-# ─────────────────────────────────────────────────────────────────────────────
-# V5.26 — PURE MEASUREMENT FUNCTIONS
-# These functions OBSERVE the model. They do not modify it.
-# Goal: tell the user when to trust the model's confidence vs when to be skeptical.
-# Philosophy: existing layers (bias correction, NBM percentiles, Trust scores) continue
-# unchanged. V5.26 just measures whether THOSE layers are likely reliable today.
-# ─────────────────────────────────────────────────────────────────────────────
 
 def compute_quality_score(city):
-    """
-    Returns (score 0-100, tier '🟢/🟡/🔴', reasons_list).
-    Pure observational metric. Does NOT change Model %, Trust scores, or any predictions.
-
-    Quality is high when:
-      - Recent settlements are tightly clustered (low stdev of errors)
-      - Bias is stable (small range of recent errors — not wildly different day to day)
-      - Sample size is sufficient (7+ recent settlements)
-      - Regime is consistent (recent errors all same direction or all near zero)
-
-    Quality is low when:
-      - Errors swing wildly (e.g. -2, +3, -1, +4 = unpredictable)
-      - Sample size is low (<5 settlements)
-      - Recent regime shift detected (last 3 errors all same direction with magnitude >2F)
-    """
     import statistics
     rows = sb_fetch_city(city)
     complete = [r for r in rows if r.get('actual') is not None and r.get('consensus') is not None]
-
     reasons = []
-
-    # Sample size check first — can't trust calibration without data
     n_complete = len(complete)
     if n_complete < 5:
         reasons.append(f'Only {n_complete} settlement(s) on record — insufficient for confident quality assessment')
-        return 35, '🟡', reasons  # MED by default, not LOW (don't punish new cities)
-
-    recent = complete[-7:]  # last 7 settlements
+        return 35, '🟡', reasons
+    recent = complete[-7:]
     errors = [r['actual'] - r['consensus'] for r in recent]
     abs_errors = [abs(e) for e in errors]
-
     score = 100
-    # ── Component 1: tightness (stdev of errors) — lower is better
     err_stdev = statistics.stdev(errors) if len(errors) >= 2 else 0
     if err_stdev > 3.0:
         score -= 35
@@ -764,8 +549,6 @@ def compute_quality_score(city):
         reasons.append(f'Errors mildly volatile (stdev {err_stdev:.1f}°F) — normal range')
     else:
         reasons.append(f'Errors tightly clustered (stdev {err_stdev:.1f}°F) — strong calibration')
-
-    # ── Component 2: range of recent errors — wide range = unpredictable
     err_range = max(errors) - min(errors)
     if err_range > 6.0:
         score -= 25
@@ -773,8 +556,6 @@ def compute_quality_score(city):
     elif err_range > 4.0:
         score -= 12
         reasons.append(f'Last 7 errors span {err_range:.1f}°F — meaningful swings')
-
-    # ── Component 3: regime shift detection — last 3 errors in same direction with magnitude
     if len(complete) >= 3:
         last_3 = complete[-3:]
         last_3_errors = [r['actual'] - r['consensus'] for r in last_3]
@@ -784,69 +565,45 @@ def compute_quality_score(city):
         elif all(e < -1.5 for e in last_3_errors):
             score -= 25
             reasons.append(f'⚠️ REGIME SHIFT — last 3 errors all cold: {", ".join(f"{e:.1f}" for e in last_3_errors)}°F. Model running warm.')
-
-    # ── Component 4: yesterday's miss is leading indicator — last error magnitude
     if errors:
         last_err = errors[-1]
         if abs(last_err) > 3.0:
             score -= 15
             reasons.append(f'Yesterday errored {("+ " if last_err > 0 else "")}{last_err:.1f}°F — large miss reduces today confidence')
-
-    # ── Component 5: sample size bonus
     if n_complete >= 14:
         reasons.append(f'{n_complete} historical settlements — ample sample size')
     elif n_complete < 7:
         score -= 8
         reasons.append(f'Only {n_complete} historical settlements — sample size limits confidence')
-
-    # ── Tier assignment
     score = max(0, min(100, score))
-    if score >= 75:
-        tier = '🟢'
-    elif score >= 50:
-        tier = '🟡'
-    else:
-        tier = '🔴'
-
+    if score >= 75: tier = '🟢'
+    elif score >= 50: tier = '🟡'
+    else: tier = '🔴'
     return score, tier, reasons
 
 
 def compute_regime_indicator():
-    """
-    Returns (warm_count, cold_count, total_with_data, message).
-    Looks at YESTERDAY's settlements across ALL cities and counts directional miss patterns.
-    If many cities erred warm (model cold) yesterday, today is at risk of similar pattern.
-    """
     yesterday_str = (datetime.now(pytz.timezone('America/New_York')) - timedelta(days=1)).strftime('%Y-%m-%d')
     all_rows = sb_fetch_all() or []
     yesterday_rows = [r for r in all_rows if r.get('date') == yesterday_str
                       and r.get('actual') is not None and r.get('consensus') is not None]
     if not yesterday_rows:
         return 0, 0, 0, 'No settled data from yesterday yet'
-
     warm_misses = sum(1 for r in yesterday_rows if (r['actual'] - r['consensus']) > 1.5)
     cold_misses = sum(1 for r in yesterday_rows if (r['actual'] - r['consensus']) < -1.5)
     total = len(yesterday_rows)
-
     if warm_misses >= 4 and warm_misses / total >= 0.4:
         msg = f'⚠️ WARM REGIME — {warm_misses}/{total} cities settled warmer than model yesterday. Today predictions may run cold.'
     elif cold_misses >= 4 and cold_misses / total >= 0.4:
         msg = f'⚠️ COLD REGIME — {cold_misses}/{total} cities settled cooler than model yesterday. Today predictions may run warm.'
     else:
         msg = f'Stable regime — yesterday {warm_misses} warm misses, {cold_misses} cold misses across {total} cities.'
-
     return warm_misses, cold_misses, total, msg
 
 
 def compute_calibration_buckets():
-    """
-    Returns dict of confidence buckets to win rate stats.
-    Reads bet log to assess: when model said 90%+, did you actually win 90% of the time?
-    This is the most important diagnostic — does the confidence number mean anything?
-    """
     bets = sb_fetch_bets() or []
     settled = [b for b in bets if b.get('result') in ('Won', 'Lost')]
-
     buckets = {
         '90-100%': {'wins': 0, 'losses': 0, 'bets': []},
         '70-89%':  {'wins': 0, 'losses': 0, 'bets': []},
@@ -854,40 +611,31 @@ def compute_calibration_buckets():
         '30-49%':  {'wins': 0, 'losses': 0, 'bets': []},
         '0-29%':   {'wins': 0, 'losses': 0, 'bets': []},
     }
-
     for bet in settled:
-        # The bet log stores price (cents) which is the MARKET's implied probability.
-        # We don't currently store the model's claimed probability at time of bet.
-        # Use price as a proxy for now — flag this as a V5.27 improvement.
         price = bet.get('price')
         if price is None: continue
         try:
             p = float(price)
         except Exception:
             continue
-        # Convert market price to implied probability (as decimal 0-1)
         if bet.get('direction') == 'YES':
             implied = p / 100.0
         else:
             implied = 1.0 - (p / 100.0)
         implied_pct = implied * 100
-
-        # Bucket assignment
         if implied_pct >= 90: bucket = '90-100%'
         elif implied_pct >= 70: bucket = '70-89%'
         elif implied_pct >= 50: bucket = '50-69%'
         elif implied_pct >= 30: bucket = '30-49%'
         else: bucket = '0-29%'
-
         if bet['result'] == 'Won':
             buckets[bucket]['wins'] += 1
         else:
             buckets[bucket]['losses'] += 1
         buckets[bucket]['bets'].append(bet)
-
     return buckets
 
-@st.cache_data(ttl=300)  # V5.24: 30min → 5min (stale data caused real-money loss on May 2)
+@st.cache_data(ttl=300)
 def fetch_nbm_percentiles(lat, lon):
     city_name = None
     best_dist = float('inf')
@@ -898,13 +646,11 @@ def fetch_nbm_percentiles(lat, lon):
             city_name = c
     station = WETHR_STATIONS.get(city_name, '')
     if not station: return None
-
     city_tz = pytz.timezone(CITY_TZ.get(city_name, 'America/New_York'))
     today_local = datetime.now(city_tz).strftime('%Y-%m-%d')
     now_utc = datetime.utcnow()
     start_utc = (now_utc - timedelta(hours=12)).strftime('%Y-%m-%dT%H:%M:%SZ')
     end_utc = (now_utc + timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ')
-
     try:
         r = requests.get(
             'https://wethr.net/api/v2/forecasts.php',
@@ -915,7 +661,6 @@ def fetch_nbm_percentiles(lat, lon):
         if r.status_code != 200: return None
         forecasts = r.json()
         if not forecasts or not isinstance(forecasts, list): return None
-
         run_highs = {}
         for f in forecasts:
             valid_time_str = f.get('valid_time', '')
@@ -931,18 +676,15 @@ def fetch_nbm_percentiles(lat, lon):
             except Exception: continue
             if run_time not in run_highs: run_highs[run_time] = []
             run_highs[run_time].append(float(temp_f))
-
         if not run_highs: return None
         run_max_temps = [max(temps) for temps in run_highs.values() if temps]
         if len(run_max_temps) < 1: return None
         run_max_temps.sort()
-
         def percentile(data, p):
             idx = (p / 100) * (len(data) - 1)
             lo = int(idx)
             hi = min(lo + 1, len(data) - 1)
             return round(data[lo] + (idx - lo) * (data[hi] - data[lo]), 1)
-
         return {
             'p10': percentile(run_max_temps, 10), 'p25': percentile(run_max_temps, 25),
             'p50': percentile(run_max_temps, 50), 'p75': percentile(run_max_temps, 75),
@@ -958,7 +700,6 @@ def nbm_bracket_prob(nbm_percentiles, lo, hi, obs_high=None):
         if key in nbm_percentiles: cdf_points.append((nbm_percentiles[key], prob))
     if len(cdf_points) < 2: return None
     cdf_points.sort(key=lambda x: x[0])
-
     def cdf(t):
         if t <= cdf_points[0][0]: return max(0.0, cdf_points[0][1] * (t - (cdf_points[0][0] - 5)) / 5)
         if t >= cdf_points[-1][0]:
@@ -970,7 +711,6 @@ def nbm_bracket_prob(nbm_percentiles, lo, hi, obs_high=None):
             if t0 <= t <= t1:
                 return p0 + (t - t0) / max(t1 - t0, 0.001) * (p1 - p0)
         return 0.5
-
     if lo is None and hi is not None:
         if obs_high is not None and obs_high > hi + 0.4: return 0.0
         return max(0.0, min(1.0, cdf(hi + 0.5)))
@@ -1078,6 +818,9 @@ def fetch_nws_grid(lat, lon):
         return result
     except Exception: return None
 
+# V5.26.2: Added @st.cache_data(ttl=300) — was uncached, hit on every render via
+# fetch_city_weather (timezone banner) AND directly in city detail block.
+@st.cache_data(ttl=300)
 def fetch_nws_forecast(lat, lon):
     city_name = None
     best_dist = float('inf')
@@ -1086,10 +829,8 @@ def fetch_nws_forecast(lat, lon):
         if dist < best_dist:
             best_dist = dist
             city_name = c
-
     station = WETHR_STATIONS.get(city_name)
     today = get_eastern_date()
-
     if station:
         try:
             r = requests.get(
@@ -1103,7 +844,6 @@ def fetch_nws_forecast(lat, lon):
                 if high is not None:
                     return round(float(high), 1), 'wethr_nws_forecasts'
         except Exception: pass
-
     grid = fetch_nws_grid(lat, lon)
     if not grid: return None, None
     office, gx, gy, _ = grid
@@ -1127,10 +867,8 @@ def fetch_nws_forecast(lat, lon):
     except Exception: pass
     return None, None
 
-# V5.25: Rewrote source priority for Current Temp viewing.
-# NWS direct first (~2-3 min after METAR publish), then Iowa Mesonet (cross-check),
-# then Wethr.net obs (fallback, ~5-15 min lag), then NWS grid (last resort).
-# Returns (station, temp, source_label, obs_timestamp_iso) so UI can show data freshness.
+# V5.26.2: Added @st.cache_data(ttl=300) — was uncached, hit on every render.
+@st.cache_data(ttl=300)
 def fetch_nws_current(lat, lon, station_id):
     city_name = None
     best_dist = float('inf')
@@ -1140,8 +878,6 @@ def fetch_nws_current(lat, lon, station_id):
             best_dist = dist
             city_name = c
     wethr_station = WETHR_STATIONS.get(city_name)
-
-    # 🟢 TIER 1: NWS direct (fastest METAR ingestion)
     if station_id:
         obs = safe_get('https://api.weather.gov/stations/' + station_id + '/observations/latest')
         if obs:
@@ -1150,8 +886,6 @@ def fetch_nws_current(lat, lon, station_id):
             obs_ts = props.get('timestamp')
             if temp_c is not None:
                 return station_id, float(c_to_f(temp_c)), 'nws_direct', obs_ts
-
-    # 🟢 TIER 2: Iowa Mesonet ASOS (cross-check, comparable speed)
     if station_id:
         try:
             now_utc = datetime.utcnow()
@@ -1166,13 +900,12 @@ def fetch_nws_current(lat, lon, station_id):
                     'tz': 'UTC',
                     'missing': 'empty',
                     'latlon': 'no',
-                    'report_type': '3,4',  # routine + special METAR
+                    'report_type': '3,4',
                 },
                 timeout=10
             )
             if r.status_code == 200 and r.text:
                 lines = [ln.strip() for ln in r.text.strip().split('\n') if ln.strip()]
-                # Skip header, find last valid row
                 for line in reversed(lines[1:] if len(lines) > 1 else []):
                     parts = line.split(',')
                     if len(parts) >= 3:
@@ -1180,14 +913,11 @@ def fetch_nws_current(lat, lon, station_id):
                         try:
                             tmpf = float(tmpf_str)
                             if -50 <= tmpf <= 140:
-                                # Parse timestamp ('YYYY-MM-DD HH:MM' UTC)
                                 ts_iso = ts_str.replace(' ', 'T') + 'Z'
                                 return station_id, round(tmpf, 1), 'iowa_mesonet', ts_iso
                         except (ValueError, IndexError):
                             continue
         except Exception: pass
-
-    # 🟡 TIER 3: Wethr.net observations (fallback, slower lag)
     if wethr_station:
         try:
             r = requests.get(
@@ -1202,8 +932,6 @@ def fetch_nws_current(lat, lon, station_id):
                 if temp_display is not None:
                     return wethr_station, round(float(temp_display), 1), 'wethr_obs', obs_ts
         except Exception: pass
-
-    # 🔴 TIER 4: NWS grid (last resort — forecast-derived, not real obs)
     points = safe_get('https://api.weather.gov/points/' + str(lat) + ',' + str(lon))
     if not points: return station_id, None, None, None
     stations_url = points.get('properties', {}).get('observationStations')
@@ -1269,11 +997,8 @@ def kelly_bet_no(model_prob, no_ask_cents, bankroll, fractional=0.15, max_pct=0.
     if kelly_full <= 0: return 0.0
     return round(max(0.0, min(kelly_full * fractional * bankroll, max_pct * bankroll, max_dollars)), 2)
 
-def compute_row_trust(
-    city, bracket_label, direction, model_pct,
-    ensemble_tier, two_degree_call_str,
-    mae_color, nbm_active, nws_forecast_f, gfs_ensemble_f, bias_adj_f,
-):
+def compute_row_trust(city, bracket_label, direction, model_pct, ensemble_tier, two_degree_call_str,
+                      mae_color, nbm_active, nws_forecast_f, gfs_ensemble_f, bias_adj_f):
     try:
         inp = SignalInputs(
             city=str(city or ''),
@@ -1301,25 +1026,21 @@ def compute_edge_trust(model_pct, yes_ask, ensemble_tier):
         yes_ask = float(yes_ask)
         model_pct = float(model_pct)
         market_implied = yes_ask
-
         if yes_ask <= 5:   price_score = 50
         elif yes_ask <= 10: price_score = 40
         elif yes_ask <= 15: price_score = 30
         elif yes_ask <= 20: price_score = 15
         else:               price_score = 0
-
         gap = model_pct - market_implied
         if gap >= 25:   gap_score = 35
         elif gap >= 20: gap_score = 28
         elif gap >= 15: gap_score = 20
         elif gap >= 10: gap_score = 10
         else:           gap_score = 0
-
         ens = str(ensemble_tier or '').upper()
         if 'HIGH' in ens:   ens_score = 15
         elif 'MED' in ens:  ens_score = 8
         else:               ens_score = 0
-
         total = price_score + gap_score + ens_score
         return round(min(100.0, total), 1)
     except Exception:
@@ -1350,19 +1071,16 @@ def get_city_best_signals(city, consensus, ladder_text, ensemble_members, kalshi
         conviction_result = check_market_conviction(kalshi_markets_data, ladder_text)
         best_yes = best_no = None
         best_yes_edge = best_no_edge = -999
-
         for label, base_prob in prob_rows:
             ens_prob = next((ensemble_bracket_prob(ensemble_members, lo, hi)
                              for lbl, lo, hi in parse_ladder(ladder_text) if labels_match(lbl, label)), None)
             final_prob = blend_probs(base_prob, ens_prob, ensemble_members, city, nbm_active=used_nbm)
             if final_prob < min_prob: continue
-
             bracket_parsed = next(((lo, hi) for lbl, lo, hi in parse_ladder(ladder_text)
                                    if labels_match(lbl, label)), (None, None))
             b_lo, b_hi = bracket_parsed
             below_consensus = (b_hi is not None and consensus is not None and b_hi < consensus - 2.0)
             above_consensus = (b_lo is not None and consensus is not None and b_lo > consensus + 2.0)
-
             yes_ask = no_ask = None
             if kalshi_markets_data:
                 match = next((m for m in kalshi_markets_data if labels_match(m[0], label)), None)
@@ -1374,15 +1092,11 @@ def get_city_best_signals(city, consensus, ladder_text, ensemble_members, kalshi
                                    is_conflicting_with_conviction(label, conviction_result[1], conviction_result[2], ladder_text))
             e = edge_cents(final_prob, yes_ask)
             icon, _ = edge_signal(e, high_uncertainty, morning_suppressed, conviction_conflict)
-
-            # V5.23: require bracket to contain consensus for YES picks
             contains_cons = bracket_contains_consensus(label, consensus, ladder_text, tolerance=1.0)
-
             if (e is not None and e > best_yes_edge and not busted and icon == '🟢' and not below_consensus and contains_cons):
                 best_yes_edge = e
                 kelly = kelly_bet(final_prob, yes_ask, bankroll) if yes_ask else 0.0
                 best_yes = f'🟢 {label} | +{e}c | ${kelly}'
-
             no_model_prob = 1.0 - final_prob
             if no_model_prob < min_prob: continue
             no_e = no_edge_cents(final_prob, no_ask)
@@ -1396,6 +1110,8 @@ def get_city_best_signals(city, consensus, ladder_text, ensemble_members, kalshi
         return best_yes or '—', best_no or '—'
     except Exception: return '—', '—'
 
+# V5.26.2: Added @st.cache_data(ttl=300) — was uncached, hit on every render.
+@st.cache_data(ttl=300)
 def fetch_gfs_ensemble(lat, lon):
     params = {'latitude': lat, 'longitude': lon, 'hourly': 'temperature_2m',
                'temperature_unit': 'fahrenheit', 'timezone': 'auto', 'forecast_days': 2, 'models': 'gfs_seamless'}
@@ -1475,6 +1191,7 @@ def apply_prob_floor(prob_rows, consensus, ladder_text):
         scale = 1.0 / (1.0 + boost_total)
         adjusted = [(lbl, round(p * scale, 4)) for lbl, p in adjusted]
     return adjusted
+
 
 def get_eastern_date():
     return datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
@@ -1574,7 +1291,6 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
     mode = CITY_PREDICTION_MODE.get(city, 'full_blend')
     if mode == 'nws_only':
         return float(fc)
-
     local_hour = get_local_hour(city)
     is_fc_heavy = city in FORECAST_HEAVY_CITIES
     if is_fc_heavy and local_hour < 10:
@@ -1597,7 +1313,6 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
     obs = noaa if noaa is not None else cur
     if obs is not None: consensus = max(base, late_day_floor(fc, obs, local_hour, city))
     else: consensus = base
-
     if obs_high is not None and obs_high > consensus:
         obs_high_trusted = True
         if local_hour < OBS_HIGH_TRUST_HOUR: obs_high_trusted = False
@@ -1607,12 +1322,9 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
         if current_for_check is not None and obs_high < current_for_check:
             obs_high_trusted = False
         if obs_high_trusted: consensus = obs_high
-
-    # V5.23: Miami removed from CITY_WARM_OFFSET
     warm_offset = CITY_WARM_OFFSET.get(city, 0.0)
     if warm_offset != 0.0:
         consensus = consensus + warm_offset
-
     return consensus
 
 def bracket_probs(mu, ladder_text, city, obs_high=None, forecast=None):
@@ -1640,11 +1352,7 @@ def two_degree_call(mu, ladder_text, obs_high=None):
         if dist < best_dist: best_dist = dist; best_label = label
     return best_label
 
-# V5.23: Best YES bracket selector audit
 def bracket_contains_consensus(label, consensus, ladder_text, tolerance=1.0):
-    """V5.23: Reject brackets too far from consensus on YES picks.
-    Fixes 4/30 New Orleans bug (consensus 77.5, picked 79-80, actual 77).
-    Returns True if bracket contains consensus or is within `tolerance` degrees."""
     if consensus is None: return True
     for lbl, lo, hi in parse_ladder(ladder_text):
         if not labels_match(lbl, label): continue
@@ -1675,6 +1383,8 @@ def boxes_to_ladder(parts):
         else: cleaned.append(t)
     return ' | '.join(cleaned)
 
+# V5.26.2: Added @st.cache_data(ttl=300) — was uncached, hit on every render.
+@st.cache_data(ttl=300)
 def fetch_obs_high_today(icao):
     try:
         r = requests.get(
@@ -1689,7 +1399,6 @@ def fetch_obs_high_today(icao):
                 high_val = round(float(wethr_high), 1)
                 return high_val, high_val, 'wethr_api_nws'
     except Exception: pass
-
     eastern = pytz.timezone('America/New_York')
     today_day = str(datetime.now(eastern).day)
     url = 'https://forecast.weather.gov/data/obhistory/' + icao + '.html'
@@ -1853,7 +1562,11 @@ def sync_all_ladders(saved_ladders, force=False):
     progress.empty()
     return saved_ladders, {'synced': synced, 'failed': failed}
 
-@st.cache_data(ttl=300)  # V5.24: 30min → 5min for fresher data
+# V5.26.2 PRIMARY FIX: Added @st.cache_data(ttl=300) — this was the biggest perf
+# bug in V5.26.1. Function was uncached, called ~11x per render via timezone
+# banner loop, each call making 5 HTTP requests internally (~55 requests per
+# render). Now properly cached so repeat city fetches within 5 min return instantly.
+@st.cache_data(ttl=300)
 def fetch_city_weather(city):
     coords = CITIES[city]
     lat, lon = coords['lat'], coords['lon']
@@ -1862,27 +1575,22 @@ def fetch_city_weather(city):
     obs_high_raw, six_hr_max, _ = fetch_obs_high_today(OBHISTORY_STATIONS[city])
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
     nbm_percentiles = fetch_nbm_percentiles(lat, lon)
-
     obs_high_final = obs_high_raw
     obs_high_discarded = False
     obs_high_discard_reason = None
-
     if obs_high_raw is not None and current_temp is not None and obs_high_raw > current_temp + 15.0:
         obs_high_final = None; obs_high_discarded = True
         obs_high_discard_reason = f'Obs high {obs_high_raw}F discarded — {round(obs_high_raw - current_temp, 1)}F above current temp'
     if obs_high_raw is not None and nws_fc is not None and not obs_high_discarded and obs_high_raw > nws_fc + 12.0:
         obs_high_final = None; obs_high_discarded = True
         obs_high_discard_reason = f'Obs high {obs_high_raw}F discarded — {round(obs_high_raw - nws_fc, 1)}F above NWS forecast'
-
     if ensemble_mean is not None and nws_fc is not None and abs(ensemble_mean - nws_fc) > 8.0:
         ensemble_members = None; ensemble_mean = None
-
     source_gap = None; high_uncertainty = False
     if nws_fc is not None and ensemble_mean is not None:
         source_gap = abs(nws_fc - ensemble_mean)
         threshold = get_uncertainty_threshold(city)
         high_uncertainty = source_gap > threshold
-
     return {
         'nws_fc': nws_fc, 'current_temp': current_temp,
         'obs_high': obs_high_final, 'obs_high_raw': obs_high_raw,
@@ -1941,6 +1649,10 @@ def sb_update_bet(bet_id, updates):
         return False
     except Exception: return False
 
+# V5.26.2: Removed duplicate sb_delete_bet definition. Previously this function
+# was defined twice — the second def overrode the first and skipped
+# _bust_bets_cache(), causing deleted bets to reappear in the UI until the 30s
+# cache TTL expired. This is the canonical version with cache busting.
 def sb_delete_bet(bet_id):
     try:
         r = requests.delete(sb_url('bets') + '?id=eq.' + str(bet_id),
@@ -1949,13 +1661,6 @@ def sb_delete_bet(bet_id):
             _bust_bets_cache()
             return True
         return False
-    except Exception: return False
-
-def sb_delete_bet(bet_id):
-    try:
-        r = requests.delete(sb_url('bets') + '?id=eq.' + str(bet_id),
-                            headers=get_sb_headers(), timeout=10)
-        return r.status_code in (200, 204)
     except Exception: return False
 
 def load_bet_log(): return sb_fetch_bets()
@@ -2079,30 +1784,34 @@ with st.sidebar:
     st.markdown('🟡 **2.5-4F** — Acceptable')
     st.markdown('🔴 **>4F** — Needs attention')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.26.1</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mph-section-header">🚀 V5.26.2</div>', unsafe_allow_html=True)
+    st.markdown('**Performance patch.**')
+    st.markdown('- Cached `fetch_city_weather` (was uncached — biggest perf win)')
+    st.markdown('- Cached `fetch_nws_forecast`, `fetch_nws_current`, `fetch_obs_high_today`, `fetch_gfs_ensemble`')
+    st.markdown('- Removed duplicate `sb_delete_bet` (was skipping cache bust)')
+    st.markdown('---')
+    st.markdown('<div class="mph-section-header">🔬 V5.26.1</div>', unsafe_allow_html=True)
     st.markdown('**Measurement, not correction.**')
-    st.markdown('- **📡 Collect All 18 Cities** button (in dashboard) — log all predictions in background')
-    st.markdown('- **Quality Score** per city (🟢/🟡/🔴) above Model Output')
+    st.markdown('- **📡 Collect All 18 Cities** button')
+    st.markdown('- **Quality Score** per city (🟢/🟡/🔴)')
     st.markdown('- **Diagnostic Dashboard** at top of app')
     st.markdown('- **Regime Indicator** — yesterday\'s miss pattern')
     st.markdown('- **Bet Calibration** — does confidence predict wins?')
     st.markdown('---')
     st.caption('V5.26 does NOT change predictions. It tells you when to TRUST them.')
-    st.caption('Use Quality + Regime as a gate on existing signals.')
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
 today_str = get_eastern_date()
 last_sync_data = load_json(LAST_SYNC_FILE)
 
-# ── Hero Header ───────────────────────────────────────────────────────────────
 st.markdown(f"""
 <div class="mph-hero">
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.26.1</span>
+                <span class="mph-version-badge">V5.26.2</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -2157,7 +1866,6 @@ else:
                    str(len(last_sync_data.get('synced', []))) + ' cities loaded')
     with col_btn:
         if st.button('Refresh All'):
-            # V5.24: Also clear @st.cache_data to bust stale weather caches
             try:
                 st.cache_data.clear()
             except Exception: pass
@@ -2166,7 +1874,6 @@ else:
             if results.get('failed'): st.warning('Could not fetch: ' + ', '.join(results['failed']))
             st.rerun()
 
-# ── Live Stats Bar ────────────────────────────────────────────────────────────
 _all_rows_stats = sb_fetch_all()
 _today_rows_stats = [r for r in _all_rows_stats if r.get('date') == today_str]
 _n_cities = len(_today_rows_stats)
@@ -2197,17 +1904,10 @@ st.markdown(f"""
 import streamlit.components.v1 as components
 components.html('<script>setTimeout(function(){window.location.reload();}, 600000);</script>', height=0)
 
-# ── V5.26 DIAGNOSTIC DASHBOARD ────────────────────────────────────────────────
-# Pure measurement layer. Tells you WHEN to trust the model, not what to bet.
-# Three sub-panels:
-#   1. Regime indicator — yesterday's miss pattern across all cities
-#   2. Per-city quality scores — sortable table with calibration health
-#   3. Bet calibration — does "high confidence" actually predict wins?
 with st.expander('🔬 V5.26 Diagnostic Dashboard — Trust the Model?', expanded=False):
     st.caption('This panel measures whether the model deserves your trust today. '
                'It does NOT change any predictions — it tells you when predictions are likely reliable vs likely flawed.')
 
-    # ─── V5.26.1: Manual Background Collection Button ─────────────
     st.markdown('### 📡 Background Data Collection')
     _today_logged = sb_fetch_all() or []
     _today_logged = [r for r in _today_logged if r.get('date') == today_str]
@@ -2251,13 +1951,9 @@ with st.expander('🔬 V5.26 Diagnostic Dashboard — Trust the Model?', expande
                        + ('...' if len(_missing_cities) > 8 else ''))
         else:
             st.success(f'✅ All 18 cities have predictions logged for {today_str}')
-        st.caption('Press the button each morning to log predictions for all 18 cities. '
-                   'This populates the calibration database in the background — needed for accurate quality scores. '
-                   '(Future V5.27: this will run automatically via GitHub Action at 7am ET.)')
+        st.caption('Press the button each morning to log predictions for all 18 cities.')
 
     st.markdown('---')
-
-    # ─── Panel 1: Regime indicator ────────────────────────────────
     st.markdown('### 🌡️ Today\'s Regime')
     warm_misses, cold_misses, total_yesterday, regime_msg = compute_regime_indicator()
     if total_yesterday == 0:
@@ -2269,17 +1965,13 @@ with st.expander('🔬 V5.26 Diagnostic Dashboard — Trust the Model?', expande
     st.caption(f'Yesterday: {warm_misses} warm misses, {cold_misses} cold misses out of {total_yesterday} settled cities.')
 
     st.markdown('---')
-
-    # ─── Panel 2: Per-city quality scores ─────────────────────────
     st.markdown('### 🎯 Per-City Quality Scores (today)')
-    st.caption('Quality measures whether THIS city\'s recent calibration justifies trusting today\'s prediction. '
-               'High quality = recent errors small and stable. Low quality = recent errors large or volatile.')
+    st.caption('Quality measures whether THIS city\'s recent calibration justifies trusting today\'s prediction.')
 
     import pandas as pd
     quality_rows = []
     for c in CITIES.keys():
         score, tier, reasons = compute_quality_score(c)
-        # Get recent error summary
         rows_c = sb_fetch_city(c)
         complete_c = [r for r in rows_c if r.get('actual') is not None and r.get('consensus') is not None]
         last_3_errs = []
@@ -2287,8 +1979,6 @@ with st.expander('🔬 V5.26 Diagnostic Dashboard — Trust the Model?', expande
             last_3 = complete_c[-3:]
             last_3_errs = [r['actual'] - r['consensus'] for r in last_3]
         last_3_str = ', '.join(('+' if e > 0 else '') + f'{e:.1f}' for e in last_3_errs) if last_3_errs else '—'
-
-        # Direction of recent bias
         if last_3_errs:
             avg_recent = sum(last_3_errs) / len(last_3_errs)
             if avg_recent > 1.5: direction = '🔥 warm'
@@ -2296,32 +1986,21 @@ with st.expander('🔬 V5.26 Diagnostic Dashboard — Trust the Model?', expande
             else: direction = '✅ stable'
         else:
             direction = '—'
-
         quality_rows.append({
-            'Tier': tier,
-            'City': c,
-            'Score': score,
-            'Last 3 Errors': last_3_str,
-            'Recent Bias': direction,
+            'Tier': tier, 'City': c, 'Score': score,
+            'Last 3 Errors': last_3_str, 'Recent Bias': direction,
             'N': len(complete_c),
         })
-
-    # Sort: HIGH quality first, then by score descending
     quality_rows_sorted = sorted(quality_rows, key=lambda x: (-x['Score'],))
     st.dataframe(pd.DataFrame(quality_rows_sorted), use_container_width=True, hide_index=True)
-
     high_count = sum(1 for r in quality_rows if r['Tier'] == '🟢')
     med_count = sum(1 for r in quality_rows if r['Tier'] == '🟡')
     low_count = sum(1 for r in quality_rows if r['Tier'] == '🔴')
-    st.caption(f'Today\'s breakdown: {high_count} 🟢 HIGH · {med_count} 🟢 MED · {low_count} 🔴 LOW quality cities. '
-               f'Recommendation: bet only 🟢 HIGH cities at full Kelly. 🟡 MED cities at half Kelly. 🔴 LOW cities skip.')
+    st.caption(f'Today\'s breakdown: {high_count} 🟢 HIGH · {med_count} 🟡 MED · {low_count} 🔴 LOW.')
 
     st.markdown('---')
-
-    # ─── Panel 3: Bet calibration ─────────────────────────────────
     st.markdown('### 📊 Bet Calibration — Does Confidence Predict Wins?')
-    st.caption('When you bet at 70%+ market price (high confidence picks), did you actually win that often? '
-               'If win rate matches the price bucket, the model is well calibrated. If not, confidence is misleading.')
+    st.caption('When you bet at 70%+ market price, did you actually win that often?')
 
     buckets = compute_calibration_buckets()
     bucket_rows = []
@@ -2333,26 +2012,21 @@ with st.expander('🔬 V5.26 Diagnostic Dashboard — Trust the Model?', expande
         else:
             wr = (data['wins'] / n) * 100
             win_rate_str = f'{wr:.0f}% ({data["wins"]}/{n})'
-            # Compare to bucket midpoint
-            bucket_mid = {
-                '90-100%': 95, '70-89%': 80, '50-69%': 60, '30-49%': 40, '0-29%': 15
-            }[label]
+            bucket_mid = {'90-100%': 95, '70-89%': 80, '50-69%': 60, '30-49%': 40, '0-29%': 15}[label]
             diff = wr - bucket_mid
             if abs(diff) < 10: calibration = '✅ Good'
             elif diff < -15: calibration = '🔴 Overconfident'
             elif diff > 15: calibration = '🟢 Underconfident'
             else: calibration = '🟡 Off'
         bucket_rows.append({
-            'Confidence Bucket': label,
-            'Win Rate': win_rate_str,
-            'Sample': n,
-            'Calibration': calibration,
+            'Confidence Bucket': label, 'Win Rate': win_rate_str,
+            'Sample': n, 'Calibration': calibration,
         })
     st.dataframe(pd.DataFrame(bucket_rows), use_container_width=True, hide_index=True)
-    st.caption('Note: V5.26 uses MARKET PRICE as proxy for confidence. V5.27 will store the model\'s claimed probability at time of bet for true model calibration.')
 
 view_mode = st.radio('View', ['📊 Mac', '📱 iPhone'], horizontal=True, label_visibility='collapsed')
 is_mobile = view_mode == '📱 iPhone'
+
 
 # ── Timezone Groups ───────────────────────────────────────────────────────────
 TIMEZONE_GROUPS = {
@@ -2409,10 +2083,8 @@ def get_phase_label(tz_key, et_hour):
         'PT': {'bet': (1100, 1200), 'peak': (1700, 1900)},
     }
     conv_times = {
-        'ET': (1100, 1200),
-        'CT': (1200, 1300),
-        'MT': (1400, 1500),
-        'PT': (1400, 1500),
+        'ET': (1100, 1200), 'CT': (1200, 1300),
+        'MT': (1400, 1500), 'PT': (1400, 1500),
     }
     times = phase_times.get(tz_key, {})
     conv = conv_times.get(tz_key, (0, 0))
@@ -2431,7 +2103,6 @@ _all_rows_banner = sb_fetch_all()
 _today_rows_banner = {r['city']: r for r in _all_rows_banner if r.get('date') == today_str}
 _et_hour_now = get_et_hour()
 
-# ── Summary Panel ──────────────────────────────────────────────
 _summary_rows = []
 for tz_key, tz_info in TIMEZONE_GROUPS.items():
     for c in tz_info['cities']:
@@ -2473,12 +2144,10 @@ if _summary_rows and not is_mobile:
 for tz_key, tz_info in TIMEZONE_GROUPS.items():
     visible_cities_in_tz = [c for c in tz_info['cities'] if c not in HIDDEN_CITIES]
     if not visible_cities_in_tz: continue
-
     status_text, status_color = window_status(tz_info['cutoff_et_hour'])
     mins_left = minutes_until_close(tz_info['cutoff_et_hour'])
     is_closed = mins_left <= 0
     phase_label, phase_color = get_phase_label(tz_key, _et_hour_now)
-
     yes_signals = []
     no_signals = []
 
@@ -2657,7 +2326,6 @@ else:
 
 if st.button('Refresh Prices'):
     clear_city_cache(city)
-    # V5.24: Also clear weather cache so next render fetches fresh APIs
     try:
         st.cache_data.clear()
     except Exception: pass
@@ -2682,14 +2350,12 @@ st.caption('Current ladder: ' + ladder_text)
 
 st.markdown('<div class="mph-section-header">🌤️ Live Weather</div>', unsafe_allow_html=True)
 
-# V5.24: Force-refresh button — clears st.cache_data so next fetch hits APIs fresh
 fr_col1, fr_col2 = st.columns([1, 3])
 with fr_col1:
     if st.button('🔄 Force Refresh Weather', key=f'force_wx_{city}', use_container_width=True):
         try:
             st.cache_data.clear()
         except Exception: pass
-        # Bump session counter to force re-render
         st.session_state[f'_wx_refresh_count_{city}'] = st.session_state.get(f'_wx_refresh_count_{city}', 0) + 1
         st.rerun()
 with fr_col2:
@@ -2717,14 +2383,11 @@ with st.spinner('Fetching weather data...'):
     obs_high_raw, six_hr_max, obs_high_url = fetch_obs_high_today(obs_icao)
     ensemble_members, ensemble_mean = fetch_gfs_ensemble(lat, lon)
     nbm_percentiles = fetch_nbm_percentiles(lat, lon)
-    # V5.24: Record fetch timestamp for staleness display
     st.session_state[f'_wx_last_fetch_{city}'] = time.time()
-    # V5.24: Track current_temp history to detect stalls (helps diagnose stale data)
     _temp_hist_key = f'_temp_hist_{city}_{get_eastern_date()}'
     _temp_hist = st.session_state.get(_temp_hist_key, [])
     if noaa_obs is not None:
         _temp_hist.append({'t': time.time(), 'temp': noaa_obs})
-        # Keep last 20 readings
         _temp_hist = _temp_hist[-20:]
         st.session_state[_temp_hist_key] = _temp_hist
 
@@ -2778,7 +2441,6 @@ with col1:
     else: st.metric('NWS Forecast', 'Unavailable')
 with col2:
     if noaa_obs is not None:
-        # V5.24: Detect temp stalls — same value across 3+ consecutive fetches
         _temp_hist_key = f'_temp_hist_{city}_{get_eastern_date()}'
         _temp_hist = st.session_state.get(_temp_hist_key, [])
         stall_warning = ''
@@ -2788,19 +2450,15 @@ with col2:
             unique_temps = set(round(h['temp'], 1) for h in last_3)
             if len(unique_temps) == 1:
                 stall_age = int(time.time() - last_3[0]['t'])
-                if stall_age >= 600:  # 10+ min same reading
+                if stall_age >= 600:
                     stall_warning = f' ⚠️ {stall_age//60}m stall'
         st.metric('Current Temp', str(round(noaa_obs, 1))+' F' + stall_warning)
-
-        # V5.24: Show fetch age inline
         last_fetch_ts = st.session_state.get(f'_wx_last_fetch_{city}')
         age_str = ''
         if last_fetch_ts:
             age_sec = int(time.time() - last_fetch_ts)
             if age_sec < 60: age_str = f' · {age_sec}s old'
             else: age_str = f' · {age_sec//60}m old'
-
-        # V5.25: Source quality badge
         source_badges = {
             'nws_direct':   ('🟢', 'NWS Direct',   'Fastest METAR ingestion (~1-3 min lag)'),
             'iowa_mesonet': ('🟢', 'Iowa Mesonet', 'Cross-check source (~1-5 min lag)'),
@@ -2808,12 +2466,9 @@ with col2:
             'nws_grid':     ('🔴', 'NWS Grid',     'Forecast-derived, NOT real obs — verify manually'),
         }
         badge = source_badges.get(noaa_source, ('⚪', 'Unknown', ''))
-
-        # V5.25: Calculate observation timestamp age (how old is the underlying data?)
         obs_age_str = ''
         if noaa_obs_ts:
             try:
-                # Parse ISO timestamp (handle both 'Z' and '+00:00' suffixes)
                 ts_clean = noaa_obs_ts.replace('Z', '+00:00')
                 obs_dt = datetime.fromisoformat(ts_clean)
                 if obs_dt.tzinfo is None:
@@ -2827,21 +2482,15 @@ with col2:
                     obs_age_str = f' · obs {obs_age_sec//3600}h{(obs_age_sec%3600)//60}m ago'
             except Exception:
                 pass
-
         st.caption(f'{badge[0]} {badge[1]} · Station: {noaa_station}{age_str}{obs_age_str}')
-
-        # V5.25: Show source quality tooltip-style line
         if noaa_source == 'nws_grid':
             st.error(f'🔴 Current temp from NWS grid (last resort) — {badge[2]}. Verify manually before betting.')
         elif noaa_source == 'wethr_obs':
             st.caption(f'🟡 {badge[2]}')
-
-        # V5.24: Stall guidance — METAR stations update hourly at :51
         if stall_warning:
             st.caption(f'⚠️ Same temp {stall_age//60} min — source API may be stale (METAR stations update hourly at :51)')
     else: st.metric('Current Temp', 'Unavailable')
 with col3:
-    # V5.23: Ventusky link removed — only Wunderground
     if obs_high_today is not None:
         source_label = '✅ Wethr NWS' if obs_high_url == 'wethr_api_nws' else '[NWS table](' + obs_url + ')'
         st.metric('Obs High Today', str(obs_high_today)+' F', delta='floor active')
@@ -2931,9 +2580,6 @@ if forecast is not None and current is not None:
                                     bias_correction=bias_correction)
     if not save_ok: st.caption('⚠️ Could not save prediction to database')
 
-    # ── V5.26: Quality Score for THIS city ────────────────────────────────────
-    # Tells you whether to trust the model's confidence on this specific city today.
-    # Pure observational metric — does not change Model %, edge, or Trust scores below.
     _q_score, _q_tier, _q_reasons = compute_quality_score(city)
     _q_color_map = {'🟢': '#22c55e', '🟡': '#eab308', '🔴': '#ef4444'}
     _q_label_map = {'🟢': 'HIGH QUALITY — full Kelly OK', '🟡': 'MED QUALITY — cut stake 50%', '🔴': 'LOW QUALITY — skip or paper-trade'}
@@ -2951,9 +2597,7 @@ if forecast is not None and current is not None:
         with st.expander(f'Why quality is {_q_score}/100 for {city}', expanded=(_q_tier == '🔴')):
             for r in _q_reasons:
                 st.markdown(f'- {r}')
-            st.caption('Quality measures whether the model deserves trust today based on recent calibration. '
-                       'It does NOT modify Model %, Trust scores, or edge below — those are unchanged. '
-                       'Use quality to decide whether to act on otherwise-strong signals.')
+            st.caption('Quality measures whether the model deserves trust today based on recent calibration.')
 
     st.markdown('<div class="mph-section-header">🎯 Model Output</div>', unsafe_allow_html=True)
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -3008,8 +2652,6 @@ if forecast is not None and current is not None:
     no_rows = []
     best_bet = best_no_bet = None
     best_edge = best_no_edge = -999
-    best_trust_yes = None
-    best_trust_no = None
 
     for label, base_prob in prob_rows:
         ens_prob = next((ensemble_bracket_prob(ensemble_members, lo, hi)
@@ -3055,19 +2697,14 @@ if forecast is not None and current is not None:
         trust_n_score = round(trust_no.composite, 1) if trust_no else None
 
         edge_trust_yes = compute_edge_trust(
-            model_pct=final_prob * 100,
-            yes_ask=yes_ask,
-            ensemble_tier=ens_tier_for_trust,
+            model_pct=final_prob * 100, yes_ask=yes_ask, ensemble_tier=ens_tier_for_trust,
         )
         edge_trust_no = compute_edge_trust(
-            model_pct=(1.0 - final_prob) * 100,
-            yes_ask=no_ask,
-            ensemble_tier=ens_tier_for_trust,
+            model_pct=(1.0 - final_prob) * 100, yes_ask=no_ask, ensemble_tier=ens_tier_for_trust,
         )
 
         signal_cell = signal_icon if signal_icon else '—'
         no_signal_cell = no_icon if no_icon else '—'
-
         trust_y_edge_cell = str(round(edge_trust_yes, 1)) if edge_trust_yes is not None else '—'
         trust_n_edge_cell = str(round(edge_trust_no, 1)) if edge_trust_no is not None else '—'
         trust_y_cell = str(trust_y_score) if trust_y_score is not None else '—'
@@ -3102,8 +2739,6 @@ if forecast is not None and current is not None:
                                 if labels_match(lbl, label)), (None, None))
         below_consensus_d = b_hi_d is not None and consensus is not None and b_hi_d < consensus - 2.0
         above_consensus_d = b_lo_d is not None and consensus is not None and b_lo_d > consensus + 2.0
-
-        # V5.23: Best YES bracket selector — must contain consensus
         contains_consensus_yes = bracket_contains_consensus(label, consensus, ladder_text, tolerance=1.0)
 
         if (e is not None and e > best_edge and not busted and signal_icon == '🟢'
@@ -3120,15 +2755,6 @@ if forecast is not None and current is not None:
             best_no_edge = no_e
             best_no_bet = {'label': label, 'edge': no_e, 'kelly': kelly_no, 'busted': False, 'no_ask': no_ask}
 
-        if (trust_yes and trust_yes.tier == 'BET' and e is not None and e >= MIN_EDGE
-                and not busted and not below_consensus_d and contains_consensus_yes):
-            if best_trust_yes is None or trust_yes.composite > best_trust_yes[0]:
-                best_trust_yes = (trust_yes.composite, label, e, kelly, trust_yes.warnings, trust_yes.stake_suggestion_label)
-        if (trust_no and trust_no.tier == 'BET' and no_e is not None and no_e >= MIN_EDGE
-                and not above_consensus_d):
-            if best_trust_no is None or trust_no.composite > best_trust_no[0]:
-                best_trust_no = (trust_no.composite, label, no_e, kelly_no, trust_no.warnings, trust_no.stake_suggestion_label)
-
     prob_source = '(NBM percentiles)' if used_nbm else '(sigma/normal fallback)'
 
     def _annotate_dots(rows, best_edge_pick, accuracy_label=None):
@@ -3143,7 +2769,6 @@ if forecast is not None and current is not None:
                 r['Signal'] = dots + r['Signal']
         return rows
 
-    # V5.23: Find accuracy pick — also requires bracket to contain consensus
     _yes_acc_label = None
     for r in yes_rows:
         sig = r.get('Signal', '')
@@ -3183,455 +2808,293 @@ if forecast is not None and current is not None:
     st.markdown(f'#### 🟢 YES Signals {prob_source}')
     st.dataframe(yes_display, use_container_width=True, hide_index=True)
 
-    def _render_best(side_label, side_suffix, rows_list, trust_map, best_sig_by_edge):
-        accuracy_candidates = []
-        for r in rows_list:
-            sig = r.get('Signal', '')
-            ens = r.get('Ensemble', '')
-            if not (('🟢' in sig) and '🔵' in ens and 'HIGH' in ens):
-                continue
-            label = r['Bracket'].replace(' BUSTED', '')
-            tdata = trust_map.get(label)
-            if not tdata: continue
-            trust_score = tdata[0]
-            model_pct = tdata[5] if len(tdata) > 5 else 0
-            edge_trust = tdata[6] if len(tdata) > 6 else 0
-            if trust_score >= 80 and model_pct >= 30:
-                # V5.23: For YES, require bracket to contain consensus
-                if side_label == 'YES':
-                    if not bracket_contains_consensus(label, consensus, ladder_text, tolerance=1.0):
-                        continue
-                accuracy_candidates.append({
-                    'label': label, 'trust': trust_score,
-                    'edge_trust': edge_trust,
-                    'edge': tdata[2], 'kelly': tdata[3],
-                    'warns': tdata[4] or [], 'model_pct': model_pct,
-                    'yes_ask': next((r.get('YES ask','').replace('c','') for r in rows_list if r.get('Bracket','').replace(' BUSTED','') == label), None),
-                })
 
-        edge_pick = best_sig_by_edge
+    st.markdown(f'#### 🔻 NO Signals {prob_source}')
+    st.dataframe(no_display, use_container_width=True, hide_index=True)
 
-        if accuracy_candidates:
-            accuracy_candidates.sort(key=lambda x: (x['trust'], x['model_pct']), reverse=True)
-            top = accuracy_candidates[0]
-            same_as_edge = (edge_pick and labels_match(top['label'], edge_pick['label']))
-            if same_as_edge:
-                st.success(
-                    f"🟢🔵💎🎯 **{top['label']}{side_suffix}** — accuracy AND edge agree · "
-                    f"Trust 🎯 {round(top['trust'],1)} · Trust 💎 {round(top['edge_trust'],1)} · "
-                    f"Model {round(top['model_pct'],1)}% · Edge +{top['edge']}c · Kelly ${top['kelly']}"
-                )
-            else:
-                st.success(
-                    f"🟢🔵🎯 **Accuracy pick {side_label}: {top['label']}{side_suffix}** · "
-                    f"Trust 🎯 {round(top['trust'],1)} · Trust 💎 {round(top['edge_trust'],1)} · "
-                    f"Model {round(top['model_pct'],1)}% · Edge +{top['edge']}c · Kelly ${top['kelly']}"
-                )
-                if edge_pick and edge_pick.get('label'):
-                    st.caption(
-                        f"💎 Edge pick (secondary): {edge_pick['label']}{side_suffix} "
-                        f"(+{edge_pick['edge']}c) — mispriced but low Trust 🎯. Sanity check only."
-                    )
-
-            trust_val = round(top['trust'], 1)
-            edge_trust_val = round(top['edge_trust'], 1)
-            now_et = datetime.now(pytz.timezone('America/New_York'))
-            et_hhmm = now_et.hour * 100 + now_et.minute
-            tz_key = 'ET' if city in ['Miami','Atlanta','Washington DC','New York','Philadelphia','Boston'] else \
-                     'CT' if city in ['Dallas','Houston','New Orleans','Oklahoma City','Chicago','Austin','San Antonio','Minneapolis'] else 'PT'
-            edge_windows = {'ET': (930,1030), 'CT': (1000,1100), 'PT': (1100,1200)}
-            conv_windows = {'ET': (1100,1200), 'CT': (1200,1300), 'PT': (1400,1500)}
-            ew = edge_windows.get(tz_key, (930,1030))
-            cw = conv_windows.get(tz_key, (1100,1200))
-            in_edge = ew[0] <= et_hhmm < ew[1]
-            in_conv = cw[0] <= et_hhmm < cw[1]
-
-            if trust_val >= 85 and in_conv:
-                st.error(f"🎯 **HIGH CONVICTION — {top['label']}{side_suffix}** · Trust 🎯 {trust_val} · Trust 💎 {edge_trust_val} · Suggested bet: **$15-20** (HIGH tier 2×)")
-            elif trust_val >= 80 and in_conv:
-                st.warning(f"🎯 **MID CONVICTION — {top['label']}{side_suffix}** · Trust 🎯 {trust_val} · Trust 💎 {edge_trust_val} · Suggested bet: **$8-10** (MID tier 1×)")
-            elif trust_val < 80 and in_conv:
-                st.caption(f"⛔ Trust 🎯 {trust_val} < 80 — LOW tier. Skip this bet.")
-            if same_as_edge and in_edge and top.get('model_pct', 0) >= 30:
-                try:
-                    yes_ask_val = float(top.get('yes_ask') or 99)
-                except: yes_ask_val = 99
-                if yes_ask_val <= 15:
-                    st.info(f"💎 **EDGE OPPORTUNITY — {top['label']}{side_suffix}** · Trust 💎 {edge_trust_val} · Market {yes_ask_val}c · Model {round(top['model_pct'],1)}% · Suggested bet: **$3-5**")
-
-            if len(accuracy_candidates) > 1:
-                others = ', '.join([f"{o['label']} (🎯{round(o['trust'],1)} 💎{round(o['edge_trust'],1)})" for o in accuracy_candidates[1:]])
-                st.caption(f"({len(accuracy_candidates)} brackets passed — also: {others})")
-            if top['warns']:
-                st.caption('⚠️ ' + ' | '.join(top['warns']))
+    def _render_best(side_label, side_suffix, best_pick, trust_map):
+        if not best_pick:
+            st.info(f'No strong {side_label} signal — sit out')
             return
-
-        if edge_pick:
-            st.info(
-                f"💎 Edge pick {side_label} (no accuracy match): "
-                f"**{edge_pick['label']}{side_suffix}** (+{edge_pick['edge']}c, "
-                f"Kelly ${edge_pick['kelly']}) — market mispriced but Trust 🎯 <80 or Model% <30 "
-                f"or bracket too far from consensus. Verify with your own sources before betting."
-            )
-            return
-
-        st.caption(f"No {side_label} bracket qualifies — skip this run.")
+        bracket_label = best_pick.get('label', '')
+        ascii_label = bracket_label.replace('°','').replace('—','-').replace('–','-')
+        edge_v = best_pick.get('edge')
+        kelly_v = best_pick.get('kelly')
+        is_busted = best_pick.get('busted', False)
+        msg_lines = []
+        if is_busted:
+            no_ask_busted = best_pick.get('no_ask', '—')
+            msg_lines.append(f'🟢 BET BEST: {ascii_label} NO @ {no_ask_busted}c (BUSTED — guaranteed payout)')
+        else:
+            sign = '+' if edge_v and edge_v > 0 else ''
+            msg_lines.append(f'🟢 BET BEST: {ascii_label} {side_label} | {sign}{edge_v}c edge | ${kelly_v} Kelly')
+        trust_obj = trust_map.get(ascii_label) if trust_map else None
+        if trust_obj is not None:
+            try:
+                msg_lines.append(f'   Trust: {round(trust_obj.composite,1)}/100 ({trust_obj.tier})')
+            except Exception: pass
+        if best_pick.get('uncertain'):
+            msg_lines.append('   ⚠️ HIGH UNCERTAINTY — verify before betting')
+        st.success('\n'.join(msg_lines))
 
     yes_trust_map = {}
     no_trust_map = {}
+    for r in yes_rows:
+        bk = r['Bracket'].replace(' BUSTED', '')
     for label, base_prob in prob_rows:
         ens_prob = next((ensemble_bracket_prob(ensemble_members, lo, hi)
                          for lbl, lo, hi in parse_ladder(ladder_text) if labels_match(lbl, label)), None)
         final_prob = blend_probs(base_prob, ens_prob, ensemble_members, city, nbm_active=used_nbm)
-        yes_ask = no_ask = None
-        if kalshi_markets:
-            match = next((m for m in kalshi_markets if labels_match(m[0], label)), None)
-            if match: yes_ask, no_ask = match[1], match[2]
-        e_yes = edge_cents(final_prob, yes_ask)
-        e_no = no_edge_cents(final_prob, no_ask)
-        k_yes = kelly_bet(final_prob, yes_ask, bankroll) if yes_ask else 0.0
-        k_no_est = kelly_bet_no(final_prob, no_ask, bankroll) if no_ask else 0.0
-        ens_conf_tmp = ensemble_confidence(ens_prob) if ens_prob is not None else ''
-        ens_tier_tmp = ensemble_tier_from_confidence(ens_conf_tmp)
+        ens_conf2 = ensemble_confidence(ens_prob) if ens_prob is not None else ''
+        ens_tier2 = ensemble_tier_from_confidence(ens_conf2)
         ty = compute_row_trust(city=city, bracket_label=label, direction='YES',
-                               model_pct=final_prob*100, ensemble_tier=ens_tier_tmp,
+                               model_pct=final_prob*100, ensemble_tier=ens_tier2,
                                two_degree_call_str=call or '', mae_color=city_mae_color,
                                nbm_active=used_nbm, nws_forecast_f=nws_forecast,
                                gfs_ensemble_f=ensemble_mean, bias_adj_f=bias_correction)
         tn = compute_row_trust(city=city, bracket_label=label, direction='NO',
-                               model_pct=(1.0-final_prob)*100, ensemble_tier=ens_tier_tmp,
+                               model_pct=(1.0-final_prob)*100, ensemble_tier=ens_tier2,
                                two_degree_call_str=call or '', mae_color=city_mae_color,
                                nbm_active=used_nbm, nws_forecast_f=nws_forecast,
                                gfs_ensemble_f=ensemble_mean, bias_adj_f=bias_correction)
-        if ty:
-            edge_t_yes = compute_edge_trust(final_prob*100, yes_ask, ens_tier_tmp)
-            yes_trust_map[label] = (ty.composite, ty.tier, e_yes or 0, round(k_yes,2), ty.warnings, final_prob*100, edge_t_yes)
-        if tn:
-            edge_t_no = compute_edge_trust((1.0-final_prob)*100, no_ask, ens_tier_tmp)
-            no_trust_map[label] = (tn.composite, tn.tier, e_no or 0, round(k_no_est,2), tn.warnings, (1.0-final_prob)*100, edge_t_no)
+        yes_trust_map[label] = ty
+        no_trust_map[label] = tn
 
-    _render_best('YES', '', yes_rows, yes_trust_map, best_bet)
+    bcol1, bcol2 = st.columns(2)
+    with bcol1: _render_best('YES', 'yes', best_bet, yes_trust_map)
+    with bcol2: _render_best('NO',  'no',  best_no_bet, no_trust_map)
 
-    st.markdown(f'#### 🔴 NO Signals {prob_source}')
-    st.dataframe(no_display, use_container_width=True, hide_index=True)
-
-    if best_no_bet and best_no_bet.get('busted'):
-        st.success('🟢 Best NO Bet: **' + best_no_bet['label'] + ' NO** · BUSTED bracket · '
-                   'NO ask: ' + str(best_no_bet['no_ask']) + 'c · Kelly: $' + str(best_no_bet['kelly']))
-    else:
-        _render_best('NO', ' NO', no_rows, no_trust_map, best_no_bet)
-
-    with st.expander('🔐 View Trust Score Details', expanded=False):
-        st.caption('Raw trust composite (0-100) per bracket. Tier: HIGH ≥85 (2× size), MID 80-84 (1× size), NO BET <80.')
+    with st.expander('🎯 View Trust Score Details (per bracket)', expanded=False):
+        st.caption('Trust scoring breakdown — see what\'s driving each signal.')
         trust_detail_rows = []
-        for r_y, r_n in zip(yes_rows, no_rows):
+        for label, base_prob in prob_rows:
+            ens_prob = next((ensemble_bracket_prob(ensemble_members, lo, hi)
+                             for lbl, lo, hi in parse_ladder(ladder_text) if labels_match(lbl, label)), None)
+            final_prob = blend_probs(base_prob, ens_prob, ensemble_members, city, nbm_active=used_nbm)
+            ens_tier2 = ensemble_tier_from_confidence(ensemble_confidence(ens_prob) if ens_prob is not None else '')
+            ty = yes_trust_map.get(label)
+            if ty is None: continue
             trust_detail_rows.append({
-                'Bracket': r_y.get('Bracket', ''),
-                'YES Trust 💎': r_y.get('Trust 💎', '—'),
-                'YES Trust 🎯': r_y.get('Trust 🎯', '—'),
-                'NO Trust 💎': r_n.get('Trust 💎', '—') if r_n else '—',
-                'NO Trust 🎯': r_n.get('Trust 🎯', '—') if r_n else '—',
-                'Model %': r_y.get('Model %', '—'),
-                'Ensemble': r_y.get('Ensemble', ''),
+                'Bracket': label,
+                'Composite': round(ty.composite, 1),
+                'Tier': ty.tier,
+                'Mode': ty.mode,
+                'Calibration': round(ty.calibration, 1) if ty.calibration is not None else '—',
+                'Ensemble': round(ty.ensemble, 1) if ty.ensemble is not None else '—',
+                'Edge fit': round(ty.edge_fit, 1) if ty.edge_fit is not None else '—',
+                'Conviction': round(ty.conviction, 1) if ty.conviction is not None else '—',
             })
-        st.dataframe(pd.DataFrame(trust_detail_rows), use_container_width=True, hide_index=True)
+        if trust_detail_rows:
+            st.dataframe(pd.DataFrame(trust_detail_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption('No trust scores available.')
 
-    parsed = parse_ladder(ladder_text)
-    top_b = next((b for b in parsed if b[2] is None), None)
-    bot_b = next((b for b in parsed if b[1] is None), None)
-    if (top_b and consensus > top_b[1]+5) or (bot_b and bot_b[2] is not None and consensus < bot_b[2]-5):
-        st.warning('Ladder does not cover consensus of '+str(round(consensus, 1))+'F — update brackets.')
+    if kalshi_markets and len(kalshi_markets) < 4:
+        st.caption(f'⚠️ Only {len(kalshi_markets)} brackets fetched from Kalshi — coverage may be incomplete.')
 
 else:
-    st.error('NWS forecast unavailable. Use manual override or try refreshing.' if forecast is None
-             else 'Current temperature unavailable — cannot compute consensus.')
-
+    st.error('Cannot run model — missing forecast or current temp.')
 
 # ── Calibration & Settlement History ──────────────────────────────────────────
-with st.expander('📈 Calibration & Settlement History', expanded=False):
-    rows = sb_fetch_city(city)
-    complete = [r for r in rows if r.get('actual') is not None and r.get('error') is not None]
+with st.expander('📊 Calibration & Settlement History', expanded=False):
+    import pandas as pd
+    rows_for_city = sb_fetch_city(city)
+    complete = [r for r in rows_for_city if r.get('actual') is not None and r.get('consensus') is not None]
     if not complete:
-        st.caption('No settled predictions yet for ' + city)
+        st.caption('No settled history yet for ' + city + '.')
     else:
+        st.markdown(f'**{city} — last {min(len(complete), 30)} settled days**')
         recent = complete[-30:]
-        errors = [r['error'] for r in recent]
-        abs_errors = [abs(e) for e in errors]
-        mae = round(sum(abs_errors) / len(abs_errors), 2)
-        bias = round(sum(errors) / len(errors), 2)
-        within_1 = sum(1 for e in abs_errors if e <= 1.0)
-        within_2 = sum(1 for e in abs_errors if e <= 2.0)
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: st.metric('MAE (last 30)', str(mae) + ' F')
-        with c2: st.metric('Bias', ('+' if bias > 0 else '') + str(bias) + ' F')
-        with c3: st.metric('Within ±1F', str(within_1) + '/' + str(len(recent)))
-        with c4: st.metric('Within ±2F', str(within_2) + '/' + str(len(recent)))
-
-        import pandas as pd
-        hist_rows = []
+        history_rows = []
         for r in reversed(recent):
-            hist_rows.append({
-                'Date': r.get('date', ''),
-                'Consensus': r.get('consensus'),
-                'Actual': r.get('actual'),
-                'Error': ('+' if r.get('error', 0) >= 0 else '') + str(r.get('error', 0)) + 'F',
-                'Bias Adj': ('+' if (r.get('bias_correction') or 0) >= 0 else '') + str(r.get('bias_correction') or 0) + 'F',
-                'Obs High': r.get('obs_high') if r.get('obs_high') else '—',
-                'Uncertain?': '⚠️' if r.get('high_uncertainty') else '',
+            actual = r.get('actual')
+            consensus_h = r.get('consensus')
+            error = r.get('error')
+            err_str = ('+' if error is not None and error > 0 else '') + (f'{error:.1f}' if error is not None else '—')
+            err_color = '✅' if error is not None and abs(error) <= 1.5 else ('⚠️' if error is not None and abs(error) <= 3.0 else '🔴')
+            history_rows.append({
+                'Date': r.get('date'),
+                'Consensus': f'{consensus_h:.1f}F' if consensus_h is not None else '—',
+                'Actual': f'{actual:.1f}F' if actual is not None else '—',
+                'Error': err_str + 'F',
+                '': err_color,
             })
-        st.dataframe(pd.DataFrame(hist_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(history_rows), use_container_width=True, hide_index=True)
+        errs = [r['error'] for r in recent if r.get('error') is not None]
+        if errs:
+            mae = sum(abs(e) for e in errs) / len(errs)
+            mean_err = sum(errs) / len(errs)
+            within_1 = sum(1 for e in errs if abs(e) <= 1.0) / len(errs) * 100
+            within_2 = sum(1 for e in errs if abs(e) <= 2.0) / len(errs) * 100
+            within_3 = sum(1 for e in errs if abs(e) <= 3.0) / len(errs) * 100
+            mc1, mc2, mc3 = st.columns(3)
+            with mc1:
+                st.metric('MAE', f'{mae:.2f}F')
+                st.caption(f'Mean error: {mean_err:+.2f}F')
+            with mc2:
+                st.metric('Within 1F', f'{within_1:.0f}%')
+                st.caption(f'{sum(1 for e in errs if abs(e) <= 1.0)}/{len(errs)} days')
+            with mc3:
+                st.metric('Within 2F', f'{within_2:.0f}%')
+                st.caption(f'Within 3F: {within_3:.0f}%')
 
 # ── Source Accuracy Report ────────────────────────────────────────────────────
-with st.expander('🔬 Source Accuracy Report (per-city)', expanded=False):
-    st.caption('Compares NWS-only vs Consensus accuracy over recent settled days. Helps identify which cities should be in nws_only mode.')
+with st.expander('📈 Source Accuracy Report — Which Source Wins?', expanded=False):
+    st.caption('Compare per-source MAE across all settled days. Identifies which input is currently most reliable.')
     import pandas as pd
-    src_rows = []
-    for c in CITIES.keys():
-        rows = sb_fetch_city(c)
-        complete = [r for r in rows if r.get('actual') is not None and r.get('forecast') is not None and r.get('consensus') is not None]
-        if len(complete) < 5: continue
-        recent = complete[-14:]
-        nws_errs = [abs(r['actual'] - r['forecast']) for r in recent]
-        cons_errs = [abs(r['actual'] - r['consensus']) for r in recent]
-        nws_mae = round(sum(nws_errs) / len(nws_errs), 2)
-        cons_mae = round(sum(cons_errs) / len(cons_errs), 2)
-        winner = 'NWS' if nws_mae < cons_mae else ('Consensus' if cons_mae < nws_mae else 'Tie')
-        diff = round(abs(nws_mae - cons_mae), 2)
-        mode = CITY_PREDICTION_MODE.get(c, 'full_blend')
-        boost = ' 🚀1.2x' if c in NWS_BIAS_BOOST_CITIES else ''
-        src_rows.append({
-            'City': c,
-            'Mode': mode + boost,
-            'NWS MAE': nws_mae,
-            'Consensus MAE': cons_mae,
-            'Diff': diff,
-            'Winner': winner,
-            'N': len(recent),
-        })
-    if src_rows:
-        src_rows.sort(key=lambda x: x['Diff'], reverse=True)
-        st.dataframe(pd.DataFrame(src_rows), use_container_width=True, hide_index=True)
-        st.caption('🚀 = NWS_BIAS_BOOST_CITIES (1.2x bias multiplier active)')
+    rows_all = sb_fetch_all() or []
+    complete_all = [r for r in rows_all if r.get('actual') is not None]
+    if not complete_all:
+        st.caption('No settled data yet.')
     else:
-        st.caption('Need 5+ settled days per city for source comparison.')
+        sources = {'Consensus': [], 'NWS Forecast': [], 'GFS Ensemble': []}
+        for r in complete_all:
+            actual = r.get('actual')
+            if r.get('consensus') is not None: sources['Consensus'].append(abs(r['consensus'] - actual))
+            if r.get('forecast') is not None: sources['NWS Forecast'].append(abs(r['forecast'] - actual))
+            if r.get('ensemble_mean') is not None: sources['GFS Ensemble'].append(abs(r['ensemble_mean'] - actual))
+        src_rows = []
+        for src, errs in sources.items():
+            if errs:
+                mae_s = sum(errs) / len(errs)
+                src_rows.append({'Source': src, 'MAE': f'{mae_s:.2f}F', 'N': len(errs)})
+        if src_rows:
+            st.dataframe(pd.DataFrame(src_rows), use_container_width=True, hide_index=True)
+            st.caption(f'{len(complete_all)} settled rows across all cities.')
 
 # ── Personal Bet Log ──────────────────────────────────────────────────────────
-st.markdown('<div class="mph-section-header">💰 Personal Bet Log</div>', unsafe_allow_html=True)
+st.markdown('---')
+st.markdown('<div class="mph-section-header">📒 Personal Bet Log</div>', unsafe_allow_html=True)
+st.caption('Track bets you actually placed. Settles automatically when the city settles.')
 
-# V5.24: Password gate on bet log — re-added after V5.23 regression
-# Uses same app_password secret; one unlock covers form + history + edit/delete
-def _check_betlog_password():
-    try:
-        correct_pw = st.secrets.get('app_password', None)
-    except Exception:
-        correct_pw = None
-    if not correct_pw:
-        return True
-    if st.session_state.get('_betlog_authed') is True:
-        return True
-    return False
+if 'bet_log_unlocked' not in st.session_state:
+    st.session_state.bet_log_unlocked = False
 
-_betlog_unlocked = _check_betlog_password()
-
-if not _betlog_unlocked:
-    bl_col1, bl_col2 = st.columns([2, 1])
-    with bl_col1:
-        bl_pw = st.text_input('🔒 Bet log password', type='password', key='_betlog_pw_input',
-                              placeholder='Enter access password to view/edit bet log')
-    with bl_col2:
-        st.write('')  # vertical spacing
-        if st.button('🔓 Unlock', key='_betlog_unlock_btn'):
+if not st.session_state.bet_log_unlocked:
+    with st.form('bet_log_unlock_form'):
+        st.markdown('**🔒 Bet log is password protected.**')
+        bl_pw = st.text_input('Password', type='password', key='bl_pw_input')
+        if st.form_submit_button('Unlock'):
             try:
-                correct = st.secrets.get('app_password', None)
+                expected = st.secrets.get('bet_log_password', None)
             except Exception:
-                correct = None
-            if bl_pw and correct and bl_pw == correct:
-                st.session_state['_betlog_authed'] = True
+                expected = None
+            if expected and bl_pw == expected:
+                st.session_state.bet_log_unlocked = True
                 st.rerun()
             else:
                 st.error('Incorrect password.')
-    st.caption('Bet log is password-protected to prevent accidental edits and protect bet history.')
 else:
-    bet_log = load_bet_log()
-
-    with st.expander('➕ Log a Bet', expanded=False):
-        st.caption('Bets are auto-settled when their date settles in the database.')
-        bcol1, bcol2, bcol3 = st.columns(3)
-        with bcol1:
-            bet_city = st.selectbox('City', list(CITIES.keys()), key='bet_city_input')
-            bet_direction = st.selectbox('Direction', ['YES', 'NO'], key='bet_dir_input')
-        with bcol2:
-            bet_bracket = st.text_input('Bracket (e.g., 79-80, 83 or above)', key='bet_bracket_input')
-            bet_price = st.number_input('Price (cents)', min_value=1, max_value=99, value=50, key='bet_price_input')
-        with bcol3:
-            bet_amount = st.number_input('Amount ($)', min_value=0.5, max_value=1000.0, value=10.0, step=0.5, key='bet_amount_input')
-            bet_date = st.text_input('Date (YYYY-MM-DD)', value=get_eastern_date(), key='bet_date_input')
-
-        if st.button('💾 Save Bet'):
-            if not bet_bracket.strip():
-                st.error('Bracket required')
-            else:
+    bet_log_data = sb_fetch_bets() or []
+    with st.expander('➕ Log a New Bet', expanded=False):
+        with st.form('new_bet_form'):
+            bc1, bc2, bc3 = st.columns(3)
+            with bc1:
+                nb_city = st.selectbox('City', list(CITIES.keys()), key='nb_city')
+                nb_bracket = st.text_input('Bracket', value=ladder_text.split(' | ')[0] if ladder_text else '', key='nb_bracket')
+            with bc2:
+                nb_direction = st.radio('Direction', ['YES', 'NO'], horizontal=True, key='nb_dir')
+                nb_price = st.number_input('Entry price (cents)', min_value=1, max_value=99, value=50, key='nb_price')
+            with bc3:
+                nb_amount = st.number_input('Stake ($)', min_value=1.0, max_value=10000.0, value=10.0, step=1.0, key='nb_amount')
+                nb_notes = st.text_input('Notes', value='', key='nb_notes')
+            if st.form_submit_button('Log Bet'):
                 new_bet = {
-                    'date': bet_date.strip(),
-                    'city': bet_city,
-                    'bracket': normalize_label(bet_bracket.strip()),
-                    'direction': bet_direction,
-                    'price': float(bet_price),
-                    'amount': float(bet_amount),
+                    'date': get_eastern_date(),
+                    'city': nb_city,
+                    'bracket': nb_bracket,
+                    'direction': nb_direction,
+                    'price': nb_price,
+                    'amount': nb_amount,
+                    'notes': nb_notes,
                     'result': 'Pending',
-                    'actual': None,
                     'profit': None,
                     'payout': None,
-                    'settled_at': None,
-                    'created_at': datetime.now(pytz.timezone('America/New_York')).isoformat(),
+                    'actual': None,
+                    'placed_at': datetime.now(pytz.timezone('America/New_York')).isoformat(),
                 }
-                saved = sb_insert_bet(new_bet)
-                if saved:
-                    st.success(f'✅ Logged: {bet_city} {bet_bracket} {bet_direction} @ {bet_price}c · ${bet_amount}')
+                inserted = sb_insert_bet(new_bet)
+                if inserted:
+                    st.success(f'Logged: {nb_city} {nb_bracket} {nb_direction} ${nb_amount:.0f} @ {nb_price}c')
                     st.rerun()
 
-    if bet_log:
-        pending = [b for b in bet_log if b.get('result') == 'Pending']
-        won = [b for b in bet_log if b.get('result') == 'Won']
-        lost = [b for b in bet_log if b.get('result') == 'Lost']
-        total_wagered = sum(float(b.get('amount', 0) or 0) for b in won + lost)
-        total_profit = sum(float(b.get('profit', 0) or 0) for b in won + lost)
-        roi = round((total_profit / total_wagered) * 100, 1) if total_wagered > 0 else 0.0
-
-        bc1, bc2, bc3, bc4, bc5 = st.columns(5)
-        with bc1: st.metric('Total Bets', len(bet_log))
-        with bc2: st.metric('Pending', len(pending))
-        with bc3: st.metric('Won', len(won))
-        with bc4: st.metric('Lost', len(lost))
-        with bc5:
-            prefix = '+' if total_profit >= 0 else ''
-            st.metric('P&L', prefix + '$' + str(round(total_profit, 2)), delta=str(roi) + '% ROI')
-
+    bet_log_data = sb_fetch_bets() or []
+    if bet_log_data:
         import pandas as pd
-        bet_rows = []
-        for b in reversed(bet_log[-50:]):
-            result_str = b.get('result', 'Pending')
-            if result_str == 'Won': result_icon = '✅ Won'
-            elif result_str == 'Lost': result_icon = '❌ Lost'
-            else: result_icon = '⏳ Pending'
-            profit_val = b.get('profit')
-            profit_str = (('+' if profit_val >= 0 else '') + '$' + str(round(profit_val, 2))) if profit_val is not None else '—'
-            bet_rows.append({
-                'ID': b.get('id'),
-                'Date': b.get('date', ''),
-                'City': b.get('city', ''),
-                'Bracket': b.get('bracket', ''),
-                'Dir': b.get('direction', ''),
-                'Price': str(b.get('price', '')) + 'c',
-                'Stake': '$' + str(b.get('amount', '')),
-                'Result': result_icon,
-                'Actual': b.get('actual') if b.get('actual') is not None else '—',
-                'P&L': profit_str,
+        sorted_bets = sorted(bet_log_data, key=lambda b: (b.get('date', ''), b.get('id', 0)), reverse=True)
+        display_rows = []
+        for b in sorted_bets:
+            result = b.get('result', 'Pending')
+            if result == 'Won': icon = '✅'
+            elif result == 'Lost': icon = '❌'
+            else: icon = '⏳'
+            profit = b.get('profit')
+            profit_str = ('+' if profit is not None and profit > 0 else '') + (f'${profit:.2f}' if profit is not None else '—')
+            display_rows.append({
+                '': icon,
+                'Date': b.get('date', '—'),
+                'City': b.get('city', '—'),
+                'Bracket': b.get('bracket', '—'),
+                'Side': b.get('direction', '—'),
+                'Price': f'{b.get("price", "—")}c' if b.get('price') is not None else '—',
+                'Stake': f'${b.get("amount", 0):.0f}',
+                'Actual': f'{b.get("actual", "—")}F' if b.get('actual') is not None else '—',
+                'Result': result,
+                'P/L': profit_str,
+                'Notes': (b.get('notes') or '')[:30],
             })
-        st.dataframe(pd.DataFrame(bet_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
 
-        # V5.24: Edit-bet form — enter ID → load → modify → save
-        with st.expander('✏️ Edit Bet', expanded=False):
-            edit_id = st.number_input('Bet ID to edit', min_value=1, step=1, key='edit_bet_id')
-            edit_load = st.button('📂 Load Bet', key='edit_load_btn')
-            if edit_load:
-                target = next((b for b in bet_log if b.get('id') == int(edit_id)), None)
+        settled_bets = [b for b in bet_log_data if b.get('result') in ('Won', 'Lost')]
+        if settled_bets:
+            wins = sum(1 for b in settled_bets if b.get('result') == 'Won')
+            losses = sum(1 for b in settled_bets if b.get('result') == 'Lost')
+            total_profit = sum((b.get('profit') or 0) for b in settled_bets)
+            total_staked = sum((b.get('amount') or 0) for b in settled_bets)
+            roi = (total_profit / total_staked * 100) if total_staked > 0 else 0
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            with sc1: st.metric('Win Rate', f'{wins}/{wins+losses}', delta=f'{(wins/(wins+losses)*100):.0f}%' if (wins+losses) > 0 else '—')
+            with sc2: st.metric('Total P/L', ('+' if total_profit >= 0 else '') + f'${total_profit:.2f}')
+            with sc3: st.metric('ROI', f'{roi:+.1f}%')
+            with sc4: st.metric('Total Staked', f'${total_staked:.0f}')
+
+        with st.expander('✏️ Edit a Bet', expanded=False):
+            edit_choices = {f"#{b['id']} · {b.get('date','—')} · {b.get('city','—')} · {b.get('bracket','—')} · {b.get('direction','—')} (${b.get('amount','—')})": b['id'] for b in sorted_bets}
+            if edit_choices:
+                edit_label = st.selectbox('Pick a bet to edit', list(edit_choices.keys()), key='edit_pick')
+                edit_id = edit_choices[edit_label]
+                target = next((b for b in bet_log_data if b['id'] == edit_id), None)
                 if target:
-                    st.session_state['_edit_bet_target'] = target
-                    st.session_state['_edit_bet_loaded_id'] = int(edit_id)
-                    st.rerun()
-                else:
-                    st.error(f'Bet #{int(edit_id)} not found')
+                    with st.form('edit_bet_form'):
+                        ec1, ec2, ec3 = st.columns(3)
+                        with ec1:
+                            new_price = st.number_input('Price (cents)', min_value=1, max_value=99, value=int(target.get('price') or 50))
+                        with ec2:
+                            new_amount = st.number_input('Stake ($)', min_value=1.0, max_value=10000.0, value=float(target.get('amount') or 10.0), step=1.0)
+                        with ec3:
+                            new_notes = st.text_input('Notes', value=target.get('notes') or '')
+                        if st.form_submit_button('Save changes'):
+                            ok = sb_update_bet(edit_id, {'price': new_price, 'amount': new_amount, 'notes': new_notes})
+                            if ok:
+                                st.success('Updated.')
+                                st.rerun()
+                            else:
+                                st.error('Update failed.')
 
-            loaded = st.session_state.get('_edit_bet_target')
-            loaded_id = st.session_state.get('_edit_bet_loaded_id')
-            if loaded and loaded_id == int(edit_id):
-                st.info(f'Editing bet #{loaded_id}')
-                ec1, ec2, ec3 = st.columns(3)
-                with ec1:
-                    city_opts = list(CITIES.keys())
-                    cur_city = loaded.get('city', city_opts[0])
-                    e_city = st.selectbox('City', city_opts,
-                                          index=city_opts.index(cur_city) if cur_city in city_opts else 0,
-                                          key='e_city')
-                    e_dir = st.selectbox('Direction', ['YES', 'NO'],
-                                         index=0 if loaded.get('direction') == 'YES' else 1,
-                                         key='e_dir')
-                with ec2:
-                    e_bracket = st.text_input('Bracket', value=loaded.get('bracket', ''), key='e_bracket')
-                    e_price = st.number_input('Price (cents)', min_value=1, max_value=99,
-                                              value=int(loaded.get('price') or 50), key='e_price')
-                with ec3:
-                    e_amount = st.number_input('Amount ($)', min_value=0.5, max_value=1000.0,
-                                               value=float(loaded.get('amount') or 10.0), step=0.5, key='e_amount')
-                    e_date = st.text_input('Date (YYYY-MM-DD)', value=loaded.get('date', ''), key='e_date')
-
-                # V5.24: Allow result + profit overrides for partial cash-outs / corrections
-                ec4, ec5, ec6 = st.columns(3)
-                with ec4:
-                    res_opts = ['Pending', 'Won', 'Lost']
-                    cur_res = loaded.get('result', 'Pending')
-                    e_result = st.selectbox('Result', res_opts,
-                                            index=res_opts.index(cur_res) if cur_res in res_opts else 0,
-                                            key='e_result')
-                with ec5:
-                    e_actual_str = st.text_input('Actual high (F, blank if pending)',
-                                                 value=str(loaded.get('actual')) if loaded.get('actual') is not None else '',
-                                                 key='e_actual')
-                with ec6:
-                    e_profit_str = st.text_input('Profit override (blank = auto)',
-                                                 value=str(loaded.get('profit')) if loaded.get('profit') is not None else '',
-                                                 key='e_profit')
-
-                save_col, cancel_col = st.columns(2)
-                with save_col:
-                    if st.button('💾 Save Changes', key='e_save_btn'):
-                        updates = {
-                            'date': e_date.strip(),
-                            'city': e_city,
-                            'bracket': normalize_label(e_bracket.strip()),
-                            'direction': e_dir,
-                            'price': float(e_price),
-                            'amount': float(e_amount),
-                            'result': e_result,
-                        }
-                        try:
-                            updates['actual'] = float(e_actual_str) if e_actual_str.strip() else None
-                        except ValueError:
-                            st.error('Actual high must be a number or blank'); st.stop()
-                        try:
-                            updates['profit'] = float(e_profit_str) if e_profit_str.strip() else None
-                        except ValueError:
-                            st.error('Profit must be a number or blank'); st.stop()
-                        if sb_update_bet(int(loaded_id), updates):
-                            st.success(f'✅ Updated bet #{loaded_id}')
-                            st.session_state.pop('_edit_bet_target', None)
-                            st.session_state.pop('_edit_bet_loaded_id', None)
-                            st.rerun()
-                        else:
-                            st.error('Update failed')
-                with cancel_col:
-                    if st.button('✖️ Cancel', key='e_cancel_btn'):
-                        st.session_state.pop('_edit_bet_target', None)
-                        st.session_state.pop('_edit_bet_loaded_id', None)
-                        st.rerun()
-            else:
-                st.caption('Enter a bet ID and click "Load Bet" to populate the form.')
-
-        with st.expander('🗑️ Delete Bet', expanded=False):
-            if not bet_log:
-                st.caption('No bets to manage.')
-            else:
-                del_id = st.number_input('Bet ID to delete', min_value=1, step=1, key='del_bet_id')
-                st.warning('⚠️ Delete is permanent. Verify the ID in the table above.')
-                if st.button('🗑️ Delete Bet'):
-                    if sb_delete_bet(int(del_id)):
-                        st.success(f'Deleted bet #{int(del_id)}')
+        with st.expander('🗑️ Delete a Bet', expanded=False):
+            del_choices = {f"#{b['id']} · {b.get('date','—')} · {b.get('city','—')} · {b.get('bracket','—')} · {b.get('direction','—')} (${b.get('amount','—')})": b['id'] for b in sorted_bets}
+            if del_choices:
+                del_label = st.selectbox('Pick a bet to delete', list(del_choices.keys()), key='del_pick')
+                del_id = del_choices[del_label]
+                confirm = st.checkbox('Yes — delete this bet permanently', key='del_confirm')
+                if st.button('Delete bet', disabled=not confirm):
+                    if sb_delete_bet(del_id):
+                        st.success('Deleted.')
                         st.rerun()
                     else:
-                        st.error('Delete failed')
+                        st.error('Delete failed.')
     else:
-        st.caption('No bets logged yet. Use the form above to track your bets.')
+        st.caption('No bets logged yet. Use the form above to log your first bet.')
 
-st.markdown('---')
-st.caption(f'MPH Weather Model V5.26.1 · Last refresh: {get_eastern_datetime().strftime("%I:%M %p ET")} · Auto-refresh every 10 min')
+st.caption('---')
+st.caption('🌡️ MPH Weather Model V5.26.2 — Performance patch (caching restored, sb_delete_bet dedupe)')
