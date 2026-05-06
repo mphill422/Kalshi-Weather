@@ -2874,16 +2874,23 @@ if forecast is not None and current is not None:
             ens_tier2 = ensemble_tier_from_confidence(ensemble_confidence(ens_prob) if ens_prob is not None else '')
             ty = yes_trust_map.get(label)
             if ty is None: continue
-            trust_detail_rows.append({
-                'Bracket': label,
-                'Composite': round(ty.composite, 1),
-                'Tier': ty.tier,
-                'Mode': ty.mode,
-                'Calibration': round(ty.calibration, 1) if ty.calibration is not None else '—',
-                'Ensemble': round(ty.ensemble, 1) if ty.ensemble is not None else '—',
-                'Edge fit': round(ty.edge_fit, 1) if ty.edge_fit is not None else '—',
-                'Conviction': round(ty.conviction, 1) if ty.conviction is not None else '—',
-            })
+            row_detail = {'Bracket': label}
+            try: row_detail['Composite'] = round(ty.composite, 1)
+            except Exception: row_detail['Composite'] = '—'
+            try: row_detail['Tier'] = ty.tier
+            except Exception: row_detail['Tier'] = '—'
+            for fld in ('mode', 'calibration', 'ensemble', 'edge_fit', 'conviction'):
+                try:
+                    val = getattr(ty, fld, None)
+                    if val is None:
+                        row_detail[fld.replace('_',' ').title()] = '—'
+                    elif isinstance(val, (int, float)):
+                        row_detail[fld.replace('_',' ').title()] = round(val, 1)
+                    else:
+                        row_detail[fld.replace('_',' ').title()] = str(val)
+                except Exception:
+                    row_detail[fld.replace('_',' ').title()] = '—'
+            trust_detail_rows.append(row_detail)
         if trust_detail_rows:
             st.dataframe(pd.DataFrame(trust_detail_rows), use_container_width=True, hide_index=True)
         else:
