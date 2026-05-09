@@ -1939,7 +1939,7 @@ with st.sidebar:
     st.markdown('<div class="mph-section-header">🚦 V5.27 Three Gates</div>', unsafe_allow_html=True)
     st.markdown(f'**Gate 1 — Consensus:** Model pick must equal market #1 or #2 by yes-ask')
     st.markdown(f'**Gate 2 — Price floor:** Entry ≥{PRICE_FLOOR_CENTS}c on side bought')
-    st.markdown('**Gate 3 — One bet/day:** Top Trust 🎯 across all cities only')
+    st.markdown('**Gate 3 — One bet/city:** Best side (YES or NO) per city only — no spreading')
     st.caption('Research basis: gopher-lab/kalshi-go + Oalkhadra. Brackets <30c = ~0% win rate. 2-of-3 consensus = 82% win rate. Skip ~50% of days.')
     st.markdown('---')
     st.markdown('<div class="mph-section-header">📊 Signal Key</div>', unsafe_allow_html=True)
@@ -1959,7 +1959,7 @@ with st.sidebar:
     st.markdown('<div class="mph-section-header">🚦 V5.27</div>', unsafe_allow_html=True)
     st.markdown('Bet frequency reduction.')
     st.markdown('- Three research-validated gates')
-    st.markdown('- Banner shows ONE pick or skip-day')
+    st.markdown('- Banner shows ALL qualifying picks (ranked by Trust 🎯)')
     st.markdown('- Per-city detail with Gate Status')
     st.markdown('- ~50% of days expected to be skips')
     st.markdown('- All forecasting infra unchanged')
@@ -2080,14 +2080,12 @@ best_overall = v527_eval['best_overall']
 qualifying_picks = v527_eval['qualifying_picks']
 rejected_cities = v527_eval['rejected']
 
-st.markdown('<div class="mph-section-header">🚦 V5.27 — Today\'s Single Best Bet</div>', unsafe_allow_html=True)
+st.markdown('<div class="mph-section-header">🚦 V5.27 — Today\'s Qualifying Bets</div>', unsafe_allow_html=True)
 
-if best_overall is None:
-    n_qualifying = len(qualifying_picks)
+if not qualifying_picks:
     n_evaluated = len(qualifying_picks) + len(rejected_cities)
-    skip_msg = f'No bet passes all three gates today ({n_evaluated} cities evaluated, {n_qualifying} qualifying).'
-    if n_qualifying == 0:
-        skip_msg += ' Skip day — preserve bankroll. Research expects ~50% of days to be skip days.'
+    skip_msg = (f'No bet passes all three gates today ({n_evaluated} cities evaluated). '
+                'Skip day — preserve bankroll. Research expects ~50% of days to be skip days.')
     st.markdown(
         f'<div style="background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);'
         f'border:1px dashed #475569;border-radius:12px;padding:18px 24px;margin-bottom:18px;">'
@@ -2098,25 +2096,37 @@ if best_overall is None:
         unsafe_allow_html=True,
     )
 else:
-    bet = best_overall
-    side = bet['side']
-    side_color = '#00ff88' if side == 'YES' else '#00b4d8'
+    # Sort all qualifying picks by Trust 🎯 (accuracy), edge as tiebreaker
+    ranked_picks = sorted(qualifying_picks.values(),
+                          key=lambda p: (p['trust_accuracy'], p['edge']), reverse=True)
+    n_picks = len(ranked_picks)
+    header_text = f'✅ {n_picks} qualifying bet{"s" if n_picks != 1 else ""} — all pass three-gate filter'
     st.markdown(
-        f'<div style="background:linear-gradient(135deg,#052e16 0%,#064e3b 100%);'
-        f'border:2px solid #00ff88;border-radius:12px;padding:18px 24px;margin-bottom:18px;">'
-        f'<div style="color:#00ff88;font-size:13px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">'
-        f'✅ Single bet — passes all three gates ({bet["gate_reason"]})</div>'
-        f'<div style="color:#ffffff;font-size:22px;font-weight:700;margin-bottom:6px;">'
-        f'{bet["city"]} · {bet["label"]} · <span style="color:{side_color};">{side}</span> @ {bet["price"]}c</div>'
-        f'<div style="color:#94a3b8;font-size:14px;font-family:\'JetBrains Mono\',monospace;">'
-        f'Edge: <span style="color:#00ff88;">+{bet["edge"]}c</span> · '
-        f'Kelly: <span style="color:#00ff88;">${bet["kelly"]}</span> · '
-        f'Model: {round(bet["model_prob"]*100,1)}% · '
-        f'Trust 🎯: <span style="color:#a78bfa;">{bet["trust_accuracy"]}</span> · '
-        f'Trust 💎: {bet["trust_edge"]}</div>'
-        f'</div>',
+        f'<div style="color:#00ff88;font-size:13px;text-transform:uppercase;letter-spacing:1px;'
+        f'margin-bottom:10px;font-family:\'JetBrains Mono\',monospace;">{header_text}</div>',
         unsafe_allow_html=True,
     )
+    for idx, bet in enumerate(ranked_picks):
+        side = bet['side']
+        side_color = '#00ff88' if side == 'YES' else '#00b4d8'
+        # Top pick (highest Trust 🎯) gets a star marker
+        marker = '🏆 ' if idx == 0 else f'#{idx + 1} · '
+        st.markdown(
+            f'<div style="background:linear-gradient(135deg,#052e16 0%,#064e3b 100%);'
+            f'border:2px solid #00ff88;border-radius:12px;padding:14px 20px;margin-bottom:10px;">'
+            f'<div style="color:#00ff88;font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">'
+            f'{marker}{bet["gate_reason"]}</div>'
+            f'<div style="color:#ffffff;font-size:20px;font-weight:700;margin-bottom:4px;">'
+            f'{bet["city"]} · {bet["label"]} · <span style="color:{side_color};">{side}</span> @ {bet["price"]}c</div>'
+            f'<div style="color:#94a3b8;font-size:13px;font-family:\'JetBrains Mono\',monospace;">'
+            f'Edge: <span style="color:#00ff88;">+{bet["edge"]}c</span> · '
+            f'Kelly: <span style="color:#00ff88;">${bet["kelly"]}</span> · '
+            f'Model: {round(bet["model_prob"]*100,1)}% · '
+            f'Trust 🎯: <span style="color:#a78bfa;">{bet["trust_accuracy"]}</span> · '
+            f'Trust 💎: {bet["trust_edge"]}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
 # Audit panel
 if rejected_cities or len(qualifying_picks) > 1:
@@ -2124,8 +2134,10 @@ if rejected_cities or len(qualifying_picks) > 1:
         st.caption('Diagnostic visibility into why each city was selected or skipped. Verify the gate is firing correctly during the 2-week validation window.')
         if qualifying_picks:
             st.markdown('**Cities that passed all three gates:**')
-            for c, pick in sorted(qualifying_picks.items(), key=lambda x: x[1]['trust_accuracy'], reverse=True):
-                marker = '🏆 ' if best_overall and pick['city'] == best_overall['city'] else '   '
+            ranked_for_audit = sorted(qualifying_picks.items(),
+                                      key=lambda x: (x[1]['trust_accuracy'], x[1]['edge']), reverse=True)
+            for idx, (c, pick) in enumerate(ranked_for_audit):
+                marker = '🏆 ' if idx == 0 else f'#{idx+1} '
                 st.markdown(
                     f"{marker}**{c}** — {pick['label']} {pick['side']} @ {pick['price']}c · "
                     f"+{pick['edge']}c · ${pick['kelly']} · Trust 🎯 {pick['trust_accuracy']} · {pick['gate_reason']}"
@@ -2360,9 +2372,13 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
     elif not tz_picks:
         picks_html = '<div style="color:#64748b; font-size:12px; font-style:italic;">— No qualifying bet (gates not satisfied)</div>'
     else:
+        # Top pick across ALL cities (highest Trust 🎯) gets the trophy
+        all_ranked = sorted(qualifying_picks.values(),
+                            key=lambda p: (p['trust_accuracy'], p['edge']), reverse=True)
+        top_city = all_ranked[0]['city'] if all_ranked else None
         rows = []
         for p in tz_picks:
-            is_winner = best_overall and p['city'] == best_overall['city']
+            is_winner = top_city and p['city'] == top_city
             tag = '🏆 ' if is_winner else '🟢 '
             side_color = '#00ff88' if p['side'] == 'YES' else '#00b4d8'
             rows.append(
@@ -2750,12 +2766,19 @@ if forecast is not None and current is not None:
     city_pick = qualifying_picks.get(city)
 
     if city_pick:
-        winner_note = ('🏆 This is also today\'s single best bet across all cities.' if best_overall and best_overall['city'] == city
-                       else (f'Today\'s overall best is {best_overall["city"]}.' if best_overall else ''))
+        # Show rank within today's qualifying picks
+        ranked = sorted(qualifying_picks.values(),
+                        key=lambda p: (p['trust_accuracy'], p['edge']), reverse=True)
+        rank_idx = next((i for i, p in enumerate(ranked) if p['city'] == city), -1)
+        rank_note = ''
+        if rank_idx == 0 and len(ranked) > 1:
+            rank_note = f' 🏆 Top-ranked among {len(ranked)} qualifying picks today.'
+        elif rank_idx >= 0 and len(ranked) > 1:
+            rank_note = f' Rank #{rank_idx + 1} of {len(ranked)} qualifying picks today.'
         st.success(
             f'🚦 **V5.27 Gate Status: PASS** — Model pick `{model_pick_label}` matches market {consensus_reason}. '
             f'Recommended bet: **{city_pick["label"]} {city_pick["side"]}** @ {city_pick["price"]}c '
-            f'(+{city_pick["edge"]}c, ${city_pick["kelly"]} Kelly, Trust 🎯 {city_pick["trust_accuracy"]}). ' + winner_note
+            f'(+{city_pick["edge"]}c, ${city_pick["kelly"]} Kelly, Trust 🎯 {city_pick["trust_accuracy"]}).' + rank_note
         )
     else:
         reason = rejected_cities.get(city, 'Unknown')
