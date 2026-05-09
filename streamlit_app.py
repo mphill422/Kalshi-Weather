@@ -1,17 +1,21 @@
-# Kalshi High Temperature Model - V5.26.2
-# V5.26.2 PERFORMANCE PATCH (audit fixes from V5.26.1):
-#   1. Added @st.cache_data(ttl=300) to fetch_city_weather — was uncached, called
-#      ~11x per render via timezone banner loop. Biggest single perf win.
-#   2. Added @st.cache_data(ttl=300) to fetch_nws_forecast, fetch_nws_current,
-#      fetch_obs_high_today, fetch_gfs_ensemble — all were uncached.
-#   3. Removed duplicate sb_delete_bet definition. Second def overrode first
-#      and skipped _bust_bets_cache(), causing deleted bets to reappear until
-#      30s TTL expired.
-#   No predictions, weights, bias formulas, or Trust scores changed.
+# Kalshi High Temperature Model - V5.27
+# V5.27 BUILD GOALS — bet frequency reduction (research-validated):
+#   After 43 live bets resulted in -$75.02 / -21.5% ROI / 27.9% win rate,
+#   public Kalshi weather strategies (gopher-lab/kalshi-go and
+#   Oalkhadra/prediction-market-trading) showed three patterns the V5.26.2
+#   model was violating:
+#     1. Brackets <30c entry have ~0% historical win rate.
+#     2. 2-of-3 consensus (model + market top 2) yields 82% win rate.
+#     3. Profitable strategies skip ~50% of days.
+#     4. Multi-bracket spreading is a documented failure (52% win rate).
 #
-# V5.26.1 patch: added manual background collection button to diagnostic dashboard.
-# V5.26 PHILOSOPHY: Measurement before correction.
-# All V5.22-V5.26.1 logic preserved.
+# V5.27 implements three gates. A signal must pass ALL THREE to surface:
+#   GATE 1 (Consensus): Model top pick must equal market #1 OR strict #2 by yes-ask.
+#   GATE 2 (Price floor): Entry >= 30c on side bought.
+#   GATE 3 (One bet/day): Single highest Trust accuracy bet across all cities.
+#
+# All V5.22 - V5.26.2 forecasting/data/scoring infrastructure preserved exactly.
+# Only the bet-selection / surfacing layer is gated.
 
 import math, re, json, time, requests
 import streamlit as st
@@ -43,7 +47,7 @@ def _check_app_password():
     .mph-login-badge { display: inline-block; padding: 0.2rem 0.7rem; background: rgba(0, 255, 136, 0.12); border: 1px solid rgba(0, 255, 136, 0.4); border-radius: 999px; color: #00ff88; font-size: 0.75rem; font-weight: 600; letter-spacing: 0.05em; margin-left: 0.5rem; }
     </style>
     <div class="mph-login-wrap">
-      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.26.2</span></div>
+      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.27</span></div>
       <div class="mph-login-sub">Private — enter access password to continue</div>
     </div>
     """, unsafe_allow_html=True)
@@ -116,6 +120,12 @@ PRICE_CACHE_FILE = Path('price_cache.json')
 PRICE_CACHE_MINUTES = 10
 
 MIN_EDGE = 8
+
+# V5.27 Three research-validated gating constants
+PRICE_FLOOR_CENTS = 30
+CONSENSUS_TOP_N = 2
+ONE_CITY_PER_DAY = True
+
 HEADERS = {'User-Agent': 'kalshi-temp-model/5.7', 'Accept': 'application/geo+json, application/json, text/html'}
 try:
     WETHR_API_KEY = st.secrets['wethr']['api_key']
@@ -818,8 +828,6 @@ def fetch_nws_grid(lat, lon):
         return result
     except Exception: return None
 
-# V5.26.2: Added @st.cache_data(ttl=300) — was uncached, hit on every render via
-# fetch_city_weather (timezone banner) AND directly in city detail block.
 @st.cache_data(ttl=300)
 def fetch_nws_forecast(lat, lon):
     city_name = None
@@ -867,7 +875,6 @@ def fetch_nws_forecast(lat, lon):
     except Exception: pass
     return None, None
 
-# V5.26.2: Added @st.cache_data(ttl=300) — was uncached, hit on every render.
 @st.cache_data(ttl=300)
 def fetch_nws_current(lat, lon, station_id):
     city_name = None
@@ -893,14 +900,9 @@ def fetch_nws_current(lat, lon, station_id):
             r = requests.get(
                 'https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py',
                 params={
-                    'station': station_id,
-                    'data': 'tmpf',
-                    'sts': sts_iso,
-                    'format': 'onlycomma',
-                    'tz': 'UTC',
-                    'missing': 'empty',
-                    'latlon': 'no',
-                    'report_type': '3,4',
+                    'station': station_id, 'data': 'tmpf', 'sts': sts_iso,
+                    'format': 'onlycomma', 'tz': 'UTC', 'missing': 'empty',
+                    'latlon': 'no', 'report_type': '3,4',
                 },
                 timeout=10
             )
@@ -1001,16 +1003,12 @@ def compute_row_trust(city, bracket_label, direction, model_pct, ensemble_tier, 
                       mae_color, nbm_active, nws_forecast_f, gfs_ensemble_f, bias_adj_f):
     try:
         inp = SignalInputs(
-            city=str(city or ''),
-            bracket_label=str(bracket_label or ''),
-            direction=str(direction or 'YES'),
-            two_degree_call=str(two_degree_call_str or ''),
+            city=str(city or ''), bracket_label=str(bracket_label or ''),
+            direction=str(direction or 'YES'), two_degree_call=str(two_degree_call_str or ''),
             bracket_midpoint=bracket_midpoint_from_label(bracket_label),
             twodc_midpoint=bracket_midpoint_from_label(two_degree_call_str),
-            model_pct=float(model_pct or 0),
-            edge_cents=0.0,
-            ensemble_tier=str(ensemble_tier or ''),
-            mae_color=str(mae_color or 'green'),
+            model_pct=float(model_pct or 0), edge_cents=0.0,
+            ensemble_tier=str(ensemble_tier or ''), mae_color=str(mae_color or 'green'),
             nbm_active=bool(nbm_active),
             nws_forecast_f=float(nws_forecast_f) if nws_forecast_f is not None else None,
             gfs_ensemble_f=float(gfs_ensemble_f) if gfs_ensemble_f is not None else None,
@@ -1059,58 +1057,246 @@ def ensemble_tier_from_confidence(conf_str):
     if 'LOW' in conf_str: return 'LOW'
     return ''
 
-def get_city_best_signals(city, consensus, ladder_text, ensemble_members, kalshi_markets_data,
-                          obs_high, high_uncertainty, bankroll, nbm_percentiles=None,
-                          current_temp=None, nws_forecast=None, local_hour=12,
-                          min_prob=0.10):
-    if consensus is None or not ladder_text: return '—', '—'
-    try:
-        prob_rows, _, used_nbm = bracket_probs_nbm(consensus, ladder_text, city, nbm_percentiles, obs_high=obs_high)
-        prob_rows = apply_prob_floor(prob_rows, consensus, ladder_text)
-        morning_suppressed, _ = check_morning_suppression(obs_high, current_temp, nws_forecast, local_hour)
-        conviction_result = check_market_conviction(kalshi_markets_data, ladder_text)
-        best_yes = best_no = None
-        best_yes_edge = best_no_edge = -999
-        for label, base_prob in prob_rows:
-            ens_prob = next((ensemble_bracket_prob(ensemble_members, lo, hi)
-                             for lbl, lo, hi in parse_ladder(ladder_text) if labels_match(lbl, label)), None)
-            final_prob = blend_probs(base_prob, ens_prob, ensemble_members, city, nbm_active=used_nbm)
-            if final_prob < min_prob: continue
-            bracket_parsed = next(((lo, hi) for lbl, lo, hi in parse_ladder(ladder_text)
-                                   if labels_match(lbl, label)), (None, None))
-            b_lo, b_hi = bracket_parsed
-            below_consensus = (b_hi is not None and consensus is not None and b_hi < consensus - 2.0)
-            above_consensus = (b_lo is not None and consensus is not None and b_lo > consensus + 2.0)
-            yes_ask = no_ask = None
-            if kalshi_markets_data:
-                match = next((m for m in kalshi_markets_data if labels_match(m[0], label)), None)
-                if match: yes_ask, no_ask = match[1], match[2]
-            busted = obs_high is not None and any(
-                labels_match(lbl, label) and hi is not None and obs_high > hi + 0.4
-                for lbl, lo, hi in parse_ladder(ladder_text))
-            conviction_conflict = (conviction_result and
-                                   is_conflicting_with_conviction(label, conviction_result[1], conviction_result[2], ladder_text))
-            e = edge_cents(final_prob, yes_ask)
-            icon, _ = edge_signal(e, high_uncertainty, morning_suppressed, conviction_conflict)
-            contains_cons = bracket_contains_consensus(label, consensus, ladder_text, tolerance=1.0)
-            if (e is not None and e > best_yes_edge and not busted and icon == '🟢' and not below_consensus and contains_cons):
-                best_yes_edge = e
-                kelly = kelly_bet(final_prob, yes_ask, bankroll) if yes_ask else 0.0
-                best_yes = f'🟢 {label} | +{e}c | ${kelly}'
-            no_model_prob = 1.0 - final_prob
-            if no_model_prob < min_prob: continue
-            no_e = no_edge_cents(final_prob, no_ask)
-            no_icon, _ = no_signal(no_e, busted=busted, model_prob=final_prob, no_ask=no_ask,
-                                   high_uncertainty=high_uncertainty, morning_suppressed=morning_suppressed,
-                                   conviction_conflict=conviction_conflict)
-            if (no_icon == '🟢' and no_e is not None and no_e > best_no_edge and not above_consensus):
-                best_no_edge = no_e
-                kelly_no = kelly_bet_no(final_prob, no_ask, bankroll) if no_ask else 0.0
-                best_no = f'🟢 {label} NO | +{no_e}c | ${kelly_no}'
-        return best_yes or '—', best_no or '—'
-    except Exception: return '—', '—'
 
-# V5.26.2: Added @st.cache_data(ttl=300) — was uncached, hit on every render.
+# V5.27 Three-gate logic ──────────────────────────────────────────────────────
+
+def get_market_top_n(kalshi_markets, n=CONSENSUS_TOP_N):
+    if not kalshi_markets:
+        return []
+    priced = [(label, yes_ask) for label, yes_ask, _ in kalshi_markets if yes_ask is not None]
+    if not priced:
+        return []
+    priced.sort(key=lambda x: x[1], reverse=True)
+    return [label for label, _ in priced[:n]]
+
+
+def model_top_pick(prob_rows):
+    if not prob_rows:
+        return None
+    return prob_rows[0][0]
+
+
+def passes_consensus_gate(model_pick_label, kalshi_markets):
+    if not model_pick_label:
+        return False, 'No model pick'
+    market_top = get_market_top_n(kalshi_markets, n=CONSENSUS_TOP_N)
+    if not market_top:
+        return False, 'No market prices'
+    for mt in market_top:
+        if labels_match(mt, model_pick_label):
+            rank = market_top.index(mt) + 1
+            return True, f'Consensus #{rank}'
+    return False, f'Model pick "{model_pick_label}" not in market top {CONSENSUS_TOP_N}: {market_top}'
+
+
+def passes_price_floor(price_cents):
+    if price_cents is None:
+        return False, 'No price'
+    if price_cents < PRICE_FLOOR_CENTS:
+        return False, f'Price {price_cents}c < {PRICE_FLOOR_CENTS}c floor'
+    if price_cents >= 99:
+        return False, f'Price {price_cents}c too high — no edge'
+    return True, 'Price floor OK'
+
+
+def select_qualifying_bet_v527(city, prob_rows, kalshi_markets, ladder_text, ensemble_members,
+                                obs_high, high_uncertainty, morning_suppressed, conviction_result,
+                                consensus, used_nbm, nws_forecast, ensemble_mean, bias_correction,
+                                city_mae_color, two_degree_call_str, bankroll):
+    if not prob_rows or not kalshi_markets:
+        return None
+
+    model_pick = model_top_pick(prob_rows)
+    consensus_pass, consensus_reason = passes_consensus_gate(model_pick, kalshi_markets)
+    if not consensus_pass:
+        return None
+
+    target_label = model_pick
+    bracket_match = next(((lo, hi) for lbl, lo, hi in parse_ladder(ladder_text)
+                          if labels_match(lbl, target_label)), (None, None))
+    target_lo, target_hi = bracket_match
+    target_market = next((m for m in kalshi_markets if labels_match(m[0], target_label)), None)
+    if not target_market:
+        return None
+    yes_ask, no_ask = target_market[1], target_market[2]
+
+    target_base_prob = next((p for lbl, p in prob_rows if labels_match(lbl, target_label)), None)
+    if target_base_prob is None:
+        return None
+    ens_prob = ensemble_bracket_prob(ensemble_members, target_lo, target_hi) if ensemble_members else None
+    final_prob = blend_probs(target_base_prob, ens_prob, ensemble_members, city, nbm_active=used_nbm)
+
+    busted = obs_high is not None and target_hi is not None and obs_high > target_hi + 0.4
+    conviction_conflict = (conviction_result and
+                           is_conflicting_with_conviction(target_label, conviction_result[1],
+                                                          conviction_result[2], ladder_text))
+
+    yes_e = edge_cents(final_prob, yes_ask)
+    yes_icon, _ = edge_signal(yes_e, high_uncertainty, morning_suppressed, conviction_conflict)
+    no_e = no_edge_cents(final_prob, no_ask)
+    no_icon, _ = no_signal(no_e, busted=busted, model_prob=final_prob, no_ask=no_ask,
+                           high_uncertainty=high_uncertainty, morning_suppressed=morning_suppressed,
+                           conviction_conflict=conviction_conflict)
+
+    contains_consensus = bracket_contains_consensus(target_label, consensus, ladder_text, tolerance=1.0)
+    candidates = []
+
+    if (yes_icon == '🟢' and not busted and contains_consensus
+            and final_prob >= 0.10 and yes_ask is not None):
+        floor_pass, _ = passes_price_floor(yes_ask)
+        if floor_pass:
+            ens_conf = ensemble_confidence(ens_prob) if ens_prob is not None else ''
+            ens_tier = ensemble_tier_from_confidence(ens_conf)
+            trust_yes = compute_row_trust(
+                city=city, bracket_label=target_label, direction='YES',
+                model_pct=final_prob * 100, ensemble_tier=ens_tier,
+                two_degree_call_str=two_degree_call_str or '', mae_color=city_mae_color,
+                nbm_active=used_nbm, nws_forecast_f=nws_forecast,
+                gfs_ensemble_f=ensemble_mean, bias_adj_f=bias_correction,
+            )
+            edge_trust_yes = compute_edge_trust(
+                model_pct=final_prob * 100, yes_ask=yes_ask, ensemble_tier=ens_tier,
+            )
+            trust_acc = trust_yes.composite if trust_yes else 0.0
+            kelly = kelly_bet(final_prob, yes_ask, bankroll)
+            candidates.append({
+                'side': 'YES', 'label': target_label, 'price': yes_ask,
+                'edge': yes_e, 'kelly': kelly, 'model_prob': final_prob,
+                'trust_accuracy': round(trust_acc, 1),
+                'trust_edge': round(edge_trust_yes, 1),
+                'gate_reason': consensus_reason,
+            })
+
+    no_qualifies = False
+    if busted and no_ask is not None and no_ask <= 5:
+        no_qualifies = True
+    elif (no_icon == '🟢' and (1.0 - final_prob) >= 0.10
+          and not busted and no_ask is not None):
+        no_qualifies = True
+
+    if no_qualifies:
+        floor_pass, _ = passes_price_floor(no_ask)
+        if floor_pass or (busted and no_ask is not None and no_ask <= 5):
+            ens_conf = ensemble_confidence(ens_prob) if ens_prob is not None else ''
+            ens_tier = ensemble_tier_from_confidence(ens_conf)
+            trust_no = compute_row_trust(
+                city=city, bracket_label=target_label, direction='NO',
+                model_pct=(1.0 - final_prob) * 100, ensemble_tier=ens_tier,
+                two_degree_call_str=two_degree_call_str or '', mae_color=city_mae_color,
+                nbm_active=used_nbm, nws_forecast_f=nws_forecast,
+                gfs_ensemble_f=ensemble_mean, bias_adj_f=bias_correction,
+            )
+            edge_trust_no = compute_edge_trust(
+                model_pct=(1.0 - final_prob) * 100, yes_ask=no_ask, ensemble_tier=ens_tier,
+            )
+            trust_acc = trust_no.composite if trust_no else 0.0
+            kelly_no = kelly_bet_no(final_prob, no_ask, bankroll)
+            no_edge_val = no_e if no_e is not None else (95 if busted else 0)
+            candidates.append({
+                'side': 'NO', 'label': target_label, 'price': no_ask,
+                'edge': no_edge_val, 'kelly': kelly_no, 'model_prob': 1.0 - final_prob,
+                'trust_accuracy': round(trust_acc, 1),
+                'trust_edge': round(edge_trust_no, 1),
+                'gate_reason': consensus_reason + (' (busted NO)' if busted else ''),
+            })
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda c: (c['trust_accuracy'], c['edge']), reverse=True)
+    return candidates[0]
+
+
+def evaluate_all_cities_v527(saved_ladders, bankroll):
+    today_rows = {r['city']: r for r in (sb_fetch_all() or []) if r.get('date') == get_eastern_date()}
+    qualifying_picks = {}
+    rejected = {}
+
+    for c in CITIES.keys():
+        if c in HIDDEN_CITIES:
+            continue
+        row = today_rows.get(c)
+        if not row:
+            rejected[c] = 'No prediction logged for today'
+            continue
+        consensus_val = row.get('consensus')
+        if consensus_val is None:
+            rejected[c] = 'Consensus unavailable'
+            continue
+
+        ladder = saved_ladders.get(c, DEFAULT_LADDERS.get(c, ''))
+        cached_markets, _ = get_cached_prices(c)
+        if not cached_markets:
+            rejected[c] = 'No cached Kalshi prices'
+            continue
+
+        try:
+            wx = fetch_city_weather(c)
+        except Exception:
+            wx = None
+
+        members = wx.get('ensemble_members') if wx else None
+        nbm_pcts = wx.get('nbm_percentiles') if wx else None
+        c_temp = wx.get('current_temp') if wx else None
+        c_fc = wx.get('nws_fc') if wx else None
+        c_hour = wx.get('local_hour', 12) if wx else 12
+
+        try:
+            prob_rows, _, used_nbm = bracket_probs_nbm(
+                consensus_val, ladder, c, nbm_pcts,
+                obs_high=row.get('obs_high'), forecast=c_fc,
+            )
+            prob_rows = apply_prob_floor(prob_rows, consensus_val, ladder)
+        except Exception:
+            rejected[c] = 'Probability computation failed'
+            continue
+
+        morning_suppressed, _ = check_morning_suppression(
+            row.get('obs_high'), c_temp, c_fc, c_hour,
+        )
+        conviction_result = check_market_conviction(cached_markets, ladder)
+        bias_correction, _ = compute_bias_correction_db(c)
+        mae_val, mae_color = get_city_mae_and_color(c)
+        call = two_degree_call(consensus_val, ladder, obs_high=row.get('obs_high'))
+
+        pick = select_qualifying_bet_v527(
+            city=c, prob_rows=prob_rows, kalshi_markets=cached_markets,
+            ladder_text=ladder, ensemble_members=members,
+            obs_high=row.get('obs_high'),
+            high_uncertainty=row.get('high_uncertainty', False),
+            morning_suppressed=morning_suppressed,
+            conviction_result=conviction_result,
+            consensus=consensus_val, used_nbm=used_nbm,
+            nws_forecast=c_fc, ensemble_mean=wx.get('ensemble_mean') if wx else None,
+            bias_correction=bias_correction, city_mae_color=mae_color,
+            two_degree_call_str=call, bankroll=bankroll,
+        )
+
+        if pick is None:
+            model_pick = model_top_pick(prob_rows)
+            cp, cr = passes_consensus_gate(model_pick, cached_markets)
+            if not cp:
+                rejected[c] = f'Gate 1 fail: {cr}'
+            else:
+                rejected[c] = 'Gate 2 / safety filter rejected (price floor / busted / conviction / morning)'
+        else:
+            pick['city'] = c
+            pick['consensus'] = consensus_val
+            qualifying_picks[c] = pick
+
+    best_overall = None
+    if qualifying_picks:
+        ranked = sorted(qualifying_picks.values(),
+                        key=lambda p: (p['trust_accuracy'], p['edge']), reverse=True)
+        best_overall = ranked[0]
+
+    return {
+        'best_overall': best_overall,
+        'qualifying_picks': qualifying_picks,
+        'rejected': rejected,
+    }
+
+
 @st.cache_data(ttl=300)
 def fetch_gfs_ensemble(lat, lon):
     params = {'latitude': lat, 'longitude': lon, 'hourly': 'temperature_2m',
@@ -1383,7 +1569,6 @@ def boxes_to_ladder(parts):
         else: cleaned.append(t)
     return ' | '.join(cleaned)
 
-# V5.26.2: Added @st.cache_data(ttl=300) — was uncached, hit on every render.
 @st.cache_data(ttl=300)
 def fetch_obs_high_today(icao):
     try:
@@ -1562,10 +1747,6 @@ def sync_all_ladders(saved_ladders, force=False):
     progress.empty()
     return saved_ladders, {'synced': synced, 'failed': failed}
 
-# V5.26.2 PRIMARY FIX: Added @st.cache_data(ttl=300) — this was the biggest perf
-# bug in V5.26.1. Function was uncached, called ~11x per render via timezone
-# banner loop, each call making 5 HTTP requests internally (~55 requests per
-# render). Now properly cached so repeat city fetches within 5 min return instantly.
 @st.cache_data(ttl=300)
 def fetch_city_weather(city):
     coords = CITIES[city]
@@ -1649,10 +1830,6 @@ def sb_update_bet(bet_id, updates):
         return False
     except Exception: return False
 
-# V5.26.2: Removed duplicate sb_delete_bet definition. Previously this function
-# was defined twice — the second def overrode the first and skipped
-# _bust_bets_cache(), causing deleted bets to reappear in the UI until the 30s
-# cache TTL expired. This is the canonical version with cache busting.
 def sb_delete_bet(bet_id):
     try:
         r = requests.delete(sb_url('bets') + '?id=eq.' + str(bet_id),
@@ -1759,46 +1936,36 @@ with st.sidebar:
     st.markdown('**Kelly fraction:** 15% (conservative)')
     st.markdown('**Max per trade:** min(5% bankroll, $100)')
     st.markdown('---')
+    st.markdown('<div class="mph-section-header">🚦 V5.27 Three Gates</div>', unsafe_allow_html=True)
+    st.markdown(f'**Gate 1 — Consensus:** Model pick must equal market #1 or #2 by yes-ask')
+    st.markdown(f'**Gate 2 — Price floor:** Entry ≥{PRICE_FLOOR_CENTS}c on side bought')
+    st.markdown('**Gate 3 — One bet/day:** Top Trust 🎯 across all cities only')
+    st.caption('Research basis: gopher-lab/kalshi-go + Oalkhadra. Brackets <30c = ~0% win rate. 2-of-3 consensus = 82% win rate. Skip ~50% of days.')
+    st.markdown('---')
     st.markdown('<div class="mph-section-header">📊 Signal Key</div>', unsafe_allow_html=True)
-    st.markdown('**Column 1 (Signal):**')
     st.markdown('🟢 BET · 🟡 SKIP · 🔴 AVOID · ⚪ No price')
+    st.markdown('🚦 = bracket passes Gate 1 · 🚫 = blocked')
     st.markdown('---')
     st.markdown('<div class="mph-section-header">🎯 Trust Columns</div>', unsafe_allow_html=True)
-    st.markdown('**Trust 💎 — Edge trust (0-100)**')
-    st.markdown('≥85 = HIGH 2× · 80-84 = MID 1× · <80 = no bet')
-    st.markdown('**Trust 🎯 — Accuracy trust (0-100)**')
-    st.markdown('≥85 = HIGH 2× · 80-84 = MID 1× · <80 = no bet')
-    st.caption('Based on erickdronski calibration: HIGH tier 80% win rate, LOW tier 34.9%')
+    st.markdown('**Trust 💎** — Edge trust (0-100)')
+    st.markdown('**Trust 🎯** — Accuracy trust ← V5.27 tie-breaker')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🔵 Ensemble Column</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mph-section-header">🔵 Ensemble</div>', unsafe_allow_html=True)
     st.markdown('🔵 HIGH · 🟡 MED · ⚪ LOW')
-    st.caption('Best bet = 🟢🎯💎 + 🔵 HIGH + Trust ≥85 (HIGH tier)')
-    st.markdown('---')
-    st.markdown('<div class="mph-section-header">⏰ Timing Symbols</div>', unsafe_allow_html=True)
-    st.markdown('💎 (Edge) Sweet spot — hunt mispricings')
-    st.markdown('🎯 (Accuracy) Sweet spot — model most reliable')
-    st.markdown('🌡️ Peak heat — highest temps expected')
     st.markdown('---')
     st.markdown('<div class="mph-section-header">🔬 MAE Guide</div>', unsafe_allow_html=True)
-    st.markdown('✅ **<2.5F** — Well calibrated')
-    st.markdown('🟡 **2.5-4F** — Acceptable')
-    st.markdown('🔴 **>4F** — Needs attention')
+    st.markdown('✅ <2.5F · 🟡 2.5-4F · 🔴 >4F')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚀 V5.26.2</div>', unsafe_allow_html=True)
-    st.markdown('**Performance patch.**')
-    st.markdown('- Cached `fetch_city_weather` (was uncached — biggest perf win)')
-    st.markdown('- Cached `fetch_nws_forecast`, `fetch_nws_current`, `fetch_obs_high_today`, `fetch_gfs_ensemble`')
-    st.markdown('- Removed duplicate `sb_delete_bet` (was skipping cache bust)')
+    st.markdown('<div class="mph-section-header">🚦 V5.27</div>', unsafe_allow_html=True)
+    st.markdown('Bet frequency reduction.')
+    st.markdown('- Three research-validated gates')
+    st.markdown('- Banner shows ONE pick or skip-day')
+    st.markdown('- Per-city detail with Gate Status')
+    st.markdown('- ~50% of days expected to be skips')
+    st.markdown('- All forecasting infra unchanged')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🔬 V5.26.1</div>', unsafe_allow_html=True)
-    st.markdown('**Measurement, not correction.**')
-    st.markdown('- **📡 Collect All 18 Cities** button')
-    st.markdown('- **Quality Score** per city (🟢/🟡/🔴)')
-    st.markdown('- **Diagnostic Dashboard** at top of app')
-    st.markdown('- **Regime Indicator** — yesterday\'s miss pattern')
-    st.markdown('- **Bet Calibration** — does confidence predict wins?')
-    st.markdown('---')
-    st.caption('V5.26 does NOT change predictions. It tells you when to TRUST them.')
+    st.caption('V5.27 reduces bets — does not change predictions.')
+
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 saved_ladders = load_json(SAVE_FILE)
@@ -1811,11 +1978,11 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.26.2</span>
+                <span class="mph-version-badge">V5.27</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
-                LIVE · Kalshi High Temperature · {today_str}
+                LIVE · Kalshi High Temperature · {today_str} · Three-Gate Selection Active
             </div>
         </div>
         <div style="text-align:right;">
@@ -1904,9 +2071,74 @@ st.markdown(f"""
 import streamlit.components.v1 as components
 components.html('<script>setTimeout(function(){window.location.reload();}, 600000);</script>', height=0)
 
+
+# ── V5.27 Cross-City Evaluation ───────────────────────────────────────────────
+with st.spinner('Running V5.27 three-gate evaluation across all cities...'):
+    v527_eval = evaluate_all_cities_v527(saved_ladders, bankroll=bankroll)
+
+best_overall = v527_eval['best_overall']
+qualifying_picks = v527_eval['qualifying_picks']
+rejected_cities = v527_eval['rejected']
+
+st.markdown('<div class="mph-section-header">🚦 V5.27 — Today\'s Single Best Bet</div>', unsafe_allow_html=True)
+
+if best_overall is None:
+    n_qualifying = len(qualifying_picks)
+    n_evaluated = len(qualifying_picks) + len(rejected_cities)
+    skip_msg = f'No bet passes all three gates today ({n_evaluated} cities evaluated, {n_qualifying} qualifying).'
+    if n_qualifying == 0:
+        skip_msg += ' Skip day — preserve bankroll. Research expects ~50% of days to be skip days.'
+    st.markdown(
+        f'<div style="background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);'
+        f'border:1px dashed #475569;border-radius:12px;padding:18px 24px;margin-bottom:18px;">'
+        f'<div style="color:#94a3b8;font-size:13px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">⏸️ Skip Day</div>'
+        f'<div style="color:#ffffff;font-size:18px;font-weight:600;margin-bottom:4px;">No qualifying bet today</div>'
+        f'<div style="color:#64748b;font-size:13px;">{skip_msg}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+else:
+    bet = best_overall
+    side = bet['side']
+    side_color = '#00ff88' if side == 'YES' else '#00b4d8'
+    st.markdown(
+        f'<div style="background:linear-gradient(135deg,#052e16 0%,#064e3b 100%);'
+        f'border:2px solid #00ff88;border-radius:12px;padding:18px 24px;margin-bottom:18px;">'
+        f'<div style="color:#00ff88;font-size:13px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">'
+        f'✅ Single bet — passes all three gates ({bet["gate_reason"]})</div>'
+        f'<div style="color:#ffffff;font-size:22px;font-weight:700;margin-bottom:6px;">'
+        f'{bet["city"]} · {bet["label"]} · <span style="color:{side_color};">{side}</span> @ {bet["price"]}c</div>'
+        f'<div style="color:#94a3b8;font-size:14px;font-family:\'JetBrains Mono\',monospace;">'
+        f'Edge: <span style="color:#00ff88;">+{bet["edge"]}c</span> · '
+        f'Kelly: <span style="color:#00ff88;">${bet["kelly"]}</span> · '
+        f'Model: {round(bet["model_prob"]*100,1)}% · '
+        f'Trust 🎯: <span style="color:#a78bfa;">{bet["trust_accuracy"]}</span> · '
+        f'Trust 💎: {bet["trust_edge"]}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+# Audit panel
+if rejected_cities or len(qualifying_picks) > 1:
+    with st.expander(f'📋 V5.27 Gate Audit ({len(qualifying_picks)} passing · {len(rejected_cities)} rejected)', expanded=False):
+        st.caption('Diagnostic visibility into why each city was selected or skipped. Verify the gate is firing correctly during the 2-week validation window.')
+        if qualifying_picks:
+            st.markdown('**Cities that passed all three gates:**')
+            for c, pick in sorted(qualifying_picks.items(), key=lambda x: x[1]['trust_accuracy'], reverse=True):
+                marker = '🏆 ' if best_overall and pick['city'] == best_overall['city'] else '   '
+                st.markdown(
+                    f"{marker}**{c}** — {pick['label']} {pick['side']} @ {pick['price']}c · "
+                    f"+{pick['edge']}c · ${pick['kelly']} · Trust 🎯 {pick['trust_accuracy']} · {pick['gate_reason']}"
+                )
+        if rejected_cities:
+            st.markdown('**Cities rejected:**')
+            for c, reason in sorted(rejected_cities.items()):
+                st.markdown(f'- **{c}** — {reason}')
+
+
 with st.expander('🔬 V5.26 Diagnostic Dashboard — Trust the Model?', expanded=False):
     st.caption('This panel measures whether the model deserves your trust today. '
-               'It does NOT change any predictions — it tells you when predictions are likely reliable vs likely flawed.')
+               'It does NOT change any predictions — it tells you when predictions are likely reliable.')
 
     st.markdown('### 📡 Background Data Collection')
     _today_logged = sb_fetch_all() or []
@@ -1916,7 +2148,7 @@ with st.expander('🔬 V5.26 Diagnostic Dashboard — Trust the Model?', expande
 
     bcol1, bcol2 = st.columns([1, 2])
     with bcol1:
-        if st.button(f'📡 Collect All 18 Cities', key='_v526_collect_all', use_container_width=True):
+        if st.button(f'📡 Collect All 18 Cities', key='_v527_collect_all', use_container_width=True):
             try:
                 st.cache_data.clear()
             except Exception: pass
@@ -2097,49 +2329,10 @@ def get_phase_label(tz_key, et_hour):
     if et_hhmm < bet_start: return '⏳ EARLY', '#94a3b8'
     return '', '#64748b'
 
-st.markdown('<div class="mph-section-header">🎯 Best Bets By Timezone Window</div>', unsafe_allow_html=True)
+st.markdown('<div class="mph-section-header">🎯 Best Bets By Timezone Window (V5.27 Gated)</div>', unsafe_allow_html=True)
+st.caption('Only V5.27-qualifying picks shown. Cities not listed did not pass all three gates — see V5.27 Gate Audit above.')
 
-_all_rows_banner = sb_fetch_all()
-_today_rows_banner = {r['city']: r for r in _all_rows_banner if r.get('date') == today_str}
 _et_hour_now = get_et_hour()
-
-_summary_rows = []
-for tz_key, tz_info in TIMEZONE_GROUPS.items():
-    for c in tz_info['cities']:
-        if c in HIDDEN_CITIES: continue
-        row = _today_rows_banner.get(c)
-        if not row: continue
-        consensus_val = row.get('consensus')
-        if consensus_val is None: continue
-        ladder_banner = saved_ladders.get(c, DEFAULT_LADDERS.get(c, ''))
-        cached_markets_banner, _ = get_cached_prices(c)
-        try:
-            best_yes_banner, best_no_banner = get_city_best_signals(
-                city=c, consensus=consensus_val, ladder_text=ladder_banner,
-                ensemble_members=[], kalshi_markets_data=cached_markets_banner,
-                obs_high=row.get('obs_high'), high_uncertainty=row.get('high_uncertainty', False),
-                bankroll=25.0, nbm_percentiles=None,
-                current_temp=None, nws_forecast=row.get('forecast'),
-                local_hour=get_local_hour(c), min_prob=0.10,
-            )
-        except Exception:
-            best_yes_banner, best_no_banner = '—', '—'
-        _summary_rows.append({
-            'city': c, 'consensus': round(consensus_val, 1),
-            'best_yes': best_yes_banner, 'best_no': best_no_banner,
-            'obs_high': row.get('obs_high'),
-        })
-
-if _summary_rows and not is_mobile:
-    with st.expander('📌 Today\'s Model Picks — Summary', expanded=False):
-        st.caption('Quick view of each visible city\'s top signal.')
-        import pandas as pd
-        _df = pd.DataFrame([{
-            'City': r['city'], 'Consensus °F': r['consensus'],
-            'Obs High °F': r['obs_high'] if r['obs_high'] is not None else '—',
-            'Best YES pick': r['best_yes'], 'Best NO pick': r['best_no'],
-        } for r in _summary_rows])
-        st.dataframe(_df, use_container_width=True, hide_index=True)
 
 for tz_key, tz_info in TIMEZONE_GROUPS.items():
     visible_cities_in_tz = [c for c in tz_info['cities'] if c not in HIDDEN_CITIES]
@@ -2148,89 +2341,38 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
     mins_left = minutes_until_close(tz_info['cutoff_et_hour'])
     is_closed = mins_left <= 0
     phase_label, phase_color = get_phase_label(tz_key, _et_hour_now)
-    yes_signals = []
-    no_signals = []
 
-    for c in tz_info['cities']:
-        if c in HIDDEN_CITIES: continue
-        row = _today_rows_banner.get(c)
-        if not row: continue
-        consensus_val = row.get('consensus')
-        ladder = saved_ladders.get(c, DEFAULT_LADDERS.get(c, ''))
-        cached_markets, _ = get_cached_prices(c)
-        obs_h = row.get('obs_high')
-        high_unc = row.get('high_uncertainty', False)
-        try:
-            cached_wx = fetch_city_weather(c)
-            members = cached_wx.get('ensemble_members') if cached_wx else None
-            nbm_pcts = cached_wx.get('nbm_percentiles') if cached_wx else None
-            c_temp = cached_wx.get('current_temp') if cached_wx else None
-            c_fc = cached_wx.get('nws_fc') if cached_wx else None
-            c_hour = cached_wx.get('local_hour', 12) if cached_wx else 12
-        except Exception:
-            members = nbm_pcts = c_temp = c_fc = None; c_hour = 12
+    tz_picks = []
+    for c in visible_cities_in_tz:
+        if c in qualifying_picks:
+            tz_picks.append(qualifying_picks[c])
+    tz_picks.sort(key=lambda p: p['trust_accuracy'], reverse=True)
 
-        city_hist = sb_fetch_city(c)
-        city_complete = [r for r in city_hist if r.get('actual') is not None and r.get('error') is not None]
-        settled_days = len(city_complete)
-        if settled_days < 3: continue
-        city_mae = None
-        if city_complete:
-            recent_14 = city_complete[-14:]
-            city_errors = [abs(r['error']) for r in recent_14]
-            city_mae = round(sum(city_errors) / len(city_errors), 1)
-        red_mae = city_mae is not None and city_mae >= 4.0
-
-        c_nws = row.get('forecast')
-        consensus_nws_gap = abs(consensus_val - c_nws) if consensus_val and c_nws else None
-        big_gap = consensus_nws_gap is not None and consensus_nws_gap > 3.0
-
-        _, price_fetched_at = get_cached_prices(c)
-        price_age_min = round((time.time() - price_fetched_at) / 60) if price_fetched_at else 999
-        if price_age_min > 120: continue
-
-        b_yes, b_no = get_city_best_signals(
-            c, consensus_val, ladder, members, cached_markets, obs_h, high_unc, 500,
-            nbm_percentiles=nbm_pcts, current_temp=c_temp, nws_forecast=c_fc, local_hour=c_hour)
-
-        flags = ''
-        if red_mae: flags += f' ⚠️MAE:{city_mae}F'
-        if big_gap: flags += f' ⚠️Gap:{round(consensus_nws_gap,1)}F'
-
-        if b_yes and b_yes != '—' and '+' in b_yes:
-            try:
-                edge_val = float(b_yes.split('+')[1].split('c')[0])
-                yes_signals.append((edge_val, f'{c}: {b_yes}{flags}', red_mae))
-            except Exception: pass
-        if b_no and b_no != '—' and '+' in b_no:
-            try:
-                edge_val = float(b_no.split('+')[1].split('c')[0])
-                no_signals.append((edge_val, f'{c}: {b_no}{flags}', red_mae))
-            except Exception: pass
-
-    yes_signals.sort(key=lambda x: x[0], reverse=True)
-    no_signals.sort(key=lambda x: x[0], reverse=True)
-
-    city_list_str = ' · '.join([c for c in tz_info['cities'] if c not in HIDDEN_CITIES])
+    city_list_str = ' · '.join(visible_cities_in_tz)
     static = TIMEZONE_STATIC_INFO.get(tz_key, {})
     sweet_spot_str = static.get('sweet_spot', '')
     accuracy_window_str = static.get('accuracy_window', '')
     peak_heat_str = static.get('peak_heat', '')
-    phase_label, phase_color = get_phase_label(tz_key, _et_hour_now)
     phase_html = f'<span style="color:{phase_color}; font-size:12px; font-weight:700; font-family:\'JetBrains Mono\',monospace;">{phase_label}</span>' if phase_label else ''
 
     if is_closed:
-        yes_html = '<div style="color:#ef4444; font-size:12px;">🔴 Window Closed</div>'
-        no_html = '<div style="color:#ef4444; font-size:12px;">🔴 Window Closed</div>'
+        picks_html = '<div style="color:#ef4444; font-size:12px;">🔴 Window Closed</div>'
+    elif not tz_picks:
+        picks_html = '<div style="color:#64748b; font-size:12px; font-style:italic;">— No qualifying bet (gates not satisfied)</div>'
     else:
-        yes_html = ''.join([
-            f'<div style="color:{"#f59e0b" if red_mae else "#00ff88"}; font-size:12px; font-family:\'JetBrains Mono\',monospace; margin-bottom:3px;">{"🟡" if red_mae else "🟢"} {sig}</div>'
-            for _, sig, red_mae in yes_signals
-        ]) or '<div style="color:#64748b; font-size:12px;">— No green YES signal</div>'
-        no_html = ''.join([
-            f'<div style="color:{"#f59e0b" if red_mae else "#00ff88"}; font-size:12px; font-family:\'JetBrains Mono\',monospace; margin-bottom:3px;">{"🟡" if red_mae else "🟢"} {sig}</div>'
-            for _, sig, red_mae in no_signals
-        ]) or '<div style="color:#64748b; font-size:12px;">— No green NO signal</div>'
+        rows = []
+        for p in tz_picks:
+            is_winner = best_overall and p['city'] == best_overall['city']
+            tag = '🏆 ' if is_winner else '🟢 '
+            side_color = '#00ff88' if p['side'] == 'YES' else '#00b4d8'
+            rows.append(
+                f'<div style="color:#00ff88; font-size:12px; font-family:\'JetBrains Mono\',monospace; margin-bottom:3px;">'
+                f'{tag}<strong>{p["city"]}</strong>: {p["label"]} '
+                f'<span style="color:{side_color};">{p["side"]}</span> @ {p["price"]}c · '
+                f'+{p["edge"]}c · ${p["kelly"]} · Trust 🎯 {p["trust_accuracy"]}'
+                f'</div>'
+            )
+        picks_html = ''.join(rows)
 
     st.markdown(f"""
 <div style="background:#0d1b2a; border:1px solid #1e3a5f; border-radius:10px; padding:14px 18px; margin-bottom:12px;">
@@ -2239,19 +2381,13 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
         <span style="color:{status_color}; font-size:12px; font-family:'JetBrains Mono',monospace;">{status_text}</span>
     </div>
     <div style="margin-bottom:2px;">{phase_html}</div>
-    <div style="color:#94a3b8; font-size:11px; margin-bottom:2px; font-family:'JetBrains Mono',monospace;">💎 (Edge) Sweet spot: {sweet_spot_str}</div>
-    <div style="color:#a78bfa; font-size:11px; margin-bottom:2px; font-family:'JetBrains Mono',monospace;">🎯 (Accuracy) Sweet spot: {accuracy_window_str}</div>
+    <div style="color:#94a3b8; font-size:11px; margin-bottom:2px; font-family:'JetBrains Mono',monospace;">💎 Edge sweet spot: {sweet_spot_str}</div>
+    <div style="color:#a78bfa; font-size:11px; margin-bottom:2px; font-family:'JetBrains Mono',monospace;">🎯 Accuracy sweet spot: {accuracy_window_str}</div>
     <div style="color:#00b4d8; font-size:11px; margin-bottom:8px; font-family:'JetBrains Mono',monospace;">🌡️ Peak heat: {peak_heat_str}</div>
     <div style="color:#64748b; font-size:11px; margin-bottom:10px; font-family:'JetBrains Mono',monospace;">{city_list_str}</div>
-    <div style="display:flex; gap:16px; flex-wrap:wrap;">
-        <div style="flex:1; min-width:200px;">
-            <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:6px;">🟢 YES Signals (Model thinks it WILL hit)</div>
-            {yes_html}
-        </div>
-        <div style="flex:1; min-width:200px;">
-            <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:6px;">🔻 NO Signals (Market overpriced · bet NO)</div>
-            {no_html}
-        </div>
+    <div>
+        <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:6px;">V5.27 Qualifying Picks</div>
+        {picks_html}
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -2318,8 +2454,14 @@ if kalshi_markets:
     age_min = round((time.time() - fetched_at) / 60) if fetched_at else 0
     age_str = 'just now' if age_min < 1 else str(age_min) + ' min ago'
     st.success('Live prices loaded — ' + str(len(kalshi_markets)) + ' brackets (fetched ' + age_str + ')')
+    market_top = get_market_top_n(kalshi_markets, n=CONSENSUS_TOP_N)
     for m in kalshi_markets:
-        st.caption(' ' + m[0] + ' | YES: ' + (str(m[1])+'c' if m[1] else 'no price') +
+        rank_tag = ''
+        for i, mt in enumerate(market_top):
+            if labels_match(mt, m[0]):
+                rank_tag = f' 🏷️ Mkt #{i+1}'
+                break
+        st.caption(' ' + m[0] + rank_tag + ' | YES: ' + (str(m[1])+'c' if m[1] else 'no price') +
                    ' | NO: ' + (str(m[2])+'c' if m[2] else 'no price'))
 else:
     st.warning('Could not fetch live prices from Kalshi. Using saved ladder.')
@@ -2377,7 +2519,6 @@ with fr_col2:
         st.markdown(f'<div style="padding:8px 0;color:{age_color};font-size:13px;">Weather last fetched: <strong>{age_str}</strong></div>', unsafe_allow_html=True)
 
 with st.spinner('Fetching weather data...'):
-    _wx_fetch_start = time.time()
     nws_forecast, _ = fetch_nws_forecast(lat, lon)
     noaa_station, noaa_obs, noaa_source, noaa_obs_ts = fetch_nws_current(lat, lon, station)
     obs_high_raw, six_hr_max, obs_high_url = fetch_obs_high_today(obs_icao)
@@ -2511,8 +2652,10 @@ with col4:
         gap_str = f' | NWS gap: {round(nws_forecast - ensemble_mean, 1):+.1f}F' if nws_forecast is not None else ''
         st.metric('GFS Ensemble', str(ensemble_mean)+' F', delta=str(n_members)+' members')
         st.caption(f'Weight: {gfs_weight_pct}%{gap_str}')
-    elif ensemble_suspect: st.metric('GFS Ensemble', 'Discarded'); st.caption('Failed sanity check (>8F from NWS)')
-    else: st.metric('GFS Ensemble', 'Unavailable')
+    elif ensemble_suspect:
+        st.metric('GFS Ensemble', 'Discarded'); st.caption('Failed sanity check (>8F from NWS)')
+    else:
+        st.metric('GFS Ensemble', 'Unavailable')
 
 if nbm_percentiles:
     nbm_p50 = nbm_percentiles.get('p50', nbm_percentiles.get('p25', '—'))
@@ -2525,7 +2668,8 @@ for w in sanity_warnings: st.error('⚠️ ' + w)
 if nws_trend_up and nws_trend_delta is not None:
     st.info(f'📈 NWS forecast trending UP +{nws_trend_delta}F since last fetch — model will boost consensus accordingly.')
 
-if nws_forecast is None: st.error('NWS forecast unavailable — cannot run model.')
+if nws_forecast is None:
+    st.error('NWS forecast unavailable — cannot run model.')
 elif high_uncertainty and source_gap is not None:
     threshold = get_uncertainty_threshold(city)
     st.warning(f'HIGH UNCERTAINTY: NWS ({nws_forecast}F) vs GFS ({ensemble_mean}F) gap = {round(source_gap, 1)}F (threshold: {threshold}F). Green signals suppressed.')
@@ -2599,6 +2743,28 @@ if forecast is not None and current is not None:
                 st.markdown(f'- {r}')
             st.caption('Quality measures whether the model deserves trust today based on recent calibration.')
 
+    # V5.27 Gate Status for this city
+    market_top_city = get_market_top_n(kalshi_markets, n=CONSENSUS_TOP_N) if kalshi_markets else []
+    model_pick_label = model_top_pick(prob_rows)
+    consensus_pass, consensus_reason = passes_consensus_gate(model_pick_label, kalshi_markets)
+    city_pick = qualifying_picks.get(city)
+
+    if city_pick:
+        winner_note = ('🏆 This is also today\'s single best bet across all cities.' if best_overall and best_overall['city'] == city
+                       else (f'Today\'s overall best is {best_overall["city"]}.' if best_overall else ''))
+        st.success(
+            f'🚦 **V5.27 Gate Status: PASS** — Model pick `{model_pick_label}` matches market {consensus_reason}. '
+            f'Recommended bet: **{city_pick["label"]} {city_pick["side"]}** @ {city_pick["price"]}c '
+            f'(+{city_pick["edge"]}c, ${city_pick["kelly"]} Kelly, Trust 🎯 {city_pick["trust_accuracy"]}). ' + winner_note
+        )
+    else:
+        reason = rejected_cities.get(city, 'Unknown')
+        st.warning(
+            f'🚦 **V5.27 Gate Status: REJECTED** — {reason}. '
+            f'Model pick: `{model_pick_label}` · Market top {CONSENSUS_TOP_N}: {market_top_city}. '
+            'No bet recommended for this city today.'
+        )
+
     st.markdown('<div class="mph-section-header">🎯 Model Output</div>', unsafe_allow_html=True)
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
@@ -2650,8 +2816,6 @@ if forecast is not None and current is not None:
     import pandas as pd
     yes_rows = []
     no_rows = []
-    best_bet = best_no_bet = None
-    best_edge = best_no_edge = -999
 
     for label, base_prob in prob_rows:
         ens_prob = next((ensemble_bracket_prob(ensemble_members, lo, hi)
@@ -2703,204 +2867,57 @@ if forecast is not None and current is not None:
             model_pct=(1.0 - final_prob) * 100, yes_ask=no_ask, ensemble_tier=ens_tier_for_trust,
         )
 
+        # V5.27 gate annotation
+        is_market_top = any(labels_match(mt, label) for mt in market_top_city)
+        gate_icon = '🚦' if is_market_top else '🚫'
+
         signal_cell = signal_icon if signal_icon else '—'
         no_signal_cell = no_icon if no_icon else '—'
-        trust_y_edge_cell = str(round(edge_trust_yes, 1)) if edge_trust_yes is not None else '—'
-        trust_n_edge_cell = str(round(edge_trust_no, 1)) if edge_trust_no is not None else '—'
-        trust_y_cell = str(trust_y_score) if trust_y_score is not None else '—'
-        trust_n_cell = str(trust_n_score) if trust_n_score is not None else '—'
 
         yes_rows.append({
             'Signal': signal_cell,
+            'V5.27': gate_icon,
             'Bracket': label + (' BUSTED' if busted else ''),
             'Model %': str(round(final_prob*100, 1))+'%',
             'Mkt %': str(round(yes_ask, 1))+'%' if yes_ask else '—',
             'YES ask': str(yes_ask)+'c' if yes_ask is not None else '—',
             'Edge': edge_str,
             'Kelly': ('$'+str(kelly)) if kelly > 0 else '—',
-            'Trust 💎': trust_y_edge_cell,
-            'Trust 🎯': trust_y_cell,
+            'Trust 💎': str(round(edge_trust_yes,1)) if edge_trust_yes is not None else '—',
+            'Trust 🎯': str(trust_y_score) if trust_y_score is not None else '—',
             'Ensemble': ens_conf,
         })
         no_rows.append({
             'Signal': no_signal_cell,
+            'V5.27': gate_icon,
             'Bracket': label + (' BUSTED' if busted else ''),
             'Model %': str(round(final_prob*100, 1))+'%',
             'Mkt %': str(round(no_ask, 1))+'%' if no_ask else '—',
             'NO ask': str(no_ask)+'c' if no_ask is not None else '—',
             'NO Edge': no_edge_str,
             'Kelly NO': ('$'+str(kelly_no)) if kelly_no > 0 else '—',
-            'Trust 💎': trust_n_edge_cell,
-            'Trust 🎯': trust_n_cell,
+            'Trust 💎': str(round(edge_trust_no,1)) if edge_trust_no is not None else '—',
+            'Trust 🎯': str(trust_n_score) if trust_n_score is not None else '—',
             'Ensemble': ens_conf,
         })
 
-        b_lo_d, b_hi_d = next(((lo, hi) for lbl, lo, hi in parse_ladder(ladder_text)
-                                if labels_match(lbl, label)), (None, None))
-        below_consensus_d = b_hi_d is not None and consensus is not None and b_hi_d < consensus - 2.0
-        above_consensus_d = b_lo_d is not None and consensus is not None and b_lo_d > consensus + 2.0
-        contains_consensus_yes = bracket_contains_consensus(label, consensus, ladder_text, tolerance=1.0)
-
-        if (e is not None and e > best_edge and not busted and signal_icon == '🟢'
-                and final_prob >= 0.10 and not below_consensus_d and contains_consensus_yes):
-            best_edge = e
-            best_bet = {'label': label, 'edge': e, 'kelly': kelly, 'uncertain': high_uncertainty}
-        if busted and no_ask is not None and no_ask <= 5:
-            no_e_for_rank = no_e if no_e is not None else 95
-            if no_e_for_rank > best_no_edge:
-                best_no_edge = no_e_for_rank
-                best_no_bet = {'label': label, 'edge': no_e_for_rank, 'kelly': kelly_no, 'busted': True, 'no_ask': no_ask}
-        elif (no_e is not None and no_e > best_no_edge and no_icon == '🟢'
-              and (1.0 - final_prob) >= 0.10 and not above_consensus_d):
-            best_no_edge = no_e
-            best_no_bet = {'label': label, 'edge': no_e, 'kelly': kelly_no, 'busted': False, 'no_ask': no_ask}
-
     prob_source = '(NBM percentiles)' if used_nbm else '(sigma/normal fallback)'
-
-    def _annotate_dots(rows, best_edge_pick, accuracy_label=None):
-        for r in rows:
-            bracket = r['Bracket'].replace(' BUSTED', '')
-            dots = ''
-            if best_edge_pick and labels_match(bracket, best_edge_pick.get('label', '')):
-                dots = '💎 ' + dots
-            if accuracy_label and labels_match(bracket, accuracy_label):
-                dots = '🎯 ' + dots
-            if dots:
-                r['Signal'] = dots + r['Signal']
-        return rows
-
-    _yes_acc_label = None
-    for r in yes_rows:
-        sig = r.get('Signal', '')
-        ens = r.get('Ensemble', '')
-        if ('🟢' in sig) and '🔵' in ens and 'HIGH' in ens:
-            label_plain = r['Bracket'].replace(' BUSTED', '')
-            model_pct_str = r.get('Model %', '0%').replace('%','')
-            try: model_pct_val = float(model_pct_str)
-            except: model_pct_val = 0
-            trust_str = r.get('Trust 🎯', '—')
-            try: trust_val = float(trust_str)
-            except: trust_val = 0
-            if (trust_val >= 75 and model_pct_val >= 30 and
-                    bracket_contains_consensus(label_plain, consensus, ladder_text, tolerance=1.0)):
-                if _yes_acc_label is None: _yes_acc_label = label_plain
-    _no_acc_label = None
-    for r in no_rows:
-        sig = r.get('Signal', '')
-        ens = r.get('Ensemble', '')
-        if ('🟢' in sig) and '🔵' in ens and 'HIGH' in ens:
-            label_plain = r['Bracket'].replace(' BUSTED', '')
-            model_pct_str = r.get('Model %', '0%').replace('%','')
-            try: model_pct_val = float(model_pct_str)
-            except: model_pct_val = 0
-            trust_str = r.get('Trust 🎯', '—')
-            try: trust_val = float(trust_str)
-            except: trust_val = 0
-            if trust_val >= 75 and model_pct_val >= 30:
-                if _no_acc_label is None: _no_acc_label = label_plain
-
-    yes_rows = _annotate_dots(yes_rows, best_bet, _yes_acc_label)
-    no_rows = _annotate_dots(no_rows, best_no_bet, _no_acc_label)
-
     yes_display = pd.DataFrame(yes_rows)
     no_display = pd.DataFrame(no_rows)
 
     st.markdown(f'#### 🟢 YES Signals {prob_source}')
+    st.caption('🚦 = bracket is in market top 2 (passes V5.27 Gate 1) · 🚫 = blocked by Gate 1')
     st.dataframe(yes_display, use_container_width=True, hide_index=True)
-
 
     st.markdown(f'#### 🔻 NO Signals {prob_source}')
     st.dataframe(no_display, use_container_width=True, hide_index=True)
-
-    def _render_best(side_label, side_suffix, best_pick, trust_map):
-        if not best_pick:
-            st.info(f'No strong {side_label} signal — sit out')
-            return
-        bracket_label = best_pick.get('label', '')
-        ascii_label = bracket_label.replace('°','').replace('—','-').replace('–','-')
-        edge_v = best_pick.get('edge')
-        kelly_v = best_pick.get('kelly')
-        is_busted = best_pick.get('busted', False)
-        msg_lines = []
-        if is_busted:
-            no_ask_busted = best_pick.get('no_ask', '—')
-            msg_lines.append(f'🟢 BET BEST: {ascii_label} NO @ {no_ask_busted}c (BUSTED — guaranteed payout)')
-        else:
-            sign = '+' if edge_v and edge_v > 0 else ''
-            msg_lines.append(f'🟢 BET BEST: {ascii_label} {side_label} | {sign}{edge_v}c edge | ${kelly_v} Kelly')
-        trust_obj = trust_map.get(ascii_label) if trust_map else None
-        if trust_obj is not None:
-            try:
-                msg_lines.append(f'   Trust: {round(trust_obj.composite,1)}/100 ({trust_obj.tier})')
-            except Exception: pass
-        if best_pick.get('uncertain'):
-            msg_lines.append('   ⚠️ HIGH UNCERTAINTY — verify before betting')
-        st.success('\n'.join(msg_lines))
-
-    yes_trust_map = {}
-    no_trust_map = {}
-    for r in yes_rows:
-        bk = r['Bracket'].replace(' BUSTED', '')
-    for label, base_prob in prob_rows:
-        ens_prob = next((ensemble_bracket_prob(ensemble_members, lo, hi)
-                         for lbl, lo, hi in parse_ladder(ladder_text) if labels_match(lbl, label)), None)
-        final_prob = blend_probs(base_prob, ens_prob, ensemble_members, city, nbm_active=used_nbm)
-        ens_conf2 = ensemble_confidence(ens_prob) if ens_prob is not None else ''
-        ens_tier2 = ensemble_tier_from_confidence(ens_conf2)
-        ty = compute_row_trust(city=city, bracket_label=label, direction='YES',
-                               model_pct=final_prob*100, ensemble_tier=ens_tier2,
-                               two_degree_call_str=call or '', mae_color=city_mae_color,
-                               nbm_active=used_nbm, nws_forecast_f=nws_forecast,
-                               gfs_ensemble_f=ensemble_mean, bias_adj_f=bias_correction)
-        tn = compute_row_trust(city=city, bracket_label=label, direction='NO',
-                               model_pct=(1.0-final_prob)*100, ensemble_tier=ens_tier2,
-                               two_degree_call_str=call or '', mae_color=city_mae_color,
-                               nbm_active=used_nbm, nws_forecast_f=nws_forecast,
-                               gfs_ensemble_f=ensemble_mean, bias_adj_f=bias_correction)
-        yes_trust_map[label] = ty
-        no_trust_map[label] = tn
-
-    bcol1, bcol2 = st.columns(2)
-    with bcol1: _render_best('YES', 'yes', best_bet, yes_trust_map)
-    with bcol2: _render_best('NO',  'no',  best_no_bet, no_trust_map)
-
-    with st.expander('🎯 View Trust Score Details (per bracket)', expanded=False):
-        st.caption('Trust scoring breakdown — see what\'s driving each signal.')
-        trust_detail_rows = []
-        for label, base_prob in prob_rows:
-            ens_prob = next((ensemble_bracket_prob(ensemble_members, lo, hi)
-                             for lbl, lo, hi in parse_ladder(ladder_text) if labels_match(lbl, label)), None)
-            final_prob = blend_probs(base_prob, ens_prob, ensemble_members, city, nbm_active=used_nbm)
-            ens_tier2 = ensemble_tier_from_confidence(ensemble_confidence(ens_prob) if ens_prob is not None else '')
-            ty = yes_trust_map.get(label)
-            if ty is None: continue
-            row_detail = {'Bracket': label}
-            try: row_detail['Composite'] = round(ty.composite, 1)
-            except Exception: row_detail['Composite'] = '—'
-            try: row_detail['Tier'] = ty.tier
-            except Exception: row_detail['Tier'] = '—'
-            for fld in ('mode', 'calibration', 'ensemble', 'edge_fit', 'conviction'):
-                try:
-                    val = getattr(ty, fld, None)
-                    if val is None:
-                        row_detail[fld.replace('_',' ').title()] = '—'
-                    elif isinstance(val, (int, float)):
-                        row_detail[fld.replace('_',' ').title()] = round(val, 1)
-                    else:
-                        row_detail[fld.replace('_',' ').title()] = str(val)
-                except Exception:
-                    row_detail[fld.replace('_',' ').title()] = '—'
-            trust_detail_rows.append(row_detail)
-        if trust_detail_rows:
-            st.dataframe(pd.DataFrame(trust_detail_rows), use_container_width=True, hide_index=True)
-        else:
-            st.caption('No trust scores available.')
 
     if kalshi_markets and len(kalshi_markets) < 4:
         st.caption(f'⚠️ Only {len(kalshi_markets)} brackets fetched from Kalshi — coverage may be incomplete.')
 
 else:
     st.error('Cannot run model — missing forecast or current temp.')
+
 
 # ── Calibration & Settlement History ──────────────────────────────────────────
 with st.expander('📊 Calibration & Settlement History', expanded=False):
@@ -2945,6 +2962,7 @@ with st.expander('📊 Calibration & Settlement History', expanded=False):
                 st.metric('Within 2F', f'{within_2:.0f}%')
                 st.caption(f'Within 3F: {within_3:.0f}%')
 
+
 # ── Source Accuracy Report ────────────────────────────────────────────────────
 with st.expander('📈 Source Accuracy Report — Which Source Wins?', expanded=False):
     st.caption('Compare per-source MAE across all settled days. Identifies which input is currently most reliable.')
@@ -2968,6 +2986,7 @@ with st.expander('📈 Source Accuracy Report — Which Source Wins?', expanded=
         if src_rows:
             st.dataframe(pd.DataFrame(src_rows), use_container_width=True, hide_index=True)
             st.caption(f'{len(complete_all)} settled rows across all cities.')
+
 
 # ── Personal Bet Log ──────────────────────────────────────────────────────────
 st.markdown('---')
@@ -3104,4 +3123,4 @@ else:
         st.caption('No bets logged yet. Use the form above to log your first bet.')
 
 st.caption('---')
-st.caption('🌡️ MPH Weather Model V5.26.2 — Performance patch (caching restored, sb_delete_bet dedupe)')
+st.caption('🌡️ MPH Weather Model V5.27 — Three research-validated gates active')
