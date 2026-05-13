@@ -796,7 +796,9 @@ def check_bracket_boundary(consensus, ladder_text, boundary_threshold=0.5):
     return warnings
 
 def check_cold_front_warning(obs_high, current_temp, nws_forecast, local_hour):
-    if obs_high is not None and current_temp is not None:
+    # Cold front warning only fires after 1 PM local. Before that, obs_high vs current_temp
+    # gaps are usually morning fluctuations or sensor blips, not actual frontal passages.
+    if obs_high is not None and current_temp is not None and local_hour >= 13:
         temp_drop = obs_high - current_temp
         if temp_drop >= 5.0:
             msg = (f'⚠️ Peak may already be in: Obs high {obs_high}F but current temp is '
@@ -959,7 +961,7 @@ def fetch_nws_current(lat, lon, station_id):
     temp_c = props.get('temperature', {}).get('value')
     obs_ts = props.get('timestamp')
     if temp_c is None: return sid, None, None, None
-    return sid, float(c_to_f(temp_c)), 'nws_grid', obs_ts
+    return sid, float(c_to_f(temp_c)), 'nws_nearby', obs_ts
 
 def kelly_bet(model_prob, market_price_cents, bankroll, fractional=0.15, max_pct=0.05, max_dollars=100):
     if market_price_cents is None or market_price_cents <= 0 or market_price_cents >= 100: return 0.0
@@ -2631,7 +2633,7 @@ with col2:
             'nws_direct':   ('🟢', 'NWS Direct',   'Fastest METAR ingestion (~1-3 min lag)'),
             'iowa_mesonet': ('🟢', 'Iowa Mesonet', 'Cross-check source (~1-5 min lag)'),
             'wethr_obs':    ('🟡', 'Wethr.net',    'Fallback source (~5-15 min lag)'),
-            'nws_grid':     ('🔴', 'NWS Grid',     'Forecast-derived, NOT real obs — verify manually'),
+            'nws_nearby':   ('🟡', 'NWS Nearby',   'Real obs from nearby NWS station — primary station unavailable'),
         }
         badge = source_badges.get(noaa_source, ('⚪', 'Unknown', ''))
         obs_age_str = ''
@@ -2651,8 +2653,8 @@ with col2:
             except Exception:
                 pass
         st.caption(f'{badge[0]} {badge[1]} · Station: {noaa_station}{age_str}{obs_age_str}')
-        if noaa_source == 'nws_grid':
-            st.error(f'🔴 Current temp from NWS grid (last resort) — {badge[2]}. Verify manually before betting.')
+        if noaa_source == 'nws_nearby':
+            st.caption(f'🟡 {badge[2]}')
         elif noaa_source == 'wethr_obs':
             st.caption(f'🟡 {badge[2]}')
         if stall_warning:
