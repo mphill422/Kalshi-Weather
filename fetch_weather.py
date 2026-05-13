@@ -43,7 +43,9 @@ PAPER_BET_STAKE       = 3.0        # Flat $3 per paper bet
 PRICE_FLOOR_CENTS     = 30         # V5.27 Gate 2
 CONSENSUS_TOP_N       = 2          # V5.27 Gate 1: model pick must be in market top 2
 TRUST_THRESHOLDS      = [75, 80]   # Run both in parallel
-WINDOW_TOLERANCE_MIN  = 2          # Trigger paper logger if within ±2 min of window time
+WINDOW_TOLERANCE_MIN  = 6          # Trigger paper logger if within ±6 min of window time
+                                   # (accommodates GitHub's :00/:10/:20/:30/:40/:50 cron schedule
+                                   # and absorbs GitHub Actions cron drift on the free tier)
 
 # Paper-bet window definitions: UTC time (hh, mm) -> list of (timezone_key, label)
 # Multiple windows can share the same UTC slot (e.g. 15:30 serves ET conv + PT edge).
