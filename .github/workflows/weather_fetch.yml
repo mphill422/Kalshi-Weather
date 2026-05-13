@@ -2,10 +2,13 @@ name: Weather Data Fetch
 
 on:
   schedule:
-    # Every 25 minutes from 9am-5pm ET (14:00-22:00 UTC)
-    # UTC is 5 hours ahead of ET
-    - cron: '0,25,50 14-21 * * *'   # 9:00am - 9:50pm ET (covers open to 5pm ET)
-    - cron: '15,40 14-21 * * *'     # fills the 15/40 minute marks
+    # Every 10 minutes from 9am-5pm ET (14:00-22:00 UTC)
+    # Hits :00, :10, :20, :30, :40, :50 of each hour.
+    # Critical: :30 cron times are required to trigger the V5.27.1 paper-bet
+    # windows at 14:30, 15:30, 16:30, 18:30 UTC (CT EDGE, ET CONV+PT EDGE,
+    # CT CONV+MT EDGE, MT CONV+PT CONV).
+    # Tighter schedule also absorbs GitHub Actions cron drops on free tier.
+    - cron: '0,10,20,30,40,50 14-21 * * *'
   workflow_dispatch:                  # allows manual trigger from GitHub UI
 
 jobs:
