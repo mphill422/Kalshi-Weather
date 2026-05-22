@@ -111,6 +111,16 @@ WETHR_STATIONS = {
     'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KMDW',
 }
 
+# Iowa State CLI station codes for auto-settlement (V5.27.1 cron settlement)
+CLI_STATIONS = {
+    'Phoenix': 'KPHX', 'Las Vegas': 'KLAS', 'Los Angeles': 'KLAX',
+    'Dallas': 'KDFW', 'Austin': 'KAUS', 'Houston': 'KHOU',
+    'Atlanta': 'KATL', 'Miami': 'KMIA', 'New York': 'KNYC',
+    'San Antonio': 'KSAT', 'New Orleans': 'KMSY', 'Philadelphia': 'KPHL',
+    'Boston': 'KBOS', 'Denver': 'KDEN', 'Oklahoma City': 'KOKC',
+    'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KMDW',
+}
+
 # Kalshi series tickers for paper-bet validation (must match Streamlit app).
 SERIES = {
     'Phoenix': 'KXHIGHTPHX', 'Las Vegas': 'KXHIGHTLV',
@@ -996,6 +1006,236 @@ def ensemble_tier_from_prob(prob):
     return 'LOW'
 
 
+# ── V5.27.1 Auto-Settlement (via cron) ────────────────────────────────────────
+# Module-level cache so repeated CLI calls within one run hit the same dict.
+_CLI_CACHE = {}
+
+
+def fetch_cli_max_temp(city, target_date_str):
+    """Fetch actual high from Iowa State CLI JSON API. Returns float or None."""
+    station = CLI_STATIONS.get(city)
+    if not station:
+        return None
+    year = target_date_str[:4]
+    cache_key = station + '_' + year
+    if cache_key not in _CLI_CACHE:
+        try:
+            url = ('https://mesonet.agron.iastate.edu/json/cli.py'
+                   '?station=' + station + '&year=' + year)
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            lookup = {}
+            for entry in data.get('results', []):
+                valid = entry.get('valid', '')
+                high = entry.get('high')
+                if valid and high is not None:
+                    try:
+                        lookup[valid] = float(high)
+                    except Exception:
+                        pass
+            _CLI_CACHE[cache_key] = lookup
+        except Exception:
+            return None
+    return _CLI_CACHE.get(cache_key, {}).get(target_date_str)
+
+
+def bracket_hits(actual_temp, lo, hi):
+    """Returns True if actual_temp lands in [lo, hi] (handles open-ended brackets)."""
+    if actual_temp is None:
+        return None
+    rounded = int(math.floor(float(actual_temp) + 0.5))
+    if lo is None and hi is not None:
+        return rounded <= hi
+    if hi is None and lo is not None:
+        return rounded >= lo
+    if lo is not None and hi is not None:
+        return lo <= rounded <= hi
+    return None
+
+
+def sb_fetch_unsettled_settlements():
+    """Fetch all settlement rows where actual IS NULL."""
+    try:
+        r = requests.get(
+            sb_url('settlements'),
+            headers=sb_headers(),
+            params={'actual': 'is.null', 'order': 'date.asc'},
+            timeout=15,
+        )
+        return r.json() if r.status_code == 200 else []
+    except Exception:
+        return []
+
+
+def sb_update_settlement_actual(row_id, actual, error):
+    """Update settlements.actual + error for a given row id."""
+    try:
+        r = requests.patch(
+            sb_url('settlements') + '?id=eq.' + str(row_id),
+            headers=sb_headers(),
+            json={'actual': round(actual, 2), 'error': error},
+            timeout=10,
+        )
+        return r.status_code in (200, 204)
+    except Exception:
+        return False
+
+
+def sb_fetch_pending_bets():
+    """Fetch all bets where result = 'Pending' or result IS NULL."""
+    try:
+        # PostgREST 'or' filter: result eq Pending OR result is null
+        r = requests.get(
+            sb_url('bets'),
+            headers=sb_headers(),
+            params={'or': '(result.eq.Pending,result.is.null)',
+                    'order': 'date.asc'},
+            timeout=15,
+        )
+        return r.json() if r.status_code == 200 else []
+    except Exception:
+        return []
+
+
+def sb_update_bet_settle(bet_id, updates):
+    """Patch a single bet row with settlement fields."""
+    try:
+        r = requests.patch(
+            sb_url('bets') + '?id=eq.' + str(bet_id),
+            headers=sb_headers(),
+            json=updates,
+            timeout=10,
+        )
+        return r.status_code in (200, 204)
+    except Exception:
+        return False
+
+
+def run_settlement_pass():
+    """Auto-settle predictions and paper bets via Iowa State CLI.
+
+    Two phases:
+      1. Settlement rows: fill in actual + error for dates < today where actual is NULL.
+      2. Paper bets: for any bet matching a now-settled (city, date), compute
+         Won/Lost via bracket logic and update result/profit/payout/actual/settled_at.
+
+    Wrapped in try/except — settlement failures must not break the weather fetch.
+    """
+    print(f'\n=== Settlement Pass ===')
+    try:
+        today = get_eastern_date()
+        # ── Phase 1: settle prediction rows ─────────────────────────────────
+        unsettled = sb_fetch_unsettled_settlements()
+        if not unsettled:
+            print('  No unsettled settlement rows.')
+        else:
+            settled_now = []  # list of (city, date, actual) we just settled
+            for row in unsettled:
+                row_date = row.get('date', '')
+                if not row_date or row_date >= today:
+                    continue  # skip today / future
+                city = row.get('city')
+                if not city:
+                    continue
+                actual = fetch_cli_max_temp(city, row_date)
+                if actual is None:
+                    continue  # CLI doesn't have it yet, try again next cron
+                consensus = row.get('consensus')
+                error = round(actual - consensus, 2) if consensus is not None else None
+                if sb_update_settlement_actual(row['id'], actual, error):
+                    settled_now.append({'city': city, 'date': row_date, 'actual': actual})
+            if settled_now:
+                print(f'  Settled {len(settled_now)} prediction(s):')
+                for s in settled_now:
+                    print(f"    + {s['city']} {s['date']} → actual {s['actual']}°F")
+            else:
+                print(f'  No new predictions settleable yet '
+                      f'({len(unsettled)} pending, CLI data not available).')
+
+        # ── Phase 2: settle paper bets ──────────────────────────────────────
+        pending_bets = sb_fetch_pending_bets()
+        if not pending_bets:
+            print('  No pending bets.')
+            return
+
+        # Build a (city, date) -> actual lookup from settlements table.
+        # We re-fetch settlements (including newly-updated rows) to get fresh actuals.
+        try:
+            r = requests.get(
+                sb_url('settlements'),
+                headers=sb_headers(),
+                params={'actual': 'not.is.null', 'order': 'date.desc',
+                        'limit': '500'},
+                timeout=15,
+            )
+            settled_rows = r.json() if r.status_code == 200 else []
+        except Exception:
+            settled_rows = []
+
+        actuals_map = {}
+        for row in settled_rows:
+            key = (row.get('city'), row.get('date'))
+            actuals_map[key] = row.get('actual')
+
+        settled_bet_count = 0
+        won_count = 0
+        lost_count = 0
+        settled_ts = datetime.now(pytz.timezone('America/New_York')).isoformat()
+
+        for bet in pending_bets:
+            bet_city = bet.get('city')
+            bet_date = bet.get('date')
+            actual = actuals_map.get((bet_city, bet_date))
+            if actual is None:
+                continue  # settlement not ready yet
+            bracket = bet.get('bracket') or bet.get('bracket_label')
+            if not bracket:
+                continue
+            lo, hi = label_to_numeric_key(bracket)
+            hit = bracket_hits(actual, lo, hi)
+            if hit is None:
+                continue
+
+            # Direction: 'YES' bet wins if bracket hit. 'NO' wins if bracket missed.
+            direction = (bet.get('direction') or 'YES').upper()
+            won = hit if direction == 'YES' else (not hit)
+
+            amount = float(bet.get('amount', 0) or 0)
+            price = float(bet.get('price', 0) or 0)
+            if won and price > 0:
+                # Kalshi YES contracts: profit = amount * (100 - price) / price
+                profit = round(amount * (100.0 - price) / price, 2)
+                payout = round(amount + profit, 2)
+            else:
+                profit = round(-amount, 2)
+                payout = 0.0
+
+            updates = {
+                'result': 'Won' if won else 'Lost',
+                'profit': profit,
+                'payout': payout,
+                'actual': round(float(actual), 2),
+                'settled_at': settled_ts,
+            }
+            if sb_update_bet_settle(bet['id'], updates):
+                settled_bet_count += 1
+                if won:
+                    won_count += 1
+                else:
+                    lost_count += 1
+
+        if settled_bet_count:
+            print(f'  Settled {settled_bet_count} paper bet(s): '
+                  f'{won_count} won, {lost_count} lost.')
+        else:
+            print(f'  No paper bets settleable yet '
+                  f'({len(pending_bets)} pending).')
+
+    except Exception as e:
+        print(f'  ⚠️ Settlement pass error (non-fatal): {e}')
+
+
 # ── V5.27.1 Paper-Bet Validator ──────────────────────────────────────────────
 def is_window_time(utc_now):
     """Returns list of (timezone_key, window_label) for windows currently firing,
@@ -1334,6 +1574,11 @@ def main():
         print(f'\nTotal paper bets logged this run: {len(all_logged)}')
     elif firing_windows and not _TRUST_AVAILABLE:
         print('\n⚠️ Paper-bet window firing but trust_score module unavailable — SKIPPED')
+
+    # ── Stage 3: Auto-settlement (runs every cron tick) ──────────────────────
+    # Settles prior-day predictions + paper bets via Iowa State CLI.
+    # Wrapped internally so failures here never affect the weather fetch result.
+    run_settlement_pass()
 
     # V5.27.1: do not exit(1) on partial failures.
     # Some cities failing NWS does not invalidate the run for the rest.
