@@ -499,7 +499,9 @@ def fetch_gfs_ensemble(city):
                          params=params, headers=HEADERS, timeout=20)
         r.raise_for_status()
         data = r.json()
-    except Exception:
+    except Exception as e:
+        # V5.27.1 diag: was previously silent. Identifies HTTP/network failures.
+        print(f'    ⚠️ [{city}] GFS ensemble fetch FAILED (network/HTTP): {type(e).__name__}: {str(e)[:120]}')
         return None, None
     today = get_eastern_date()
     hourly = data.get('hourly', {})
@@ -509,6 +511,11 @@ def fetch_gfs_ensemble(city):
     if not today_indices:
         today_indices = [i for i, t in enumerate(times) if t.startswith(today)]
     if not today_indices:
+        # V5.27.1 diag: time series returned but none of the timestamps match today.
+        # Often timezone-related (auto-resolves to a local TZ whose date != Eastern).
+        sample_times = times[:3] if times else []
+        print(f'    ⚠️ [{city}] GFS ensemble NO TODAY MATCH: looking for "{today}", '
+              f'series has {len(times)} entries, sample: {sample_times}')
         return None, None
     member_maxes = []
     for key, vals in hourly.items():
@@ -521,6 +528,12 @@ def fetch_gfs_ensemble(city):
             except Exception:
                 pass
     if len(member_maxes) < 3:
+        # V5.27.1 diag: ensemble grid is sparse at this lat/lon (or ensemble keys
+        # weren't named as expected). Counts of named ensemble member keys.
+        member_key_count = sum(1 for k in hourly.keys()
+                               if k != 'time' and 'temperature_2m' in k)
+        print(f'    ⚠️ [{city}] GFS ensemble SPARSE GRID: got {len(member_maxes)} member maxes '
+              f'(need ≥3); response had {member_key_count} ensemble keys total')
         return None, None
     return member_maxes, round(sum(member_maxes) / len(member_maxes), 1)
 
