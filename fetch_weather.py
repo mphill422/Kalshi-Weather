@@ -1,5 +1,5 @@
 """
-fetch_weather.py — MPH Weather Model V5.27.1
+fetch_weather.py — MPH Weather Model V5.27.2
 Scheduled weather fetcher + paper-bet validator for GitHub Actions.
 
 Runs every 25 minutes from 9am-5pm ET via GitHub Actions cron.
@@ -36,7 +36,7 @@ SUPABASE_URL  = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY  = os.environ.get('SUPABASE_KEY', '')
 
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
-HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.27.1', 'Accept': 'application/json'}
+HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.27.2', 'Accept': 'application/json'}
 
 # ── V5.27.1 Validator Configuration ──────────────────────────────────────────
 PAPER_BET_STAKE       = 3.0        # Flat $3 per paper bet
@@ -494,14 +494,32 @@ def fetch_gfs_ensemble(city):
         'timezone': 'auto', 'forecast_days': 2,
         'models': 'gfs_seamless',
     }
-    try:
-        r = requests.get('https://ensemble-api.open-meteo.com/v1/ensemble',
-                         params=params, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        # V5.27.1 diag: was previously silent. Identifies HTTP/network failures.
-        print(f'    ⚠️ [{city}] GFS ensemble fetch FAILED (network/HTTP): {type(e).__name__}: {str(e)[:120]}')
+    # V5.27.2: timeout raised 20s → 45s + 1 retry on timeout (Open-Meteo
+    # ensemble endpoint can legitimately take 30s+ under load).
+    data = None
+    for attempt in (1, 2):
+        try:
+            r = requests.get('https://ensemble-api.open-meteo.com/v1/ensemble',
+                             params=params, headers=HEADERS, timeout=45)
+            r.raise_for_status()
+            data = r.json()
+            if attempt == 2:
+                print(f'    ✅ [{city}] GFS ensemble recovered on retry')
+            break
+        except requests.exceptions.Timeout as e:
+            if attempt == 1:
+                print(f'    … [{city}] GFS ensemble timeout (attempt 1/2), retrying once')
+                continue
+            else:
+                print(f'    ⚠️ [{city}] GFS ensemble fetch FAILED (timeout after retry): '
+                      f'{type(e).__name__}: {str(e)[:120]}')
+                return None, None
+        except Exception as e:
+            # Non-timeout errors (HTTP 4xx/5xx, JSON parse, etc.) — don't retry.
+            print(f'    ⚠️ [{city}] GFS ensemble fetch FAILED (network/HTTP): '
+                  f'{type(e).__name__}: {str(e)[:120]}')
+            return None, None
+    if data is None:
         return None, None
     today = get_eastern_date()
     hourly = data.get('hourly', {})
@@ -1464,7 +1482,7 @@ def main():
     now_et = datetime.now(pytz.timezone('America/New_York'))
     utc_now = datetime.utcnow()
 
-    print(f'\n=== V5.27.1 Weather Fetch Run ===')
+    print(f'\n=== V5.27.2 Weather Fetch Run ===')
     print(f'Date: {today} | ET: {now_et.strftime("%I:%M %p ET")} | UTC: {utc_now.strftime("%H:%M")}')
     print(f'Cities: {len(CITIES)} (all 18 including hidden)\n')
 
