@@ -1,23 +1,27 @@
 """
-fetch_weather.py — MPH Weather Model V5.27.2
+fetch_weather.py — MPH Weather Model V5.28
 Scheduled weather fetcher + paper-bet validator for GitHub Actions.
 
-Runs every 25 minutes from 9am-5pm ET via GitHub Actions cron.
+V5.28 changes from V5.27.2:
+  - BLOCK NO bets on the model's TOP bracket (calibration fix). Reason: the model
+    identifies the most-likely bracket and then bets AGAINST it on the NO side
+    because sigma-CDF math caps top-bracket probability at ~35% even when actual
+    bracket-hit rate is 85%+. Model's own top pick is the direction it believes —
+    betting NO against it is internally inconsistent.
+  - Empirical: 75 NO bets, 40% win rate, -$75 profit vs 49 YES bets, 55% win
+    rate, +$21 profit on same brackets in clean-cutoff validation (May 22–Jun 1).
+  - BUSTED brackets (obs_high already > bracket ceiling) keep their auto-fire NO
+    behavior — those are mechanically impossible, not calibration.
+  - Strategy tag prefix bumped V527_ → V528_ so post-fix bets are easy to filter.
+  - Proper sigma recalibration per-city MAE deferred to V5.29 research.
 
-Two responsibilities per run:
-  1. Fetch weather data for all 18 cities, compute consensus, upsert to settlements.
-  2. If current UTC time is within ±2 min of a paper-bet window (14:00, 14:30,
-     15:30, 16:30, 18:30 UTC), run the V5.27.1 three-gate evaluation and log
-     qualifying paper bets across 8 strategy tags.
+V5.27.2 (still active):
+  - GFS ensemble timeout 20s → 45s + 1 retry on timeout
+  - Diagnostic logging on all 3 ensemble failure modes
 
-V5.27.1 changes from V5.19:
-  - All 18 cities (was 10)
-  - Obs-high threshold tightened 15F -> 10F (May 11 KNYC sensor-spike pattern)
-  - Miami routed to nws_only (14-day MAE: -2.04F hot bias, 0.73F worse)
-  - Removed Miami +2.5F warm offset (V5.19 artifact that conflicts with V5.27.1)
-  - NBM percentile fetch added for probabilistic bracket probs
-  - Removed exit(1) on partial failures — log warning, complete the run
-  - Paper-bet validator integrated (8 strategy tags, T75 + T80 in parallel)
+V5.27.1 (still active):
+  - All 18 cities, obs-high 10F threshold, NBM percentiles, settlement-via-cron,
+    paper-bet validator with 8 strategy tags, Miami nws_only routing.
 """
 
 import math
@@ -30,25 +34,21 @@ from datetime import datetime, timedelta
 
 import pytz
 
-# ── Credentials from GitHub Secrets ──────────────────────────────────────────
+# ── Credentials ──────────────────────────────────────────────────────────────
 WETHR_API_KEY = os.environ.get('WETHR_API_KEY', '')
 SUPABASE_URL  = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY  = os.environ.get('SUPABASE_KEY', '')
 
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
-HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.27.2', 'Accept': 'application/json'}
+HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.28', 'Accept': 'application/json'}
 
-# ── V5.27.1 Validator Configuration ──────────────────────────────────────────
-PAPER_BET_STAKE       = 3.0        # Flat $3 per paper bet
-PRICE_FLOOR_CENTS     = 30         # V5.27 Gate 2
-CONSENSUS_TOP_N       = 2          # V5.27 Gate 1: model pick must be in market top 2
-TRUST_THRESHOLDS      = [75, 80]   # Run both in parallel
-WINDOW_TOLERANCE_MIN  = 6          # Trigger paper logger if within ±6 min of window time
-                                   # (accommodates GitHub's :00/:10/:20/:30/:40/:50 cron schedule
-                                   # and absorbs GitHub Actions cron drift on the free tier)
+# ── Validator Configuration ──────────────────────────────────────────────────
+PAPER_BET_STAKE       = 3.0
+PRICE_FLOOR_CENTS     = 30
+CONSENSUS_TOP_N       = 2
+TRUST_THRESHOLDS      = [75, 80]
+WINDOW_TOLERANCE_MIN  = 6
 
-# Paper-bet window definitions: UTC time (hh, mm) -> list of (timezone_key, label)
-# Multiple windows can share the same UTC slot (e.g. 15:30 serves ET conv + PT edge).
 WINDOW_SCHEDULE = {
     (14,  0): [('ET', 'EDGE')],
     (14, 30): [('CT', 'EDGE')],
@@ -57,9 +57,6 @@ WINDOW_SCHEDULE = {
     (18, 30): [('MT', 'CONVICTION'), ('PT', 'CONVICTION')],
 }
 
-# Map each timezone key to its city list (all 18 cities, including hidden ones).
-# Hidden flag is preserved but doesn't filter the validator — all cities get
-# evaluated per spec.
 TZ_CITIES = {
     'ET': ['New York', 'Boston', 'Philadelphia', 'Washington DC', 'Atlanta', 'Miami'],
     'CT': ['Chicago', 'Dallas', 'Austin', 'Houston', 'San Antonio',
@@ -68,7 +65,6 @@ TZ_CITIES = {
     'PT': ['Phoenix', 'Las Vegas', 'Los Angeles'],
 }
 
-# ── Cities & locations (all 18) ──────────────────────────────────────────────
 CITY_TZ = {
     'Phoenix': 'America/Phoenix', 'Las Vegas': 'America/Los_Angeles',
     'Los Angeles': 'America/Los_Angeles', 'Dallas': 'America/Chicago',
@@ -111,7 +107,6 @@ WETHR_STATIONS = {
     'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KMDW',
 }
 
-# Iowa State CLI station codes for auto-settlement (V5.27.1 cron settlement)
 CLI_STATIONS = {
     'Phoenix': 'KPHX', 'Las Vegas': 'KLAS', 'Los Angeles': 'KLAX',
     'Dallas': 'KDFW', 'Austin': 'KAUS', 'Houston': 'KHOU',
@@ -121,7 +116,6 @@ CLI_STATIONS = {
     'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KMDW',
 }
 
-# Kalshi series tickers for paper-bet validation (must match Streamlit app).
 SERIES = {
     'Phoenix': 'KXHIGHTPHX', 'Las Vegas': 'KXHIGHTLV',
     'Los Angeles': 'KXHIGHLAX', 'Dallas': 'KXHIGHTDAL',
@@ -134,34 +128,19 @@ SERIES = {
     'Washington DC': 'KXHIGHTDC', 'Chicago': 'KXHIGHCHI',
 }
 
-# V5.27.1 — Miami routed to nws_only (14-day MAE: -2.04F hot, 0.73F worse than nws_only)
 CITY_PREDICTION_MODE = {
-    'New York':      'full_blend',
-    'Houston':       'full_blend',
-    'Dallas':        'full_blend',
-    'Los Angeles':   'full_blend',
-    'Phoenix':       'full_blend',
-    'Las Vegas':     'full_blend',
-    'Boston':        'full_blend',
-    'Philadelphia':  'full_blend',
-    'Miami':         'nws_only',
-    'New Orleans':   'nws_only',
-    'Washington DC': 'nws_only',
-    'Atlanta':       'nws_only',
-    'Oklahoma City': 'nws_only',
-    'Chicago':       'nws_only',
-    'Denver':        'nws_only',
-    'Austin':        'nws_only',
-    'Minneapolis':   'nws_only',
-    'San Antonio':   'nws_only',
+    'New York':      'full_blend', 'Houston':       'full_blend',
+    'Dallas':        'full_blend', 'Los Angeles':   'full_blend',
+    'Phoenix':       'full_blend', 'Las Vegas':     'full_blend',
+    'Boston':        'full_blend', 'Philadelphia':  'full_blend',
+    'Miami':         'nws_only',   'New Orleans':   'nws_only',
+    'Washington DC': 'nws_only',   'Atlanta':       'nws_only',
+    'Oklahoma City': 'nws_only',   'Chicago':       'nws_only',
+    'Denver':        'nws_only',   'Austin':        'nws_only',
+    'Minneapolis':   'nws_only',   'San Antonio':   'nws_only',
 }
 
-# V5.27.1 — Miami warm offset REMOVED (V5.19 artifact; conflicts with nws_only routing).
-# Only Phoenix and Las Vegas retain structural offsets.
-CITY_WARM_OFFSET = {
-    'Phoenix':    1.0,
-    'Las Vegas': -1.0,
-}
+CITY_WARM_OFFSET = {'Phoenix': 1.0, 'Las Vegas': -1.0}
 
 FORECAST_HEAVY_CITIES = {'Dallas', 'Austin', 'Houston', 'San Antonio', 'Oklahoma City'}
 DESERT_CITIES         = {'Phoenix', 'Las Vegas'}
@@ -184,15 +163,11 @@ BASE_SIGMA = {
     'Oklahoma City': 2.5, 'Chicago': 2.1,
 }
 
-NWS_BIAS_BOOST_CITIES = {
-    'Washington DC', 'Oklahoma City', 'Denver', 'Austin', 'San Antonio',
-}
+NWS_BIAS_BOOST_CITIES = {'Washington DC', 'Oklahoma City', 'Denver', 'Austin', 'San Antonio'}
 NWS_BIAS_BOOST_MULTIPLIER = 1.2
 
-OBS_HIGH_TRUST_HOUR    = 13
-OBS_HIGH_MAX_OVERSHOOT = 10.0
-
-# V5.27.1 sanity thresholds (was 15.0 in V5.19)
+OBS_HIGH_TRUST_HOUR              = 13
+OBS_HIGH_MAX_OVERSHOOT           = 10.0
 OBS_HIGH_OVER_CURRENT_THRESHOLD  = 10.0
 OBS_HIGH_OVER_FORECAST_THRESHOLD = 12.0
 
@@ -247,7 +222,7 @@ def labels_match(a, b):
     return label_to_numeric_key(a) == label_to_numeric_key(b)
 
 
-# ── Supabase helpers ──────────────────────────────────────────────────────────
+# ── Supabase ──────────────────────────────────────────────────────────────────
 def sb_headers():
     return {
         'apikey': SUPABASE_KEY,
@@ -294,7 +269,6 @@ def sb_upsert(city, consensus, forecast, ensemble_mean, source_gap,
     }
     if existing:
         update = {k: v for k, v in row.items() if k not in ('date', 'city')}
-        # Preserve actual/error if already settled
         if existing.get('actual') is not None:
             update.pop('actual', None)
             update.pop('error', None)
@@ -308,7 +282,6 @@ def sb_upsert(city, consensus, forecast, ensemble_mean, source_gap,
 
 
 def sb_insert_paper_bet(bet_row):
-    """Insert a paper bet into the bets table. Returns True on success."""
     try:
         r = requests.post(sb_url('bets'), headers=sb_headers(), json=bet_row, timeout=10)
         return r.status_code in (200, 201)
@@ -318,8 +291,6 @@ def sb_insert_paper_bet(bet_row):
 
 
 def sb_count_paper_bets_today(city, strategy_tag):
-    """Check if a paper bet with this tag already exists for this city today.
-    Returns count. Used for dedup so reruns of the same cron don't double-log."""
     today = get_eastern_date()
     try:
         r = requests.get(
@@ -340,12 +311,11 @@ def sb_count_paper_bets_today(city, strategy_tag):
         return 0
 
 
-# ── Bias correction (mirrors streamlit_app.py compute_bias_correction_db) ────
+# ── Bias correction ──────────────────────────────────────────────────────────
 def compute_bias_correction(city, n_recent=10):
     rows = sb_fetch_city(city)
     complete = [r for r in rows if r.get('actual') is not None and r.get('consensus') is not None]
     if len(complete) < 3:
-        # Regional fallback (Chicago borrows from Minneapolis)
         prior_city = REGIONAL_PRIOR_BIAS.get(city)
         if prior_city:
             prior_rows = sb_fetch_city(prior_city)
@@ -404,7 +374,6 @@ def fetch_nws_grid(lat, lon):
 def fetch_nws_forecast(city):
     station = WETHR_STATIONS.get(city)
     today = get_eastern_date()
-    # Wethr.net primary
     if station:
         try:
             r = requests.get(
@@ -418,7 +387,6 @@ def fetch_nws_forecast(city):
                     return round(float(high), 1)
         except Exception:
             pass
-    # NWS direct fallback
     coords = CITIES[city]
     grid = fetch_nws_grid(coords['lat'], coords['lon'])
     if not grid:
@@ -483,7 +451,7 @@ def fetch_obs_high(city):
     return None
 
 
-# ── GFS ensemble ──────────────────────────────────────────────────────────────
+# ── GFS ensemble (V5.27.2: 45s timeout + retry) ──────────────────────────────
 def fetch_gfs_ensemble(city):
     coords = CITIES[city]
     lat, lon = coords['lat'], coords['lon']
@@ -494,8 +462,6 @@ def fetch_gfs_ensemble(city):
         'timezone': 'auto', 'forecast_days': 2,
         'models': 'gfs_seamless',
     }
-    # V5.27.2: timeout raised 20s → 45s + 1 retry on timeout (Open-Meteo
-    # ensemble endpoint can legitimately take 30s+ under load).
     data = None
     for attempt in (1, 2):
         try:
@@ -515,7 +481,6 @@ def fetch_gfs_ensemble(city):
                       f'{type(e).__name__}: {str(e)[:120]}')
                 return None, None
         except Exception as e:
-            # Non-timeout errors (HTTP 4xx/5xx, JSON parse, etc.) — don't retry.
             print(f'    ⚠️ [{city}] GFS ensemble fetch FAILED (network/HTTP): '
                   f'{type(e).__name__}: {str(e)[:120]}')
             return None, None
@@ -529,8 +494,6 @@ def fetch_gfs_ensemble(city):
     if not today_indices:
         today_indices = [i for i, t in enumerate(times) if t.startswith(today)]
     if not today_indices:
-        # V5.27.1 diag: time series returned but none of the timestamps match today.
-        # Often timezone-related (auto-resolves to a local TZ whose date != Eastern).
         sample_times = times[:3] if times else []
         print(f'    ⚠️ [{city}] GFS ensemble NO TODAY MATCH: looking for "{today}", '
               f'series has {len(times)} entries, sample: {sample_times}')
@@ -546,8 +509,6 @@ def fetch_gfs_ensemble(city):
             except Exception:
                 pass
     if len(member_maxes) < 3:
-        # V5.27.1 diag: ensemble grid is sparse at this lat/lon (or ensemble keys
-        # weren't named as expected). Counts of named ensemble member keys.
         member_key_count = sum(1 for k in hourly.keys()
                                if k != 'time' and 'temperature_2m' in k)
         print(f'    ⚠️ [{city}] GFS ensemble SPARSE GRID: got {len(member_maxes)} member maxes '
@@ -556,7 +517,7 @@ def fetch_gfs_ensemble(city):
     return member_maxes, round(sum(member_maxes) / len(member_maxes), 1)
 
 
-# ── NBM percentile fetch (V5.27.1 addition; mirrors streamlit_app.py) ────────
+# ── NBM percentile fetch ──────────────────────────────────────────────────────
 def fetch_nbm_percentiles(city):
     station = WETHR_STATIONS.get(city)
     if not station:
@@ -615,7 +576,7 @@ def fetch_nbm_percentiles(city):
         return None
 
 
-# ── Consensus computation (mirrors streamlit_app.py V5.27.1) ─────────────────
+# ── Consensus ────────────────────────────────────────────────────────────────
 def choose_sigma(city, obs_high=None, forecast=None):
     s = BASE_SIGMA.get(city, 2.1)
     local_hour = get_local_hour(city)
@@ -668,7 +629,6 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
             consensus = max(base, late_day_floor(fc, obs, local_hour, city))
         else:
             consensus = base
-        # obs_high override
         if obs_high is not None and obs_high > consensus:
             trusted = True
             if local_hour < OBS_HIGH_TRUST_HOUR:
@@ -758,7 +718,6 @@ def nbm_bracket_prob(nbm, lo, hi, obs_high=None):
 
 
 def bracket_probs(consensus, ladder_text, city, nbm, obs_high=None, forecast=None):
-    """Returns list of (label, prob), sorted by prob desc, plus used_nbm flag."""
     used_nbm = bool(nbm and len(nbm) >= 2)
     rows = []
     if used_nbm:
@@ -855,7 +814,7 @@ def two_degree_call(mu, ladder_text, obs_high=None):
     return best_label
 
 
-# ── Kalshi market fetch (paper validator only — predictions don't need this) ─
+# ── Kalshi market fetch ──────────────────────────────────────────────────────
 def get_eastern_datetime():
     return datetime.now(pytz.timezone('America/New_York'))
 
@@ -985,9 +944,7 @@ def get_market_top_n(kalshi_markets, n=CONSENSUS_TOP_N):
     return [label for label, _ in priced[:n]]
 
 
-# ── Trust score (imported from trust_score.py in repo) ───────────────────────
-# This must match streamlit_app.py's compute_row_trust() exactly, since the
-# Trust 🎯 threshold (75/80) is the validator's primary gate.
+# ── Trust score ──────────────────────────────────────────────────────────────
 try:
     from trust_score import SignalInputs, compute_trust_score, bracket_midpoint_from_label
     _TRUST_AVAILABLE = True
@@ -1000,7 +957,6 @@ except Exception as e:
 def compute_row_trust(city, bracket_label, direction, model_pct, ensemble_tier,
                       two_degree_call_str, mae_color, nbm_active,
                       nws_forecast_f, gfs_ensemble_f, bias_adj_f):
-    """Mirrors streamlit_app.py compute_row_trust(). Returns composite score 0-100 or None."""
     if not _TRUST_AVAILABLE:
         return None
     try:
@@ -1037,13 +993,11 @@ def ensemble_tier_from_prob(prob):
     return 'LOW'
 
 
-# ── V5.27.1 Auto-Settlement (via cron) ────────────────────────────────────────
-# Module-level cache so repeated CLI calls within one run hit the same dict.
+# ── Auto-Settlement ──────────────────────────────────────────────────────────
 _CLI_CACHE = {}
 
 
 def fetch_cli_max_temp(city, target_date_str):
-    """Fetch actual high from Iowa State CLI JSON API. Returns float or None."""
     station = CLI_STATIONS.get(city)
     if not station:
         return None
@@ -1072,7 +1026,6 @@ def fetch_cli_max_temp(city, target_date_str):
 
 
 def bracket_hits(actual_temp, lo, hi):
-    """Returns True if actual_temp lands in [lo, hi] (handles open-ended brackets)."""
     if actual_temp is None:
         return None
     rounded = int(math.floor(float(actual_temp) + 0.5))
@@ -1086,7 +1039,6 @@ def bracket_hits(actual_temp, lo, hi):
 
 
 def sb_fetch_unsettled_settlements():
-    """Fetch all settlement rows where actual IS NULL."""
     try:
         r = requests.get(
             sb_url('settlements'),
@@ -1100,7 +1052,6 @@ def sb_fetch_unsettled_settlements():
 
 
 def sb_update_settlement_actual(row_id, actual, error):
-    """Update settlements.actual + error for a given row id."""
     try:
         r = requests.patch(
             sb_url('settlements') + '?id=eq.' + str(row_id),
@@ -1114,9 +1065,7 @@ def sb_update_settlement_actual(row_id, actual, error):
 
 
 def sb_fetch_pending_bets():
-    """Fetch all bets where result = 'Pending' or result IS NULL."""
     try:
-        # PostgREST 'or' filter: result eq Pending OR result is null
         r = requests.get(
             sb_url('bets'),
             headers=sb_headers(),
@@ -1130,7 +1079,6 @@ def sb_fetch_pending_bets():
 
 
 def sb_update_bet_settle(bet_id, updates):
-    """Patch a single bet row with settlement fields."""
     try:
         r = requests.patch(
             sb_url('bets') + '?id=eq.' + str(bet_id),
@@ -1144,34 +1092,24 @@ def sb_update_bet_settle(bet_id, updates):
 
 
 def run_settlement_pass():
-    """Auto-settle predictions and paper bets via Iowa State CLI.
-
-    Two phases:
-      1. Settlement rows: fill in actual + error for dates < today where actual is NULL.
-      2. Paper bets: for any bet matching a now-settled (city, date), compute
-         Won/Lost via bracket logic and update result/profit/payout/actual/settled_at.
-
-    Wrapped in try/except — settlement failures must not break the weather fetch.
-    """
     print(f'\n=== Settlement Pass ===')
     try:
         today = get_eastern_date()
-        # ── Phase 1: settle prediction rows ─────────────────────────────────
         unsettled = sb_fetch_unsettled_settlements()
         if not unsettled:
             print('  No unsettled settlement rows.')
         else:
-            settled_now = []  # list of (city, date, actual) we just settled
+            settled_now = []
             for row in unsettled:
                 row_date = row.get('date', '')
                 if not row_date or row_date >= today:
-                    continue  # skip today / future
+                    continue
                 city = row.get('city')
                 if not city:
                     continue
                 actual = fetch_cli_max_temp(city, row_date)
                 if actual is None:
-                    continue  # CLI doesn't have it yet, try again next cron
+                    continue
                 consensus = row.get('consensus')
                 error = round(actual - consensus, 2) if consensus is not None else None
                 if sb_update_settlement_actual(row['id'], actual, error):
@@ -1184,14 +1122,11 @@ def run_settlement_pass():
                 print(f'  No new predictions settleable yet '
                       f'({len(unsettled)} pending, CLI data not available).')
 
-        # ── Phase 2: settle paper bets ──────────────────────────────────────
         pending_bets = sb_fetch_pending_bets()
         if not pending_bets:
             print('  No pending bets.')
             return
 
-        # Build a (city, date) -> actual lookup from settlements table.
-        # We re-fetch settlements (including newly-updated rows) to get fresh actuals.
         try:
             r = requests.get(
                 sb_url('settlements'),
@@ -1219,7 +1154,7 @@ def run_settlement_pass():
             bet_date = bet.get('date')
             actual = actuals_map.get((bet_city, bet_date))
             if actual is None:
-                continue  # settlement not ready yet
+                continue
             bracket = bet.get('bracket') or bet.get('bracket_label')
             if not bracket:
                 continue
@@ -1228,14 +1163,12 @@ def run_settlement_pass():
             if hit is None:
                 continue
 
-            # Direction: 'YES' bet wins if bracket hit. 'NO' wins if bracket missed.
             direction = (bet.get('direction') or 'YES').upper()
             won = hit if direction == 'YES' else (not hit)
 
             amount = float(bet.get('amount', 0) or 0)
             price = float(bet.get('price', 0) or 0)
             if won and price > 0:
-                # Kalshi YES contracts: profit = amount * (100 - price) / price
                 profit = round(amount * (100.0 - price) / price, 2)
                 payout = round(amount + profit, 2)
             else:
@@ -1267,10 +1200,8 @@ def run_settlement_pass():
         print(f'  ⚠️ Settlement pass error (non-fatal): {e}')
 
 
-# ── V5.27.1 Paper-Bet Validator ──────────────────────────────────────────────
+# ── Paper-Bet Validator (V5.28: NO blocked on top bracket) ───────────────────
 def is_window_time(utc_now):
-    """Returns list of (timezone_key, window_label) for windows currently firing,
-    or empty list if outside any window's tolerance."""
     firing = []
     for (h, m), tz_window_list in WINDOW_SCHEDULE.items():
         window_dt = utc_now.replace(hour=h, minute=m, second=0, microsecond=0)
@@ -1281,15 +1212,12 @@ def is_window_time(utc_now):
 
 
 def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction):
-    """Run V5.27.1 three-gate evaluation for one city.
-    Returns dict with model_pick info + Trust scores, or None if Gate 1 fails."""
     nws_fc = weather_data.get('nws_fc')
     obs_high = weather_data.get('obs_high')
     ensemble_members = weather_data.get('ensemble_members')
     ensemble_mean = weather_data.get('ensemble_mean')
     nbm = weather_data.get('nbm')
 
-    # Fetch live Kalshi markets
     series = SERIES.get(city)
     if not series:
         return None
@@ -1297,21 +1225,17 @@ def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction):
     if not kalshi_markets or len(kalshi_markets) < 2:
         return None
 
-    # Build ladder from Kalshi market labels
     ladder_text = ' | '.join(normalize_label(m[0]) for m in kalshi_markets)
 
-    # Compute bracket probabilities (NBM-aware)
     prob_rows, used_nbm = bracket_probs(consensus, ladder_text, city, nbm,
                                          obs_high=obs_high, forecast=nws_fc)
     prob_rows = apply_prob_floor(prob_rows, consensus, ladder_text)
     if not prob_rows:
         return None
 
-    # Model pick = highest base probability bracket
     model_pick_label = prob_rows[0][0]
     target_base_prob = prob_rows[0][1]
 
-    # GATE 1: model pick must be in market top 2 by yes_ask
     market_top = get_market_top_n(kalshi_markets, n=CONSENSUS_TOP_N)
     in_top = any(labels_match(mt, model_pick_label) for mt in market_top)
     if not in_top:
@@ -1320,30 +1244,24 @@ def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction):
             'reason': f'Gate 1 fail: model pick "{model_pick_label}" not in market top {CONSENSUS_TOP_N}: {market_top}',
         }
 
-    # Find Kalshi market for the target bracket
     target_market = next((m for m in kalshi_markets if labels_match(m[0], model_pick_label)), None)
     if not target_market:
         return None
     yes_ask, no_ask = target_market[1], target_market[2]
 
-    # Bracket bounds for ensemble + busted check
     bracket_lo = bracket_hi = None
     for lbl, lo, hi in parse_ladder(ladder_text):
         if labels_match(lbl, model_pick_label):
             bracket_lo, bracket_hi = lo, hi
             break
 
-    # Blend with GFS ensemble
     ens_prob = ensemble_bracket_prob(ensemble_members, bracket_lo, bracket_hi) if ensemble_members else None
     final_prob = blend_probs(target_base_prob, ens_prob, ensemble_members, city, nbm_active=used_nbm)
 
-    # GATE 3: busted bracket check
     busted = obs_high is not None and bracket_hi is not None and obs_high > bracket_hi + 0.4
 
-    # Consensus containment (V5.27 inner gate)
     contains_consensus = bracket_contains_consensus(model_pick_label, consensus, ladder_text, tolerance=1.0)
 
-    # Compute Trust scores for YES and NO directions
     ens_tier = ensemble_tier_from_prob(ens_prob) if ens_prob is not None else ''
     call_str = two_degree_call(consensus, ladder_text, obs_high=obs_high)
     mae_color = get_city_mae_color(city)
@@ -1378,19 +1296,19 @@ def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction):
 
 
 def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
-    """For one timezone window (e.g. ET edge), log paper bets across all
-    8 strategy tags for each qualifying city.
+    """V5.28: NO bets on the model's TOP bracket are BLOCKED.
 
-    Each city can produce up to 4 paper bets at this window:
-      YES_<WINDOW>_T80, YES_<WINDOW>_T75 (if yes side passes)
-      NO_<WINDOW>_T80,  NO_<WINDOW>_T75  (if no side passes)
+    The model identified this bracket as MOST LIKELY — betting against it is
+    internally inconsistent. Empirical: 75 NO bets, 40% win rate, -$75 vs 49
+    YES bets, 55% win rate, +$21 on same brackets (May 22–Jun 1 validation).
 
-    Same direction never logs both T80 and T75 — T80 is a strict subset of T75.
-    A T80 winner is also a T75 winner, so we log BOTH tags (independent strategies).
+    BUSTED brackets (obs_high > ceiling) still auto-fire NO at ≤5c — those
+    are mechanically impossible to hit, different mechanism from calibration.
     """
     cities = TZ_CITIES.get(tz_key, [])
     today = get_eastern_date()
     logged = []
+    no_blocks = 0  # count of NO bets blocked by V5.28 rule (for log visibility)
 
     for city in cities:
         wx_data = weather_results.get(city)
@@ -1416,7 +1334,7 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
         trust_yes = eval_result['trust_yes']
         trust_no  = eval_result['trust_no']
 
-        # YES side qualification
+        # YES side qualification (unchanged from V5.27.2)
         yes_qualifies = (
             yes_ask is not None
             and yes_ask >= PRICE_FLOOR_CENTS
@@ -1426,20 +1344,22 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
             and final_prob >= 0.10
         )
 
-        # NO side qualification (busted brackets force NO at any price <= 5c)
+        # V5.28 CHANGE: NO bets on non-busted top brackets are BLOCKED.
+        # Calibration bug: model says "X is most likely" then bets ¬X with 65%
+        # claimed conviction. Internally inconsistent. Only BUSTED → NO fires.
         no_qualifies = False
         if no_ask is not None and no_ask < 99:
             if busted and no_ask <= 5:
                 no_qualifies = True
-            elif no_ask >= PRICE_FLOOR_CENTS and (1.0 - final_prob) >= 0.10 and not busted:
-                no_qualifies = True
+            elif (1.0 - final_prob) >= 0.10 and not busted:
+                # Would have qualified pre-V5.28 — count the block for visibility.
+                no_blocks += 1
 
         # Log YES bets across both thresholds
         if yes_qualifies and trust_yes is not None:
             for threshold in TRUST_THRESHOLDS:
                 if trust_yes >= threshold:
-                    tag = f'V527_PAPER_YES_{window_label}_T{threshold}'
-                    # Dedup: skip if same tag already logged for this city today
+                    tag = f'V528_PAPER_YES_{window_label}_T{threshold}'
                     if sb_count_paper_bets_today(city, tag) > 0:
                         continue
                     bet_row = {
@@ -1453,14 +1373,13 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
                     if sb_insert_paper_bet(bet_row):
                         logged.append(f'{city} {bracket} YES @ {yes_ask}c [{tag}] Trust {trust_yes:.1f}')
 
-        # Log NO bets across both thresholds
+        # Log BUSTED NO bets (the only kind that now fire)
         if no_qualifies and trust_no is not None:
             for threshold in TRUST_THRESHOLDS:
                 if trust_no >= threshold:
-                    tag = f'V527_PAPER_NO_{window_label}_T{threshold}'
+                    tag = f'V528_PAPER_NO_{window_label}_T{threshold}'
                     if sb_count_paper_bets_today(city, tag) > 0:
                         continue
-                    # Busted brackets: tag stays the same but note flags the bust
                     bust_note = ' [BUSTED]' if busted else ''
                     bet_row = {
                         'date': today, 'city': city, 'bracket': bracket,
@@ -1473,6 +1392,9 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
                     if sb_insert_paper_bet(bet_row):
                         logged.append(f'{city} {bracket} NO @ {no_ask}c [{tag}] Trust {trust_no:.1f}')
 
+    if no_blocks > 0:
+        print(f'    🚫 V5.28: blocked {no_blocks} NO bet(s) on model top brackets (calibration fix)')
+
     return logged
 
 
@@ -1482,19 +1404,17 @@ def main():
     now_et = datetime.now(pytz.timezone('America/New_York'))
     utc_now = datetime.utcnow()
 
-    print(f'\n=== V5.27.2 Weather Fetch Run ===')
+    print(f'\n=== V5.28 Weather Fetch Run ===')
     print(f'Date: {today} | ET: {now_et.strftime("%I:%M %p ET")} | UTC: {utc_now.strftime("%H:%M")}')
     print(f'Cities: {len(CITIES)} (all 18 including hidden)\n')
 
-    # Determine if we're in a paper-bet window
     firing_windows = is_window_time(utc_now)
     if firing_windows:
         print(f'🎯 Paper-bet window(s) firing this run: {firing_windows}\n')
     else:
         print('(No paper-bet window active this run — predictions only)\n')
 
-    # ── Stage 1: Fetch weather + write predictions for all 18 cities ─────────
-    weather_results = {}  # city -> {consensus, bias_correction, nws_fc, obs_high, ensemble_members, ensemble_mean, nbm, ok}
+    weather_results = {}
     save_ok_count = 0
     save_fail = []
 
@@ -1513,13 +1433,11 @@ def main():
             obs_high_raw = fetch_obs_high(city)
             ensemble_members, ensemble_mean = fetch_gfs_ensemble(city)
             nbm = None
-            # Only fetch NBM if we have time budget; it's 1 extra API call per city
-            if firing_windows:  # NBM needed for paper validation
+            if firing_windows:
                 nbm = fetch_nbm_percentiles(city)
             print(f'    Current: {current_temp}F | Obs high: {obs_high_raw}F | '
                   f'GFS: {ensemble_mean}F | NBM: {"yes" if nbm else "no"}')
 
-            # V5.27.1 sanity: obs_high vs current temp (10F, was 15F)
             obs_high = obs_high_raw
             if (obs_high_raw is not None and current_temp is not None
                     and obs_high_raw > current_temp + OBS_HIGH_OVER_CURRENT_THRESHOLD):
@@ -1579,16 +1497,15 @@ def main():
             weather_results[city] = {'ok': False, 'reason': str(e)}
             save_fail.append(city)
 
-        time.sleep(0.3)  # be polite to APIs
+        time.sleep(0.3)
 
     print(f'\n=== Predictions Summary ===')
     print(f'Saved {save_ok_count}/{len(CITIES)} cities')
     if save_fail:
         print(f'Failed: {", ".join(save_fail)}')
 
-    # ── Stage 2: Paper-bet validator (only if in window) ──────────────────────
     if firing_windows and _TRUST_AVAILABLE:
-        print(f'\n=== Paper-Bet Validator ===')
+        print(f'\n=== Paper-Bet Validator (V5.28: NO blocked on top bracket) ===')
         run_iso = datetime.now(pytz.timezone('America/New_York')).isoformat()
         all_logged = []
         for tz_key, window_label in firing_windows:
@@ -1606,14 +1523,8 @@ def main():
     elif firing_windows and not _TRUST_AVAILABLE:
         print('\n⚠️ Paper-bet window firing but trust_score module unavailable — SKIPPED')
 
-    # ── Stage 3: Auto-settlement (runs every cron tick) ──────────────────────
-    # Settles prior-day predictions + paper bets via Iowa State CLI.
-    # Wrapped internally so failures here never affect the weather fetch result.
     run_settlement_pass()
 
-    # V5.27.1: do not exit(1) on partial failures.
-    # Some cities failing NWS does not invalidate the run for the rest.
-    # GitHub will mark this as success even with partial failures.
     if save_fail:
         print(f'\n⚠️ Partial failure: {len(save_fail)} of {len(CITIES)} cities did not save.')
         print('   (Run completes successfully — predictions for working cities are live.)')
