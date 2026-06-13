@@ -1,6 +1,18 @@
 """
-fetch_weather.py — MPH Weather Model V5.28
+fetch_weather.py — MPH Weather Model V5.28.1
 Scheduled weather fetcher + paper-bet validator for GitHub Actions.
+
+V5.28.1 changes from V5.28:
+  - NEW: Kalshi market snapshot logger. On every paper-bet window cron tick,
+    captures the full Kalshi ladder (every bracket + yes/no price) and computes
+    Σp (sum of bucket implied probabilities) for each of the 18 cities.
+  - Writes to new Supabase table `kalshi_snapshots` (you must CREATE TABLE
+    before deploying — SQL provided separately).
+  - Pure data capture. Zero model behavior change. Wrapped in try/except so
+    snapshot failures cannot break paper-bet evaluation.
+  - Enables future analysis: timing optimization (when does model+market
+    agreement peak?), Σp gate development (skip overpriced ladders),
+    cluster detection (adjacent brackets pricing within 15c).
 
 V5.28 changes from V5.27.2:
   - BLOCK NO bets on the model's TOP bracket (calibration fix). Reason: the model
@@ -40,7 +52,7 @@ SUPABASE_URL  = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY  = os.environ.get('SUPABASE_KEY', '')
 
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
-HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.28', 'Accept': 'application/json'}
+HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.28.1', 'Accept': 'application/json'}
 
 # ── Validator Configuration ──────────────────────────────────────────────────
 PAPER_BET_STAKE       = 3.0
@@ -308,6 +320,104 @@ def sb_count_paper_bets_today(city, strategy_tag):
             return len(r.json())
         return 0
     except Exception:
+        return 0
+
+
+# ── V5.28.1: Kalshi market snapshot logger ───────────────────────────────────
+# Captures the full Kalshi ladder for each city on every paper-bet window tick.
+# Computes Σp (sum of YES implied probs across all brackets) which signals when
+# the whole market is mispriced. Stored in `kalshi_snapshots` table.
+#
+# Schema (create once in Supabase SQL editor before deploying V5.28.1):
+#
+#   CREATE TABLE IF NOT EXISTS public.kalshi_snapshots (
+#     id BIGSERIAL PRIMARY KEY,
+#     snapshot_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+#     date TEXT NOT NULL,           -- ET date 'YYYY-MM-DD'
+#     city TEXT NOT NULL,
+#     bracket_label TEXT NOT NULL,  -- normalized, e.g. '81-82' or '90 or above'
+#     yes_price_cents INTEGER,
+#     no_price_cents INTEGER,
+#     bracket_rank INTEGER,         -- 1 = highest yes_ask for this city/snapshot
+#     sigma_p NUMERIC(5,4),         -- sum of (yes_price/100) across whole ladder
+#     window_tz TEXT,               -- 'ET'/'CT'/'MT'/'PT'
+#     window_label TEXT,            -- 'EDGE' / 'CONVICTION'
+#     utc_hour INTEGER,             -- UTC hour the snapshot was captured
+#     model_top_bracket TEXT        -- our model's #1 pick at this moment
+#   );
+#   CREATE INDEX IF NOT EXISTS idx_snap_city_date ON public.kalshi_snapshots(city, date);
+#   CREATE INDEX IF NOT EXISTS idx_snap_time ON public.kalshi_snapshots(snapshot_time);
+#   ALTER TABLE public.kalshi_snapshots ENABLE ROW LEVEL SECURITY;
+#   CREATE POLICY "Allow all access" ON public.kalshi_snapshots
+#     FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);
+
+
+def snapshot_kalshi_market(city, kalshi_markets, window_tz, window_label,
+                           model_top_bracket, utc_now):
+    """Snapshot the full Kalshi ladder for one city to kalshi_snapshots table.
+
+    Args:
+      city: city name
+      kalshi_markets: list of (label, yes_ask, no_ask) from fetch_kalshi_brackets
+      window_tz: 'ET'/'CT'/'MT'/'PT' (or '' if not in a window)
+      window_label: 'EDGE'/'CONVICTION' (or '' if not in a window)
+      model_top_bracket: our model's #1 bracket pick at this moment
+      utc_now: datetime.utcnow()
+
+    Returns count of rows inserted (best-effort; failures logged but not raised).
+    """
+    if not kalshi_markets:
+        return 0
+    try:
+        # Compute sigma_p: sum of yes_ask cents / 100 across all brackets
+        valid_yes = [m[1] for m in kalshi_markets if m[1] is not None]
+        if not valid_yes:
+            return 0
+        sigma_p = round(sum(valid_yes) / 100.0, 4)
+
+        # Compute bracket_rank by yes_ask (highest = 1)
+        ranked = sorted(
+            [(idx, m) for idx, m in enumerate(kalshi_markets) if m[1] is not None],
+            key=lambda x: x[1][1],
+            reverse=True,
+        )
+        rank_by_idx = {orig_idx: rank for rank, (orig_idx, _) in enumerate(ranked, start=1)}
+
+        today = get_eastern_date()
+        snap_ts = utc_now.replace(microsecond=0).isoformat() + 'Z'
+
+        rows = []
+        for idx, (label, yes_ask, no_ask) in enumerate(kalshi_markets):
+            rows.append({
+                'snapshot_time': snap_ts,
+                'date': today,
+                'city': city,
+                'bracket_label': normalize_label(label),
+                'yes_price_cents': yes_ask,
+                'no_price_cents': no_ask,
+                'bracket_rank': rank_by_idx.get(idx),
+                'sigma_p': sigma_p,
+                'window_tz': window_tz or None,
+                'window_label': window_label or None,
+                'utc_hour': utc_now.hour,
+                'model_top_bracket': normalize_label(model_top_bracket) if model_top_bracket else None,
+            })
+
+        # Bulk insert
+        r = requests.post(
+            sb_url('kalshi_snapshots'),
+            headers=sb_headers(),
+            json=rows,
+            timeout=10,
+        )
+        if r.status_code in (200, 201):
+            return len(rows)
+        else:
+            print(f'    ⚠️ Snapshot insert non-200 for {city}: HTTP {r.status_code}')
+            return 0
+    except Exception as e:
+        # Non-fatal — snapshot failures must NOT block paper-bet evaluation
+        print(f'    ⚠️ Snapshot exception for {city} (non-fatal): {type(e).__name__}: {str(e)[:120]}')
         return 0
 
 
@@ -1211,7 +1321,8 @@ def is_window_time(utc_now):
     return firing
 
 
-def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction):
+def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction,
+                                window_tz='', window_label='', utc_now=None):
     nws_fc = weather_data.get('nws_fc')
     obs_high = weather_data.get('obs_high')
     ensemble_members = weather_data.get('ensemble_members')
@@ -1235,6 +1346,19 @@ def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction):
 
     model_pick_label = prob_rows[0][0]
     target_base_prob = prob_rows[0][1]
+
+    # V5.28.1: snapshot the full Kalshi ladder now that we know our model's top
+    # pick. Captures market state + our state in one row for later analysis.
+    # Best-effort — failures cannot block paper-bet logic.
+    if utc_now is not None:
+        snapshot_kalshi_market(
+            city=city,
+            kalshi_markets=kalshi_markets,
+            window_tz=window_tz,
+            window_label=window_label,
+            model_top_bracket=model_pick_label,
+            utc_now=utc_now,
+        )
 
     market_top = get_market_top_n(kalshi_markets, n=CONSENSUS_TOP_N)
     in_top = any(labels_match(mt, model_pick_label) for mt in market_top)
@@ -1304,11 +1428,15 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
 
     BUSTED brackets (obs_high > ceiling) still auto-fire NO at ≤5c — those
     are mechanically impossible to hit, different mechanism from calibration.
+
+    V5.28.1: passes window_tz / window_label / utc_now into evaluate so the
+    Kalshi snapshot logger has context for timing analysis.
     """
     cities = TZ_CITIES.get(tz_key, [])
     today = get_eastern_date()
     logged = []
     no_blocks = 0  # count of NO bets blocked by V5.28 rule (for log visibility)
+    utc_now = datetime.utcnow()  # single timestamp for all snapshots this window
 
     for city in cities:
         wx_data = weather_results.get(city)
@@ -1319,7 +1447,10 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
         if consensus is None:
             continue
 
-        eval_result = evaluate_city_for_paper_bet(city, wx_data, consensus, bias_correction)
+        eval_result = evaluate_city_for_paper_bet(
+            city, wx_data, consensus, bias_correction,
+            window_tz=tz_key, window_label=window_label, utc_now=utc_now,
+        )
         if eval_result is None:
             continue
         if not eval_result.get('gate1_pass'):
@@ -1404,7 +1535,7 @@ def main():
     now_et = datetime.now(pytz.timezone('America/New_York'))
     utc_now = datetime.utcnow()
 
-    print(f'\n=== V5.28 Weather Fetch Run ===')
+    print(f'\n=== V5.28.1 Weather Fetch Run ===')
     print(f'Date: {today} | ET: {now_et.strftime("%I:%M %p ET")} | UTC: {utc_now.strftime("%H:%M")}')
     print(f'Cities: {len(CITIES)} (all 18 including hidden)\n')
 
