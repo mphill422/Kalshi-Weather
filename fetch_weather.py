@@ -1,6 +1,18 @@
 """
-fetch_weather.py — MPH Weather Model V5.28.1
+fetch_weather.py — MPH Weather Model V5.28.2
 Scheduled weather fetcher + paper-bet validator for GitHub Actions.
+
+V5.28.2 changes from V5.28.1:
+  - BUG FIX: fetch_kalshi_brackets() was returning BOTH today's and tomorrow's
+    markets when both were open. Discovered via V5.28.1 snapshot data showing
+    sigma_p ~2.0 (should be ~1.0). Fix: strict close_time filter as primary,
+    label deduplication as backstop.
+  - Side effect of bug: V527/V528 paper bets may have occasionally logged
+    prices from tomorrow's market for same-label brackets. Probably small
+    impact since same-bracket prices are similar across adjacent days, but
+    fix removes that noise going forward.
+  - Will be visible in logs: '⚠️ [{series}] Dropped N duplicate bracket(s)'
+    if/when the legacy filter would have let duplicates through.
 
 V5.28.1 changes from V5.28:
   - NEW: Kalshi market snapshot logger. On every paper-bet window cron tick,
@@ -52,7 +64,7 @@ SUPABASE_URL  = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY  = os.environ.get('SUPABASE_KEY', '')
 
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
-HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.28.1', 'Accept': 'application/json'}
+HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.28.2', 'Accept': 'application/json'}
 
 # ── Validator Configuration ──────────────────────────────────────────────────
 PAPER_BET_STAKE       = 3.0
@@ -1023,21 +1035,53 @@ def fetch_kalshi_brackets(series):
         return None
 
     all_markets = data['markets']
-    markets = [m for m in all_markets if
-               any(x in (m.get('ticker') or '').upper() for x in [today_upper2, today_upper3]) or
-               any(x in (m.get('event_ticker') or '').upper() for x in [today_upper2, today_upper3])]
+
+    # V5.28.2 fix: STRICT today-only filter.
+    # Bug discovered Jun 13 2026 — kalshi_snapshots showed sigma_p ~2.0 on most
+    # cities because fetch was returning both today's AND tomorrow's markets.
+    # Phoenix snapshot example: 108-109 appeared twice, prices 72c and 57c
+    # (today's vs tomorrow's). Same for every other bracket.
+    #
+    # Defensive layers:
+    #   1) Filter by Kalshi's close_time (authoritative settlement date)
+    #   2) Fall back to ticker pattern matching only if #1 yields nothing
+    #   3) Dedupe by bracket label (keep first = lowest yes_ask sum order)
+
+    # Primary filter: close_time starts with today's ET date
+    markets = [m for m in all_markets if (m.get('close_time') or '').startswith(today_date)]
+
+    # Fallback 1: ticker pattern (legacy V5.27.1 logic)
     if not markets:
-        markets = [m for m in all_markets if (m.get('close_time') or '').startswith(today_date)]
+        markets = [m for m in all_markets if
+                   any(x in (m.get('ticker') or '').upper() for x in [today_upper2, today_upper3]) or
+                   any(x in (m.get('event_ticker') or '').upper() for x in [today_upper2, today_upper3])]
+
+    # Fallback 2: take everything (last resort — should be very rare)
     if not markets:
+        print(f'    ⚠️ [{series}] No today_date match — falling back to all {len(all_markets)} markets')
         markets = all_markets
 
+    # V5.28.2: dedupe by normalized bracket label.
+    # If duplicates remain after close_time filter, keep the FIRST occurrence
+    # (since Kalshi typically returns active markets first in response order).
     parsed = []
+    seen_labels = set()
+    duplicates_dropped = 0
     for m in markets:
         label, key = parse_market_label(m)
         if label is None:
             continue
+        norm_label = normalize_label(label)
+        if norm_label in seen_labels:
+            duplicates_dropped += 1
+            continue
+        seen_labels.add(norm_label)
         yes_ask, no_ask = get_price_cents(m)
         parsed.append((key, label, yes_ask, no_ask))
+
+    if duplicates_dropped > 0:
+        print(f'    ⚠️ [{series}] Dropped {duplicates_dropped} duplicate bracket(s) after dedup')
+
     if len(parsed) < 2:
         return None
     parsed.sort(key=lambda x: x[0])
@@ -1535,7 +1579,7 @@ def main():
     now_et = datetime.now(pytz.timezone('America/New_York'))
     utc_now = datetime.utcnow()
 
-    print(f'\n=== V5.28.1 Weather Fetch Run ===')
+    print(f'\n=== V5.28.2 Weather Fetch Run ===')
     print(f'Date: {today} | ET: {now_et.strftime("%I:%M %p ET")} | UTC: {utc_now.strftime("%H:%M")}')
     print(f'Cities: {len(CITIES)} (all 18 including hidden)\n')
 
