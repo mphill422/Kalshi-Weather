@@ -1,6 +1,18 @@
 """
-fetch_weather.py — MPH Weather Model V5.28.2
+fetch_weather.py — MPH Weather Model V5.28.3-diag
 Scheduled weather fetcher + paper-bet validator for GitHub Actions.
+
+V5.28.3-diag changes from V5.28.2:
+  - DIAGNOSTIC PATCH (no behavior change). Adds raw Kalshi API response dump
+    to new Supabase table `kalshi_api_dumps` (you must CREATE TABLE first).
+  - Records which endpoint succeeded (event_ticker / series_status_open /
+    series_only), counts at each filter stage (raw → close_time-filtered →
+    deduped), and the FULL raw response as JSONB for offline analysis.
+  - Console log per city per cron tick:
+    '📋 [{series}] endpoint={X}, raw={Y}, filtered={Z}, final={W}'
+  - Purpose: figure out why Houston returns 2 different ladder structures
+    simultaneously and why some snapshots came in with all prices at $1.00.
+  - Once we have one day of dump data we can write V5.28.4 with confidence.
 
 V5.28.2 changes from V5.28.1:
   - BUG FIX: fetch_kalshi_brackets() was returning BOTH today's and tomorrow's
@@ -64,7 +76,7 @@ SUPABASE_URL  = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY  = os.environ.get('SUPABASE_KEY', '')
 
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
-HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.28.2', 'Accept': 'application/json'}
+HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.28.3-diag', 'Accept': 'application/json'}
 
 # ── Validator Configuration ──────────────────────────────────────────────────
 PAPER_BET_STAKE       = 3.0
@@ -431,6 +443,68 @@ def snapshot_kalshi_market(city, kalshi_markets, window_tz, window_label,
         # Non-fatal — snapshot failures must NOT block paper-bet evaluation
         print(f'    ⚠️ Snapshot exception for {city} (non-fatal): {type(e).__name__}: {str(e)[:120]}')
         return 0
+
+
+# ── V5.28.3-diag: Raw Kalshi API dump (diagnostic only) ──────────────────────
+# Captures the EXACT JSON Kalshi returns from fetch_kalshi_brackets API calls,
+# so we can analyze:
+#   - How Kalshi structures multiple ladders per city (Houston had 12 brackets
+#     across 2 different ladder structures)
+#   - Why some snapshots came in with all prices at $1.00 (illiquid markets?)
+#   - Whether close_time is reliable as a today-filter
+#
+# Schema (create once in Supabase SQL editor before deploying):
+#
+#   CREATE TABLE IF NOT EXISTS public.kalshi_api_dumps (
+#     id BIGSERIAL PRIMARY KEY,
+#     dump_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+#     date TEXT NOT NULL,
+#     city TEXT NOT NULL,
+#     series TEXT NOT NULL,
+#     endpoint_used TEXT,           -- which fallback succeeded: 'event_ticker',
+#                                   --   'series_status_open', 'series_only'
+#     market_count INTEGER,         -- total markets returned by API
+#     filtered_count INTEGER,       -- count after close_time filter
+#     final_count INTEGER,          -- count after dedup
+#     raw_response JSONB            -- full Kalshi response (limited to 30 markets)
+#   );
+#   CREATE INDEX IF NOT EXISTS idx_dumps_city_date ON public.kalshi_api_dumps(city, date);
+#   ALTER TABLE public.kalshi_api_dumps ENABLE ROW LEVEL SECURITY;
+#   CREATE POLICY "Allow all access" ON public.kalshi_api_dumps
+#     FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);
+
+
+def dump_raw_kalshi_response(city, series, raw_data, endpoint_used,
+                              market_count, filtered_count, final_count):
+    """Dump raw Kalshi API response to kalshi_api_dumps table for diagnosis.
+
+    Best-effort — failures cannot break paper-bet evaluation.
+    """
+    if not raw_data:
+        return
+    try:
+        today = get_eastern_date()
+        row = {
+            'date': today,
+            'city': city,
+            'series': series,
+            'endpoint_used': endpoint_used,
+            'market_count': market_count,
+            'filtered_count': filtered_count,
+            'final_count': final_count,
+            'raw_response': raw_data,  # JSONB column accepts dict directly
+        }
+        r = requests.post(
+            sb_url('kalshi_api_dumps'),
+            headers=sb_headers(),
+            json=row,
+            timeout=10,
+        )
+        if r.status_code not in (200, 201):
+            print(f'    ⚠️ API dump insert non-200 for {city}: HTTP {r.status_code}')
+    except Exception as e:
+        # Non-fatal
+        print(f'    ⚠️ API dump exception for {city} (non-fatal): {type(e).__name__}: {str(e)[:120]}')
 
 
 # ── Bias correction ──────────────────────────────────────────────────────────
@@ -1011,7 +1085,12 @@ def get_price_cents(m):
     return yes_ask, no_ask
 
 
-def fetch_kalshi_brackets(series):
+def fetch_kalshi_brackets(series, city=''):
+    """Fetch and parse Kalshi market ladder for a city.
+
+    V5.28.3-diag: accepts optional `city` param for diagnostic dump correlation.
+    Dumps raw API response to kalshi_api_dumps table for offline analysis.
+    """
     url = 'https://api.elections.kalshi.com/trade-api/v2/markets'
     event_ticker = get_event_ticker(series)
     today_date = get_eastern_date()
@@ -1026,15 +1105,24 @@ def fetch_kalshi_brackets(series):
         except Exception:
             return None
 
+    # Track which endpoint succeeded for diagnostic purposes
+    endpoint_used = None
     data = _try({'event_ticker': event_ticker, 'limit': 30})
-    if not data or not data.get('markets'):
+    if data and data.get('markets'):
+        endpoint_used = 'event_ticker'
+    else:
         data = _try({'series_ticker': series, 'status': 'open', 'limit': 30})
-    if not data or not data.get('markets'):
-        data = _try({'series_ticker': series, 'limit': 30})
+        if data and data.get('markets'):
+            endpoint_used = 'series_status_open'
+        else:
+            data = _try({'series_ticker': series, 'limit': 30})
+            if data and data.get('markets'):
+                endpoint_used = 'series_only'
     if not data or not data.get('markets'):
         return None
 
     all_markets = data['markets']
+    raw_market_count = len(all_markets)
 
     # V5.28.2 fix: STRICT today-only filter.
     # Bug discovered Jun 13 2026 — kalshi_snapshots showed sigma_p ~2.0 on most
@@ -1061,6 +1149,8 @@ def fetch_kalshi_brackets(series):
         print(f'    ⚠️ [{series}] No today_date match — falling back to all {len(all_markets)} markets')
         markets = all_markets
 
+    filtered_count = len(markets)
+
     # V5.28.2: dedupe by normalized bracket label.
     # If duplicates remain after close_time filter, keep the FIRST occurrence
     # (since Kalshi typically returns active markets first in response order).
@@ -1081,6 +1171,20 @@ def fetch_kalshi_brackets(series):
 
     if duplicates_dropped > 0:
         print(f'    ⚠️ [{series}] Dropped {duplicates_dropped} duplicate bracket(s) after dedup')
+
+    # V5.28.3-diag: dump raw API response for offline analysis.
+    # Wrapped internally — dump failures don't break paper-bet evaluation.
+    print(f'    📋 [{series}] endpoint={endpoint_used}, raw={raw_market_count}, '
+          f'filtered={filtered_count}, final={len(parsed)}')
+    dump_raw_kalshi_response(
+        city=city or series,  # fall back to series name if city not passed
+        series=series,
+        raw_data=data,
+        endpoint_used=endpoint_used,
+        market_count=raw_market_count,
+        filtered_count=filtered_count,
+        final_count=len(parsed),
+    )
 
     if len(parsed) < 2:
         return None
@@ -1376,7 +1480,7 @@ def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction,
     series = SERIES.get(city)
     if not series:
         return None
-    kalshi_markets = fetch_kalshi_brackets(series)
+    kalshi_markets = fetch_kalshi_brackets(series, city=city)
     if not kalshi_markets or len(kalshi_markets) < 2:
         return None
 
@@ -1579,7 +1683,7 @@ def main():
     now_et = datetime.now(pytz.timezone('America/New_York'))
     utc_now = datetime.utcnow()
 
-    print(f'\n=== V5.28.2 Weather Fetch Run ===')
+    print(f'\n=== V5.28.3-diag Weather Fetch Run ===')
     print(f'Date: {today} | ET: {now_et.strftime("%I:%M %p ET")} | UTC: {utc_now.strftime("%H:%M")}')
     print(f'Cities: {len(CITIES)} (all 18 including hidden)\n')
 
