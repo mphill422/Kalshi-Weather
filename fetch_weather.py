@@ -1,6 +1,17 @@
 """
-fetch_weather.py — MPH Weather Model V5.28.4
+fetch_weather.py — MPH Weather Model V5.29.A
 Scheduled weather fetcher + paper-bet validator for GitHub Actions.
+
+V5.29.A changes from V5.28.4:
+  - NEW: Σp gate. Computes sum of YES implied probabilities across Kalshi
+    ladder for each city. If Σp > 1.15, skip the city entirely (ladder is
+    materially overpriced; fees + favorite-longshot bias eat all expected edge).
+  - Strategy tag prefix bumped V528 → V529 for clean validation cutoff.
+  - sigma_p included in bet notes column for per-bet visibility.
+  - Console summary per window: '🚫 V5.29.A: skipped N city/cities (Σp > 1.15)'.
+  - Starting threshold 1.15 is conservative — Jun 15 data showed 1.05-1.14
+    range, so this catches only clearly overpriced ladders. Tighten over time
+    as V529 paper-bet performance by sigma_p bucket accumulates.
 
 V5.28.4 changes from V5.28.3-diag:
   - ROOT CAUSE FIX. Diagnostic dumps (Jun 15) revealed:
@@ -92,7 +103,7 @@ SUPABASE_URL  = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY  = os.environ.get('SUPABASE_KEY', '')
 
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
-HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.28.4', 'Accept': 'application/json'}
+HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.29.A', 'Accept': 'application/json'}
 
 # ── Validator Configuration ──────────────────────────────────────────────────
 PAPER_BET_STAKE       = 3.0
@@ -100,6 +111,14 @@ PRICE_FLOOR_CENTS     = 30
 CONSENSUS_TOP_N       = 2
 TRUST_THRESHOLDS      = [75, 80]
 WINDOW_TOLERANCE_MIN  = 6
+
+# V5.29.A: skip city if Kalshi ladder Σp exceeds this threshold.
+# Σp = sum of YES implied probs across all brackets (should be ~1.0 in fair
+# market). Higher = market overpriced as a whole (favorite-longshot bias +
+# Kalshi fees). Starting conservative at 1.15 — actual data Jun 15 showed
+# 1.05-1.14 range, so this skips only clearly overpriced ladders. Tighten
+# over time as we accumulate V529 paper-bet performance data by sigma_p bucket.
+SIGMA_P_GATE_MAX      = 1.15
 
 WINDOW_SCHEDULE = {
     (14,  0): [('ET', 'EDGE')],
@@ -1500,6 +1519,13 @@ def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction,
     if not kalshi_markets or len(kalshi_markets) < 2:
         return None
 
+    # V5.29.A: Σp gate — compute sum of YES implied probs across whole ladder.
+    # Σp > 1.15 means market is materially overpriced (Kalshi fees + favorite-
+    # longshot bias + market maker margin compounding to >15% overhead).
+    # Skip the city — any bet here pays too much overhead for our edge.
+    valid_yes_prices = [m[1] for m in kalshi_markets if m[1] is not None]
+    sigma_p = round(sum(valid_yes_prices) / 100.0, 4) if valid_yes_prices else None
+
     ladder_text = ' | '.join(normalize_label(m[0]) for m in kalshi_markets)
 
     prob_rows, used_nbm = bracket_probs(consensus, ladder_text, city, nbm,
@@ -1524,11 +1550,22 @@ def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction,
             utc_now=utc_now,
         )
 
+    # V5.29.A: Σp gate check (after snapshot so we still capture overpriced data)
+    if sigma_p is not None and sigma_p > SIGMA_P_GATE_MAX:
+        return {
+            'gate1_pass': False,
+            'sigma_p_pass': False,
+            'sigma_p': sigma_p,
+            'reason': f'Σp gate fail: {sigma_p:.3f} > {SIGMA_P_GATE_MAX} (ladder overpriced)',
+        }
+
     market_top = get_market_top_n(kalshi_markets, n=CONSENSUS_TOP_N)
     in_top = any(labels_match(mt, model_pick_label) for mt in market_top)
     if not in_top:
         return {
             'gate1_pass': False,
+            'sigma_p_pass': True,
+            'sigma_p': sigma_p,
             'reason': f'Gate 1 fail: model pick "{model_pick_label}" not in market top {CONSENSUS_TOP_N}: {market_top}',
         }
 
@@ -1571,6 +1608,8 @@ def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction,
 
     return {
         'gate1_pass': True,
+        'sigma_p_pass': True,
+        'sigma_p': sigma_p,
         'bracket': model_pick_label,
         'yes_ask': yes_ask,
         'no_ask': no_ask,
@@ -1584,11 +1623,15 @@ def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction,
 
 
 def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
-    """V5.28: NO bets on the model's TOP bracket are BLOCKED.
+    """V5.29.A: Σp gate active. V5.28 NO-bet block carried forward.
 
-    The model identified this bracket as MOST LIKELY — betting against it is
-    internally inconsistent. Empirical: 75 NO bets, 40% win rate, -$75 vs 49
-    YES bets, 55% win rate, +$21 on same brackets (May 22–Jun 1 validation).
+    V5.29.A NEW: skip cities where Kalshi ladder Σp > 1.15 (overpriced ladder).
+    Strategy tag prefix bumped V528 → V529 (clean validation cutoff).
+
+    V5.28: NO bets on the model's TOP bracket are BLOCKED. The model identified
+    this bracket as MOST LIKELY — betting against it is internally inconsistent.
+    Empirical: 75 NO bets, 40% win rate, -$75 vs 49 YES bets, 55% win rate,
+    +$21 on same brackets (May 22–Jun 1 validation).
 
     BUSTED brackets (obs_high > ceiling) still auto-fire NO at ≤5c — those
     are mechanically impossible to hit, different mechanism from calibration.
@@ -1599,7 +1642,8 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
     cities = TZ_CITIES.get(tz_key, [])
     today = get_eastern_date()
     logged = []
-    no_blocks = 0  # count of NO bets blocked by V5.28 rule (for log visibility)
+    no_blocks = 0           # count of NO bets blocked by V5.28 rule
+    sigma_p_blocks = 0      # V5.29.A: count of cities skipped by Σp gate
     utc_now = datetime.utcnow()  # single timestamp for all snapshots this window
 
     for city in cities:
@@ -1617,6 +1661,12 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
         )
         if eval_result is None:
             continue
+        # V5.29.A: count Σp gate fails for visibility
+        if eval_result.get('sigma_p_pass') is False:
+            sigma_p_blocks += 1
+            sp = eval_result.get('sigma_p')
+            print(f'    🚫 V5.29.A Σp gate: {city} skipped (Σp={sp:.3f} > {SIGMA_P_GATE_MAX})')
+            continue
         if not eval_result.get('gate1_pass'):
             continue
 
@@ -1628,6 +1678,7 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
         contains_consensus = eval_result['contains_consensus']
         trust_yes = eval_result['trust_yes']
         trust_no  = eval_result['trust_no']
+        sigma_p   = eval_result.get('sigma_p')  # V5.29.A
 
         # YES side qualification (unchanged from V5.27.2)
         yes_qualifies = (
@@ -1654,15 +1705,16 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
         if yes_qualifies and trust_yes is not None:
             for threshold in TRUST_THRESHOLDS:
                 if trust_yes >= threshold:
-                    tag = f'V528_PAPER_YES_{window_label}_T{threshold}'
+                    tag = f'V529_PAPER_YES_{window_label}_T{threshold}'
                     if sb_count_paper_bets_today(city, tag) > 0:
                         continue
+                    sp_str = f' | Σp {sigma_p:.3f}' if sigma_p is not None else ''
                     bet_row = {
                         'date': today, 'city': city, 'bracket': bracket,
                         'direction': 'YES', 'price': yes_ask, 'amount': PAPER_BET_STAKE,
                         'result': 'Pending', 'profit': 0.0, 'payout': 0.0,
                         'actual': None, 'strategy_tag': tag,
-                        'notes': f'Trust 🎯 {trust_yes:.1f} | Model {final_prob*100:.1f}% | {tz_key} {window_label}',
+                        'notes': f'Trust 🎯 {trust_yes:.1f} | Model {final_prob*100:.1f}%{sp_str} | {tz_key} {window_label}',
                         'placed_at': run_iso,
                     }
                     if sb_insert_paper_bet(bet_row):
@@ -1672,16 +1724,17 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
         if no_qualifies and trust_no is not None:
             for threshold in TRUST_THRESHOLDS:
                 if trust_no >= threshold:
-                    tag = f'V528_PAPER_NO_{window_label}_T{threshold}'
+                    tag = f'V529_PAPER_NO_{window_label}_T{threshold}'
                     if sb_count_paper_bets_today(city, tag) > 0:
                         continue
                     bust_note = ' [BUSTED]' if busted else ''
+                    sp_str = f' | Σp {sigma_p:.3f}' if sigma_p is not None else ''
                     bet_row = {
                         'date': today, 'city': city, 'bracket': bracket,
                         'direction': 'NO', 'price': no_ask, 'amount': PAPER_BET_STAKE,
                         'result': 'Pending', 'profit': 0.0, 'payout': 0.0,
                         'actual': None, 'strategy_tag': tag,
-                        'notes': f'Trust 🎯 {trust_no:.1f} | Model {(1.0-final_prob)*100:.1f}%{bust_note} | {tz_key} {window_label}',
+                        'notes': f'Trust 🎯 {trust_no:.1f} | Model {(1.0-final_prob)*100:.1f}%{bust_note}{sp_str} | {tz_key} {window_label}',
                         'placed_at': run_iso,
                     }
                     if sb_insert_paper_bet(bet_row):
@@ -1689,6 +1742,8 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
 
     if no_blocks > 0:
         print(f'    🚫 V5.28: blocked {no_blocks} NO bet(s) on model top brackets (calibration fix)')
+    if sigma_p_blocks > 0:
+        print(f'    🚫 V5.29.A: skipped {sigma_p_blocks} city/cities (Σp > {SIGMA_P_GATE_MAX})')
 
     return logged
 
@@ -1699,7 +1754,7 @@ def main():
     now_et = datetime.now(pytz.timezone('America/New_York'))
     utc_now = datetime.utcnow()
 
-    print(f'\n=== V5.28.4 Weather Fetch Run ===')
+    print(f'\n=== V5.29.A Weather Fetch Run ===')
     print(f'Date: {today} | ET: {now_et.strftime("%I:%M %p ET")} | UTC: {utc_now.strftime("%H:%M")}')
     print(f'Cities: {len(CITIES)} (all 18 including hidden)\n')
 
