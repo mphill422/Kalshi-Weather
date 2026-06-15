@@ -1,6 +1,22 @@
 """
-fetch_weather.py — MPH Weather Model V5.28.3-diag
+fetch_weather.py — MPH Weather Model V5.28.4
 Scheduled weather fetcher + paper-bet validator for GitHub Actions.
+
+V5.28.4 changes from V5.28.3-diag:
+  - ROOT CAUSE FIX. Diagnostic dumps (Jun 15) revealed:
+      1) get_event_ticker() was producing '15JUN26' but Kalshi uses '26JUN15'.
+         The first API endpoint (event_ticker) failed on every cron tick,
+         forcing fallback to series_status_open which returns ALL open markets
+         (today + tomorrow).
+      2) V5.28.2 close_time filter checked today's ET date but Kalshi's
+         close_time starts with tomorrow's UTC date (midnight ET = next UTC day).
+         Filter never matched anything.
+      3) V5.28.2 ticker pattern matching used wrong date format ('15JUN26').
+  - Now: event_ticker endpoint succeeds → returns ONLY today's 6 markets.
+  - Defensive fallback layers (close_time, ticker pattern, take-all) use
+    correct date formats so they also work if primary endpoint fails.
+  - Kept V5.28.3-diag's raw API dump capture for ongoing monitoring.
+  - Expected effect: sigma_p drops from ~2.0 to ~1.0 on all cities.
 
 V5.28.3-diag changes from V5.28.2:
   - DIAGNOSTIC PATCH (no behavior change). Adds raw Kalshi API response dump
@@ -76,7 +92,7 @@ SUPABASE_URL  = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY  = os.environ.get('SUPABASE_KEY', '')
 
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
-HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.28.3-diag', 'Accept': 'application/json'}
+HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.28.4', 'Accept': 'application/json'}
 
 # ── Validator Configuration ──────────────────────────────────────────────────
 PAPER_BET_STAKE       = 3.0
@@ -1016,7 +1032,11 @@ def get_eastern_datetime():
 
 
 def get_event_ticker(series):
-    return series + '-' + get_eastern_datetime().strftime('%d%b%y').upper()
+    # V5.28.4 fix: Kalshi uses YY-MON-DD format (e.g., '26JUN15'), not DD-MON-YY.
+    # The previous '%d%b%y' format ('15JUN26') was wrong — caused endpoint #1
+    # (event_ticker param) to fail on every call, forcing fallback to endpoint
+    # #2 which returns ALL open markets in the series (including tomorrow's).
+    return series + '-' + get_eastern_datetime().strftime('%y%b%d').upper()
 
 
 def parse_market_label(m):
@@ -1094,8 +1114,13 @@ def fetch_kalshi_brackets(series, city=''):
     url = 'https://api.elections.kalshi.com/trade-api/v2/markets'
     event_ticker = get_event_ticker(series)
     today_date = get_eastern_date()
-    today_upper2 = get_eastern_datetime().strftime('%d%b%y').upper()
-    today_upper3 = get_eastern_datetime().strftime('%d%b%Y').upper()
+
+    # V5.28.4: Kalshi's ticker format is YY-MON-DD (e.g., '26JUN15'), not
+    # DD-MON-YY. Also, markets close at midnight ET = early next UTC day,
+    # so close_time starts with tomorrow's UTC date, not today's.
+    today_et_dt = get_eastern_datetime()
+    today_kalshi_fmt = today_et_dt.strftime('%y%b%d').upper()  # '26JUN15'
+    tomorrow_utc_date = (today_et_dt + timedelta(days=1)).strftime('%Y-%m-%d')
 
     def _try(params):
         try:
@@ -1124,36 +1149,27 @@ def fetch_kalshi_brackets(series, city=''):
     all_markets = data['markets']
     raw_market_count = len(all_markets)
 
-    # V5.28.2 fix: STRICT today-only filter.
-    # Bug discovered Jun 13 2026 — kalshi_snapshots showed sigma_p ~2.0 on most
-    # cities because fetch was returning both today's AND tomorrow's markets.
-    # Phoenix snapshot example: 108-109 appeared twice, prices 72c and 57c
-    # (today's vs tomorrow's). Same for every other bracket.
+    # V5.28.4 filtering chain — three layers + last-resort fallback:
     #
-    # Defensive layers:
-    #   1) Filter by Kalshi's close_time (authoritative settlement date)
-    #   2) Fall back to ticker pattern matching only if #1 yields nothing
-    #   3) Dedupe by bracket label (keep first = lowest yes_ask sum order)
+    # Layer 1: event_ticker pattern match (primary). Today's markets have
+    #   event_ticker like 'KXHIGHTHOU-26JUN15'. Match the '26JUN15' substring.
+    # Layer 2: close_time match. Markets settle at midnight ET = ~04-06 UTC
+    #   of the next calendar day, so close_time starts with tomorrow's UTC date.
+    # Layer 3: ticker pattern match (legacy fallback).
+    # Layer 4: take everything (warn loudly — should be very rare).
 
-    # Primary filter: close_time starts with today's ET date
-    markets = [m for m in all_markets if (m.get('close_time') or '').startswith(today_date)]
-
-    # Fallback 1: ticker pattern (legacy V5.27.1 logic)
+    markets = [m for m in all_markets if today_kalshi_fmt in (m.get('event_ticker') or '').upper()]
     if not markets:
-        markets = [m for m in all_markets if
-                   any(x in (m.get('ticker') or '').upper() for x in [today_upper2, today_upper3]) or
-                   any(x in (m.get('event_ticker') or '').upper() for x in [today_upper2, today_upper3])]
-
-    # Fallback 2: take everything (last resort — should be very rare)
+        markets = [m for m in all_markets if (m.get('close_time') or '').startswith(tomorrow_utc_date)]
     if not markets:
-        print(f'    ⚠️ [{series}] No today_date match — falling back to all {len(all_markets)} markets')
+        markets = [m for m in all_markets if today_kalshi_fmt in (m.get('ticker') or '').upper()]
+    if not markets:
+        print(f'    ⚠️ [{series}] No today-match ({today_kalshi_fmt}/{tomorrow_utc_date}) — falling back to all {len(all_markets)} markets')
         markets = all_markets
 
     filtered_count = len(markets)
 
-    # V5.28.2: dedupe by normalized bracket label.
-    # If duplicates remain after close_time filter, keep the FIRST occurrence
-    # (since Kalshi typically returns active markets first in response order).
+    # Dedup by normalized bracket label as defensive backstop.
     parsed = []
     seen_labels = set()
     duplicates_dropped = 0
@@ -1683,7 +1699,7 @@ def main():
     now_et = datetime.now(pytz.timezone('America/New_York'))
     utc_now = datetime.utcnow()
 
-    print(f'\n=== V5.28.3-diag Weather Fetch Run ===')
+    print(f'\n=== V5.28.4 Weather Fetch Run ===')
     print(f'Date: {today} | ET: {now_et.strftime("%I:%M %p ET")} | UTC: {utc_now.strftime("%H:%M")}')
     print(f'Cities: {len(CITIES)} (all 18 including hidden)\n')
 
