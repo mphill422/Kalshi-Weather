@@ -1,6 +1,21 @@
 """
-fetch_weather.py — MPH Weather Model V5.29.B
+fetch_weather.py — MPH Weather Model V5.29.C
 Scheduled weather fetcher + paper-bet validator for GitHub Actions.
+
+V5.29.C changes from V5.29.B:
+  - GFS /v1/forecast fallback when /v1/ensemble fails.
+  - Previous behavior: any GFS failure (HTTP timeout, NO TODAY MATCH timezone
+    issue, SPARSE GRID <3 members) returned (None, None) → no ensemble data
+    for that city → bracket probability falls back to sigma-CDF only.
+  - Now: any failure path tries /v1/forecast single-point as backup. Returns
+    a 1-member "ensemble" wrapping the deterministic GFS forecast. Acts as
+    sanity check — if this single value disagrees with model's bracket pick,
+    ens_prob = 0.0 suppresses bet confidence (preventing wild misses).
+  - Targets memory #14 finding: all 4 worst misses (OKC 22°F, Dallas 12°F,
+    Boston 11.2°F) had null ensemble. The 79% null rate for Dallas, 64% for
+    Austin, 57% for Houston should drop dramatically.
+  - Logs '🔁 [{city}] GFS fallback fired ({reason}): mean={X}F' when triggered.
+  - Strategy tag prefix bumped V529B → V529C for clean validation cutoff.
 
 V5.29.B changes from V5.29.A:
   - Per-city sigma recalibration from observed 28-day data (2026-06-17).
@@ -117,7 +132,7 @@ SUPABASE_URL  = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY  = os.environ.get('SUPABASE_KEY', '')
 
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
-HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.29.B', 'Accept': 'application/json'}
+HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.29.C', 'Accept': 'application/json'}
 
 # ── Validator Configuration ──────────────────────────────────────────────────
 PAPER_BET_STAKE       = 3.0
@@ -716,6 +731,57 @@ def fetch_obs_high(city):
 
 
 # ── GFS ensemble (V5.27.2: 45s timeout + retry) ──────────────────────────────
+def fetch_gfs_forecast_fallback(city):
+    """V5.29.C: Single-point GFS forecast fallback when ensemble fails.
+
+    Uses Open-Meteo's /v1/forecast endpoint with models=gfs_seamless.
+    Returns ([single_max_temp], single_max_temp) to mimic ensemble signature.
+    The 1-member "ensemble" gives downstream code something to blend against
+    instead of None. Acts as a sanity check — if this single forecast disagrees
+    with model's bracket pick, ens_prob = 0.0 suppresses bet confidence.
+
+    Returns (None, None) on any failure.
+    """
+    coords = CITIES[city]
+    lat, lon = coords['lat'], coords['lon']
+    params = {
+        'latitude': lat, 'longitude': lon,
+        'hourly': 'temperature_2m',
+        'temperature_unit': 'fahrenheit',
+        'timezone': 'auto', 'forecast_days': 2,
+        'models': 'gfs_seamless',
+    }
+    try:
+        r = requests.get('https://api.open-meteo.com/v1/forecast',
+                         params=params, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print(f'    ⚠️ [{city}] GFS fallback /v1/forecast FAILED: '
+              f'{type(e).__name__}: {str(e)[:120]}')
+        return None, None
+
+    today = get_eastern_date()
+    hourly = data.get('hourly', {})
+    times = hourly.get('time', [])
+    temps = hourly.get('temperature_2m', [])
+    if not times or not temps:
+        return None, None
+
+    today_temps = []
+    for i, t in enumerate(times):
+        if t.startswith(today) and len(t) >= 13 and 6 <= int(t[11:13]) <= 21:
+            if i < len(temps) and temps[i] is not None:
+                try:
+                    today_temps.append(float(temps[i]))
+                except Exception:
+                    pass
+    if not today_temps:
+        return None, None
+    max_temp = round(max(today_temps), 1)
+    return [max_temp], max_temp
+
+
 def fetch_gfs_ensemble(city):
     coords = CITIES[city]
     lat, lon = coords['lat'], coords['lon']
@@ -743,13 +809,25 @@ def fetch_gfs_ensemble(city):
             else:
                 print(f'    ⚠️ [{city}] GFS ensemble fetch FAILED (timeout after retry): '
                       f'{type(e).__name__}: {str(e)[:120]}')
-                return None, None
+                # V5.29.C: try /v1/forecast single-point fallback
+                fb_members, fb_mean = fetch_gfs_forecast_fallback(city)
+                if fb_members is not None:
+                    print(f'    🔁 [{city}] GFS fallback fired (timeout): mean={fb_mean}F')
+                return fb_members, fb_mean
         except Exception as e:
             print(f'    ⚠️ [{city}] GFS ensemble fetch FAILED (network/HTTP): '
                   f'{type(e).__name__}: {str(e)[:120]}')
-            return None, None
+            # V5.29.C: try /v1/forecast single-point fallback
+            fb_members, fb_mean = fetch_gfs_forecast_fallback(city)
+            if fb_members is not None:
+                print(f'    🔁 [{city}] GFS fallback fired (network): mean={fb_mean}F')
+            return fb_members, fb_mean
     if data is None:
-        return None, None
+        # V5.29.C: try fallback if main loop somehow exited without data
+        fb_members, fb_mean = fetch_gfs_forecast_fallback(city)
+        if fb_members is not None:
+            print(f'    🔁 [{city}] GFS fallback fired (no_data): mean={fb_mean}F')
+        return fb_members, fb_mean
     today = get_eastern_date()
     hourly = data.get('hourly', {})
     times = hourly.get('time', [])
@@ -761,7 +839,11 @@ def fetch_gfs_ensemble(city):
         sample_times = times[:3] if times else []
         print(f'    ⚠️ [{city}] GFS ensemble NO TODAY MATCH: looking for "{today}", '
               f'series has {len(times)} entries, sample: {sample_times}')
-        return None, None
+        # V5.29.C: try /v1/forecast single-point fallback
+        fb_members, fb_mean = fetch_gfs_forecast_fallback(city)
+        if fb_members is not None:
+            print(f'    🔁 [{city}] GFS fallback fired (no_today_match): mean={fb_mean}F')
+        return fb_members, fb_mean
     member_maxes = []
     for key, vals in hourly.items():
         if key == 'time' or 'temperature_2m' not in key or not isinstance(vals, list):
@@ -777,7 +859,11 @@ def fetch_gfs_ensemble(city):
                                if k != 'time' and 'temperature_2m' in k)
         print(f'    ⚠️ [{city}] GFS ensemble SPARSE GRID: got {len(member_maxes)} member maxes '
               f'(need ≥3); response had {member_key_count} ensemble keys total')
-        return None, None
+        # V5.29.C: try /v1/forecast single-point fallback
+        fb_members, fb_mean = fetch_gfs_forecast_fallback(city)
+        if fb_members is not None:
+            print(f'    🔁 [{city}] GFS fallback fired (sparse_grid): mean={fb_mean}F')
+        return fb_members, fb_mean
     return member_maxes, round(sum(member_maxes) / len(member_maxes), 1)
 
 
@@ -1738,7 +1824,7 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
         if yes_qualifies and trust_yes is not None:
             for threshold in TRUST_THRESHOLDS:
                 if trust_yes >= threshold:
-                    tag = f'V529B_PAPER_YES_{window_label}_T{threshold}'
+                    tag = f'V529C_PAPER_YES_{window_label}_T{threshold}'
                     if sb_count_paper_bets_today(city, tag) > 0:
                         continue
                     sp_str = f' | Σp {sigma_p:.3f}' if sigma_p is not None else ''
@@ -1757,7 +1843,7 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
         if no_qualifies and trust_no is not None:
             for threshold in TRUST_THRESHOLDS:
                 if trust_no >= threshold:
-                    tag = f'V529B_PAPER_NO_{window_label}_T{threshold}'
+                    tag = f'V529C_PAPER_NO_{window_label}_T{threshold}'
                     if sb_count_paper_bets_today(city, tag) > 0:
                         continue
                     bust_note = ' [BUSTED]' if busted else ''
@@ -1787,7 +1873,7 @@ def main():
     now_et = datetime.now(pytz.timezone('America/New_York'))
     utc_now = datetime.utcnow()
 
-    print(f'\n=== V5.29.B Weather Fetch Run ===')
+    print(f'\n=== V5.29.C Weather Fetch Run ===')
     print(f'Date: {today} | ET: {now_et.strftime("%I:%M %p ET")} | UTC: {utc_now.strftime("%H:%M")}')
     print(f'Cities: {len(CITIES)} (all 18 including hidden)\n')
 
