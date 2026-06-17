@@ -1,6 +1,20 @@
 """
-fetch_weather.py — MPH Weather Model V5.29.A
+fetch_weather.py — MPH Weather Model V5.29.B
 Scheduled weather fetcher + paper-bet validator for GitHub Actions.
+
+V5.29.B changes from V5.29.A:
+  - Per-city sigma recalibration from observed 28-day data (2026-06-17).
+  - 14 cities had sigma INCREASED (Boston 1.9→3.5, NYC 1.8→3.0, etc) — these
+    were drastically underconfident, causing high-confidence bets that
+    actually had moderate uncertainty. Expect FEWER but better-calibrated bets.
+  - 2 cities had sigma DECREASED (Phoenix 2.2→0.9, Vegas 2.2→1.2) — these
+    were overconfident, suppressing legitimate high-confidence picks. Expect
+    MORE aggressive picks for Phoenix/Vegas with higher final_prob.
+  - Capped at 3.5°F to prevent single-day outliers (OKC's 22°F miss) from
+    over-inflating any city's sigma.
+  - Strategy tag prefix bumped V529 → V529.B for clean validation cutoff.
+  - This is the FIRST item from the original V5.29 punch list (memory #19,
+    June 4 2026) — should have shipped before V5.29.A Σp gate.
 
 V5.29.A changes from V5.28.4:
   - NEW: Σp gate. Computes sum of YES implied probabilities across Kalshi
@@ -103,7 +117,7 @@ SUPABASE_URL  = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY  = os.environ.get('SUPABASE_KEY', '')
 
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
-HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.29.A', 'Accept': 'application/json'}
+HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.29.B', 'Accept': 'application/json'}
 
 # ── Validator Configuration ──────────────────────────────────────────────────
 PAPER_BET_STAKE       = 3.0
@@ -226,12 +240,31 @@ GFS_CITY_WEIGHT = {
     'Boston': 0.0, 'Washington DC': 0.0,
 }
 
+# V5.29.B per-city sigma recalibration from observed 28-day data (Jun 17 2026).
+# Previous hardcoded values were drastically underconfident for most cities
+# (Boston 1.9 vs observed 3.66, NYC 1.8 vs 3.03) and overconfident for desert
+# cities (Phoenix 2.2 vs 0.94, Vegas 2.2 vs 1.24). Capped at 3.5°F to prevent
+# single-day data feed failures (e.g. OKC's 22°F outlier) from over-inflating.
+# Recalibration date: 2026-06-17. Re-run quarterly or after structural changes.
 BASE_SIGMA = {
-    'New York': 1.8, 'Philadelphia': 1.8, 'Washington DC': 1.9, 'Boston': 1.9,
-    'Los Angeles': 1.7, 'Denver': 1.9, 'Miami': 2.0, 'Minneapolis': 2.1,
-    'New Orleans': 2.1, 'Phoenix': 2.2, 'Las Vegas': 2.2, 'Atlanta': 2.3,
-    'Dallas': 2.3, 'Austin': 2.3, 'Houston': 2.3, 'San Antonio': 2.3,
-    'Oklahoma City': 2.5, 'Chicago': 2.1,
+    'Boston': 3.5,        # was 1.9 — observed σ 3.66 (capped)
+    'Oklahoma City': 3.5, # was 2.5 — observed σ 4.35 (capped, outlier-inflated)
+    'San Antonio': 3.2,   # was 2.3 — observed σ 3.19
+    'New York': 3.0,      # was 1.8 — observed σ 3.03
+    'Dallas': 3.0,        # was 2.3 — observed σ 3.02
+    'Miami': 3.0,         # was 2.0 — observed σ 2.99
+    'Atlanta': 2.8,       # was 2.3 — observed σ 2.77
+    'Los Angeles': 2.7,   # was 1.7 — observed σ 2.69
+    'Austin': 2.6,        # was 2.3 — observed σ 2.64
+    'Washington DC': 2.6, # was 1.9 — observed σ 2.60
+    'Chicago': 2.3,       # was 2.1 — observed σ 2.31
+    'Minneapolis': 2.2,   # was 2.1 — observed σ 2.20
+    'Denver': 2.1,        # was 1.9 — observed σ 2.12
+    'Houston': 2.1,       # was 2.3 — observed σ 2.06 (slight tighten)
+    'New Orleans': 2.0,   # was 2.1 — observed σ 1.95
+    'Philadelphia': 1.7,  # was 1.8 — observed σ 1.74
+    'Las Vegas': 1.2,     # was 2.2 — observed σ 1.24 (major tighten)
+    'Phoenix': 0.9,       # was 2.2 — observed σ 0.94 (major tighten)
 }
 
 NWS_BIAS_BOOST_CITIES = {'Washington DC', 'Oklahoma City', 'Denver', 'Austin', 'San Antonio'}
@@ -1705,7 +1738,7 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
         if yes_qualifies and trust_yes is not None:
             for threshold in TRUST_THRESHOLDS:
                 if trust_yes >= threshold:
-                    tag = f'V529_PAPER_YES_{window_label}_T{threshold}'
+                    tag = f'V529B_PAPER_YES_{window_label}_T{threshold}'
                     if sb_count_paper_bets_today(city, tag) > 0:
                         continue
                     sp_str = f' | Σp {sigma_p:.3f}' if sigma_p is not None else ''
@@ -1724,7 +1757,7 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
         if no_qualifies and trust_no is not None:
             for threshold in TRUST_THRESHOLDS:
                 if trust_no >= threshold:
-                    tag = f'V529_PAPER_NO_{window_label}_T{threshold}'
+                    tag = f'V529B_PAPER_NO_{window_label}_T{threshold}'
                     if sb_count_paper_bets_today(city, tag) > 0:
                         continue
                     bust_note = ' [BUSTED]' if busted else ''
@@ -1754,7 +1787,7 @@ def main():
     now_et = datetime.now(pytz.timezone('America/New_York'))
     utc_now = datetime.utcnow()
 
-    print(f'\n=== V5.29.A Weather Fetch Run ===')
+    print(f'\n=== V5.29.B Weather Fetch Run ===')
     print(f'Date: {today} | ET: {now_et.strftime("%I:%M %p ET")} | UTC: {utc_now.strftime("%H:%M")}')
     print(f'Cities: {len(CITIES)} (all 18 including hidden)\n')
 
