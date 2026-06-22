@@ -1,6 +1,19 @@
 """
-fetch_weather.py — MPH Weather Model V5.29.C
+fetch_weather.py — MPH Weather Model V5.29.D
 Scheduled weather fetcher + paper-bet validator for GitHub Actions.
+
+V5.29.D changes from V5.29.C:
+  - ENSEMBLE-AWARE CONSENSUS CORRECTION. When GFS ensemble disagrees with
+    NWS-derived consensus by >3F, shift consensus halfway toward ensemble
+    (capped at ±2F). Catches days where NWS is systematically wrong but
+    ensemble (or V5.29.C fallback) is closer to reality.
+  - Evidence: Jun 20 data. Dallas NWS 88, ensemble 93.4, actual 93. With
+    V5.29.D consensus would have shifted 88.8→90.8, picking correct bracket.
+    Minneapolis Jun 19 NWS 69, ensemble 74.5, actual 76. Similar pattern.
+  - Safeguards: skip when obs_high already locked, skip when ensemble is
+    wildly off from NWS (>8F probable bad data), hard cap ±2F adjustment.
+  - Logs '🎯 V5.29.D consensus shift' when correction fires.
+  - Strategy tag prefix bumped V529C → V529D for clean validation cutoff.
 
 V5.29.C changes from V5.29.B:
   - GFS /v1/forecast fallback when /v1/ensemble fails.
@@ -132,7 +145,7 @@ SUPABASE_URL  = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY  = os.environ.get('SUPABASE_KEY', '')
 
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
-HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.29.C', 'Accept': 'application/json'}
+HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.29.D', 'Accept': 'application/json'}
 
 # ── Validator Configuration ──────────────────────────────────────────────────
 PAPER_BET_STAKE       = 3.0
@@ -1824,7 +1837,7 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
         if yes_qualifies and trust_yes is not None:
             for threshold in TRUST_THRESHOLDS:
                 if trust_yes >= threshold:
-                    tag = f'V529C_PAPER_YES_{window_label}_T{threshold}'
+                    tag = f'V529D_PAPER_YES_{window_label}_T{threshold}'
                     if sb_count_paper_bets_today(city, tag) > 0:
                         continue
                     sp_str = f' | Σp {sigma_p:.3f}' if sigma_p is not None else ''
@@ -1843,7 +1856,7 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
         if no_qualifies and trust_no is not None:
             for threshold in TRUST_THRESHOLDS:
                 if trust_no >= threshold:
-                    tag = f'V529C_PAPER_NO_{window_label}_T{threshold}'
+                    tag = f'V529D_PAPER_NO_{window_label}_T{threshold}'
                     if sb_count_paper_bets_today(city, tag) > 0:
                         continue
                     bust_note = ' [BUSTED]' if busted else ''
@@ -1873,7 +1886,7 @@ def main():
     now_et = datetime.now(pytz.timezone('America/New_York'))
     utc_now = datetime.utcnow()
 
-    print(f'\n=== V5.29.C Weather Fetch Run ===')
+    print(f'\n=== V5.29.D Weather Fetch Run ===')
     print(f'Date: {today} | ET: {now_et.strftime("%I:%M %p ET")} | UTC: {utc_now.strftime("%H:%M")}')
     print(f'Cities: {len(CITIES)} (all 18 including hidden)\n')
 
@@ -1940,6 +1953,35 @@ def main():
             warm_offset = CITY_WARM_OFFSET.get(city, 0.0)
             print(f'    Consensus: {consensus}F (raw={consensus_raw:.1f}, '
                   f'bias={bias_correction:+.2f}, offset={warm_offset:+.1f})')
+
+            # V5.29.D: ensemble-aware consensus correction.
+            # When the GFS ensemble disagrees with NWS-derived consensus by >3F,
+            # shift consensus halfway toward ensemble (capped at ±2F). This
+            # catches days where NWS is systematically wrong but ensemble (or
+            # V5.29.C fallback) is closer to reality. Jun 20 data: Dallas NWS
+            # 88, ensemble 93.4, actual 93 — would have shifted consensus
+            # 88.8→90.8, picking the correct bracket.
+            #
+            # Safeguards:
+            #   - Skip if obs_high is locked in and consensus matches obs_high
+            #     (don't second-guess observed reality)
+            #   - Skip if ensemble_mean differs from NWS by >8F (probably a
+            #     bad fallback value, not real signal)
+            #   - Cap adjustment at ±2F to prevent catastrophic over-correction
+            if ensemble_mean is not None and nws_fc is not None:
+                gap = ensemble_mean - consensus
+                nws_ensemble_gap = abs(ensemble_mean - nws_fc)
+                # Skip correction if obs_high is the consensus (already locked)
+                obs_locked = (obs_high is not None and abs(consensus - obs_high) < 0.1)
+                # Skip if ensemble is wildly off from NWS (likely bad data)
+                ensemble_wildly_off = nws_ensemble_gap > 8.0
+                if abs(gap) > 3.0 and not obs_locked and not ensemble_wildly_off:
+                    adjustment = max(-2.0, min(2.0, 0.5 * gap))
+                    new_consensus = round(consensus + adjustment, 1)
+                    print(f'    🎯 V5.29.D consensus shift: ensemble={ensemble_mean}F vs '
+                          f'consensus={consensus}F (gap={gap:+.1f}F) → {new_consensus}F '
+                          f'(adj={adjustment:+.1f}F)')
+                    consensus = new_consensus
 
             ok = sb_upsert(
                 city=city, consensus=consensus, forecast=nws_fc,
