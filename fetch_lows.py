@@ -125,7 +125,7 @@ LOW_SERIES = {
     'Los Angeles': 'KXLOWTLAX', 'Dallas': 'KXLOWTDAL',
     'Austin': 'KXLOWTAUS', 'Houston': 'KXLOWTHOU',
     'Atlanta': 'KXLOWTATL', 'Miami': 'KXLOWTMIA',
-    'New York': 'KXLOWTNY', 'San Antonio': 'KXLOWTSATX',
+    'New York': 'KXLOWTNYC', 'San Antonio': 'KXLOWTSATX',
     'New Orleans': 'KXLOWTNOLA', 'Philadelphia': 'KXLOWTPHIL',
     'Boston': 'KXLOWTBOS', 'Denver': 'KXLOWTDEN',
     'Oklahoma City': 'KXLOWTOKC', 'Minneapolis': 'KXLOWTMIN',
