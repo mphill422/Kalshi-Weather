@@ -1,0 +1,20 @@
+name: Min Timing Probe
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 10-23 * * *'
+
+jobs:
+  timing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests pytz
+      - name: Run timing probe
+        env:
+          WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
+        run: python min_timing_probe.py
