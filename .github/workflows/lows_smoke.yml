@@ -16,4 +16,4 @@ jobs:
       - name: Run smoke test
         env:
           WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
-        run: python fetch_lows.py
+       run: python wethr_probe.py
