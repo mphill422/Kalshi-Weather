@@ -81,16 +81,31 @@ def fcst_low(station):
 
 
 def obs_history(station):
-    """observations.php with mode omitted = history. Returns raw payload."""
-    try:
-        r = requests.get('https://wethr.net/api/v2/observations.php',
-                         params={'station_code': station},
-                         headers=WETHR_HEADERS, timeout=20)
-        if r.status_code == 200:
-            return r.json()
-        return {'__http__': r.status_code, '__body__': r.text[:200]}
-    except Exception as e:
-        return {'__exc__': f'{type(e).__name__}: {str(e)[:150]}'}
+    """observations.php with mode omitted = history. Requires start_time/end_time
+    (UTC). Pull a 3.5-day window so we cover the last 2 settled days + today."""
+    now = datetime.utcnow()
+    start = (now - timedelta(days=3, hours=12)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    end = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+    # try a few likely param spellings; return the first that returns a list
+    param_variants = [
+        {'station_code': station, 'start_time': start, 'end_time': end},
+        {'station_code': station, 'start_time': start[:10], 'end_time': end[:10]},
+    ]
+    last = None
+    for params in param_variants:
+        try:
+            r = requests.get('https://wethr.net/api/v2/observations.php',
+                             params=params, headers=WETHR_HEADERS, timeout=20)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    return data
+                last = data
+            else:
+                last = {'__http__': r.status_code, '__body__': r.text[:200]}
+        except Exception as e:
+            last = {'__exc__': f'{type(e).__name__}: {str(e)[:150]}'}
+    return last
 
 
 def temp_of(rec):
