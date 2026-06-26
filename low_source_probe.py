@@ -80,32 +80,44 @@ def fcst_low(station):
     return None
 
 
-def obs_history(station):
-    """observations.php with mode omitted = history. Requires start_time/end_time
-    (UTC). Pull a 3.5-day window so we cover the last 2 settled days + today."""
+def _obs_chunk(station, start, end):
+    """One observations.php history call for a [start,end] UTC window (<=24h)."""
+    params = {'station_code': station, 'start_time': start, 'end_time': end}
+    try:
+        r = requests.get('https://wethr.net/api/v2/observations.php',
+                         params=params, headers=WETHR_HEADERS, timeout=20)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list):
+                return data, None
+            return None, {'__http__': 200, '__body__': str(data)[:200]}
+        return None, {'__http__': r.status_code, '__body__': r.text[:200]}
+    except Exception as e:
+        return None, {'__exc__': f'{type(e).__name__}: {str(e)[:150]}'}
+
+
+def obs_history(station, n_days=4):
+    """Fetch history in per-UTC-day ~24h chunks and MERGE. Each chunk stays under
+    the endpoint's range cap. We grab the last n_days UTC days (covers the last
+    2 *local* settled days fully, since a US local day spans 2 adjacent UTC days).
+    Returns (records_list, first_error_or_None)."""
     now = datetime.utcnow()
-    start = (now - timedelta(days=3, hours=12)).strftime('%Y-%m-%dT%H:%M:%SZ')
-    end = now.strftime('%Y-%m-%dT%H:%M:%SZ')
-    # try a few likely param spellings; return the first that returns a list
-    param_variants = [
-        {'station_code': station, 'start_time': start, 'end_time': end},
-        {'station_code': station, 'start_time': start[:10], 'end_time': end[:10]},
-    ]
-    last = None
-    for params in param_variants:
-        try:
-            r = requests.get('https://wethr.net/api/v2/observations.php',
-                             params=params, headers=WETHR_HEADERS, timeout=20)
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list):
-                    return data
-                last = data
-            else:
-                last = {'__http__': r.status_code, '__body__': r.text[:200]}
-        except Exception as e:
-            last = {'__exc__': f'{type(e).__name__}: {str(e)[:150]}'}
-    return last
+    all_recs = []
+    first_err = None
+    for i in range(n_days):
+        day = (now - timedelta(days=i)).date()
+        start = f'{day.isoformat()}T00:00:00Z'
+        # end at 23:59:59 of that UTC day, but never past now
+        end_dt = min(datetime.combine(day, datetime.max.time()).replace(microsecond=0), now)
+        end = end_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+        recs, err = _obs_chunk(station, start, end)
+        if recs:
+            all_recs.extend(recs)
+        elif first_err is None:
+            first_err = err
+    if all_recs:
+        return all_recs, None
+    return None, first_err
 
 
 def temp_of(rec):
@@ -155,17 +167,17 @@ def main():
 
     # First, dump the shape of the history payload for one city so we learn it
     sample_st = CITIES['Miami'][0]
-    sample = obs_history(sample_st)
+    sample, sample_err = obs_history(sample_st)
     if isinstance(sample, list):
         print(f'obs-history shape: LIST of {len(sample)} records'
               + (f' | sample keys: {list(sample[0].keys())[:8]}…' if sample and isinstance(sample[0], dict) else ''))
     else:
-        print(f'obs-history shape: {type(sample).__name__} → {str(sample)[:200]}')
+        print(f'obs-history shape: no records | err → {str(sample_err)[:200]}')
     print()
 
     q1_matches = []
     for city, (st, tz) in CITIES.items():
-        hist = obs_history(st)
+        hist, _ = obs_history(st)
         mins, nrec, span = daily_mins_from_history(hist, tz)
         f_low = fcst_low(st)
 
