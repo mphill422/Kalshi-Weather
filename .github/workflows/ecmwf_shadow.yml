@@ -1,0 +1,21 @@
+name: ECMWF Shadow
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 13 * * *'
+
+jobs:
+  shadow:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests pytz
+      - name: Run ECMWF shadow
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python ecmwf_shadow.py
