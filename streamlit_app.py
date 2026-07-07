@@ -132,7 +132,7 @@ MIN_EDGE = 8
 # V5.27 Three research-validated gating constants
 PRICE_FLOOR_CENTS = 30
 CONSENSUS_TOP_N = 2
-ONE_CITY_PER_DAY = True
+ONE_CITY_PER_DAY = False
 
 HEADERS = {'User-Agent': 'kalshi-temp-model/5.27.1', 'Accept': 'application/geo+json, application/json, text/html'}
 try:
@@ -289,10 +289,8 @@ GFS_CITY_WEIGHT = {
     'Boston': 0.0, 'Washington DC': 0.0,
 }
 
-HIDDEN_CITIES = {
-    'Minneapolis', 'Denver', 'Chicago', 'Austin',
-    'Philadelphia', 'Boston', 'San Antonio',
-}
+HIDDEN_CITIES = set()
+
 
 SPRING_WIDE_THRESHOLD_CITIES = {'New York', 'Philadelphia', 'Boston', 'Washington DC', 'Los Angeles'}
 NORTHEAST_CITIES = {'New York', 'Philadelphia', 'Boston', 'Washington DC'}
