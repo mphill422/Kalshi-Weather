@@ -2155,6 +2155,40 @@ if rejected_cities or len(qualifying_picks) > 1:
                 st.markdown(f'- **{c}** — {reason}')
 
 
+# ── Auto-logger: record today's gated YES picks (button-triggered) ──
+    with st.expander('📝 Log Today\'s Gated Picks (paper)', expanded=False):
+        st.caption('Records today\'s qualifying picks to the bets table, tagged '
+                   'AUTO_GATED, so the gated strategy can be measured over time. '
+                   'Dupe-guarded — safe to press more than once.')
+        _tstr = get_eastern_date()
+        if not qualifying_picks:
+            st.info('No qualifying picks to log today (skip day or all gates rejected).')
+        else:
+            if st.button(f'📝 Log {len(qualifying_picks)} gated pick(s) for {_tstr}',
+                         key='_auto_log_gated'):
+                _existing = sb_fetch_bets() or []
+                _already = {(b.get('city'), str(b.get('date')))
+                            for b in _existing
+                            if (b.get('strategy_tag') or '').startswith('AUTO_GATED')}
+                _logged_now = []
+                for _c, _pick in qualifying_picks.items():
+                    if (_c, _tstr) in _already:
+                        continue
+                    _row = {
+                        'date': _tstr, 'city': _c,
+                        'bracket': _pick['label'], 'direction': _pick['side'],
+                        'price': _pick['price'], 'amount': PAPER_BET_STAKE_AUTO,
+                        'result': 'Pending', 'profit': 0.0, 'payout': 0.0,
+                        'actual': None, 'strategy_tag': 'AUTO_GATED',
+                        'logged_at': datetime.now(pytz.timezone('America/New_York')).isoformat(),
+                    }
+                    if sb_insert_bet(_row):
+                        _logged_now.append(f'{_c} {_pick["label"]} {_pick["side"]} @ {_pick["price"]}c')
+                if _logged_now:
+                    st.success(f'✅ Logged {len(_logged_now)}: ' + ' · '.join(_logged_now))
+                else:
+                    st.caption('Nothing new to log (already logged today).')
+
 with st.expander('🔬 V5.27.1 Diagnostic Dashboard — Trust the Model?', expanded=False):
     st.caption('This panel measures whether the model deserves your trust today. '
                'It does NOT change any predictions — it tells you when predictions are likely reliable.')
