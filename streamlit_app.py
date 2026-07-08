@@ -356,7 +356,7 @@ def _bust_settlements_cache():
 def _sb_fetch_all_cached():
     try:
         r = requests.get(sb_url('settlements'), headers=get_sb_headers(),
-                         params={'order': 'date.asc', 'limit': '1000'}, timeout=10)
+                         params={'order': 'date.desc', 'limit': '3000'}, timeout=10)
         return r.json() if r.status_code == 200 else []
     except Exception: return []
 
