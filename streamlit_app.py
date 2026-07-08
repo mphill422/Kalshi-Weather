@@ -2180,7 +2180,7 @@ if rejected_cities or len(qualifying_picks) > 1:
                         'price': _pick['price'], 'amount': PAPER_BET_STAKE_AUTO,
                         'result': 'Pending', 'profit': 0.0, 'payout': 0.0,
                         'actual': None, 'strategy_tag': 'AUTO_GATED',
-                        'logged_at': datetime.now(pytz.timezone('America/New_York')).isoformat(),
+                
                     }
                     if sb_insert_bet(_row):
                         _logged_now.append(f'{_c} {_pick["label"]} {_pick["side"]} @ {_pick["price"]}c')
