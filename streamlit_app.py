@@ -1178,12 +1178,7 @@ def select_qualifying_bet_v527(city, prob_rows, kalshi_markets, ladder_text, ens
                 'gate_reason': consensus_reason,
             })
 
-    no_qualifies = False
-    if busted and no_ask is not None and no_ask <= 5:
-        no_qualifies = True
-    elif (no_icon == '🟢' and (1.0 - final_prob) >= 0.10
-          and not busted and no_ask is not None):
-        no_qualifies = True
+    no_qualifies = False  # V5.28 NO-block: all NO bets disabled
 
     if no_qualifies:
         floor_pass, _ = passes_price_floor(no_ask)
