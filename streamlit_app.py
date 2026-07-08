@@ -131,6 +131,7 @@ MIN_EDGE = 8
 
 # V5.27 Three research-validated gating constants
 PRICE_FLOOR_CENTS = 30
+PAPER_BET_STAKE_AUTO = 10.0
 CONSENSUS_TOP_N = 2
 ONE_CITY_PER_DAY = False
 
