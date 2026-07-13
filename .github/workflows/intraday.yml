@@ -1,0 +1,22 @@
+name: Intraday Atmospherics
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/20 12-23 * * *'
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests pytz
+      - name: Run intraday collector
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
+        run: python fetch_intraday.py
