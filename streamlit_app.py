@@ -2210,7 +2210,7 @@ with st.expander('🔬 V5.27.1 Diagnostic Dashboard — Trust the Model?', expan
     _today_logged = sb_fetch_all() or []
     _today_logged = [r for r in _today_logged if r.get('date') == today_str]
     _logged_cities = set(r.get('city') for r in _today_logged)
-    _missing_cities = [c for c in CITIES.keys() if c not in _logged_cities]
+    _missing_cities = [c for c in CITIES.keys() if c not in _logged_cities and c not in HIDDEN_CITIES]
 
     bcol1, bcol2 = st.columns([1, 2])
     with bcol1:
