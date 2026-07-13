@@ -2220,7 +2220,7 @@ with st.expander('🔬 V5.27.1 Diagnostic Dashboard — Trust the Model?', expan
             except Exception: pass
             progress = st.progress(0, text='Starting...')
             results = {'logged': [], 'failed': []}
-            cities_list = list(CITIES.keys())
+            cities_list = [c for c in CITIES.keys() if c not in HIDDEN_CITIES]
             for i, c in enumerate(cities_list):
                 try:
                     progress.progress((i + 1) / len(cities_list),
