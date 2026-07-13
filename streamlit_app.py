@@ -3199,4 +3199,3 @@ if bet_log_unlocked:
 st.markdown('---')
 st.caption('🌡️ MPH Weather Model V5.27.1 — Three research-validated gates active')
 # working baseline).
-baseline before allowlist merge
