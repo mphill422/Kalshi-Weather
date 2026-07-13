@@ -2070,7 +2070,7 @@ _last_sync_time = last_sync_data.get('date', '—')
 st.markdown(f"""
 <div class="mph-stats-bar">
     <div class="mph-stat">
-        <span class="mph-stat-value">{_n_cities}/18</span>
+        <span class="mph-stat-value">{_n_cities}/11</span>
         <span class="mph-stat-label">Cities Live</span>
     </div>
     <div class="mph-stat {'mph-stat-neutral' if _synced_count < 18 else ''}">
