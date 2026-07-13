@@ -1800,6 +1800,16 @@ def save_city_prediction(city, weather, saved_ladders):
     consensus_raw = compute_consensus(nws_fc, cur, current_temp, city, obs_high=obs_high)
     bias_correction, _ = compute_bias_correction_db(city)
     consensus = round(consensus_raw + bias_correction, 1)
+    # V5.29.D: ensemble-aware consensus correction.
+    ensemble_mean = weather.get('ensemble_mean')
+    if ensemble_mean is not None and nws_fc is not None:
+        gap = ensemble_mean - consensus
+        nws_ensemble_gap = abs(ensemble_mean - nws_fc)
+        obs_locked = (obs_high is not None and abs(consensus - obs_high) < 0.1)
+        ensemble_wildly_off = nws_ensemble_gap > 8.0
+        if abs(gap) > 3.0 and not obs_locked and not ensemble_wildly_off:
+            adjustment = max(-2.0, min(2.0, 0.5 * gap))
+            consensus = round(consensus + adjustment, 1)
     save_ok = sb_upsert_prediction(city=city, consensus=consensus, forecast=nws_fc,
                                     ensemble_mean=weather['ensemble_mean'], source_gap=weather['source_gap'],
                                     high_uncertainty=weather['high_uncertainty'], obs_high=obs_high,
