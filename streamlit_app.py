@@ -2062,7 +2062,7 @@ else:
             st.rerun()
 
 _all_rows_stats = sb_fetch_all()
-_today_rows_stats = [r for r in _all_rows_stats if r.get('date') == today_str]
+_today_rows_stats = [r for r in _all_rows_stats if r.get('date') == today_str and r.get('city') not in HIDDEN_CITIES]
 _n_cities = len(_today_rows_stats)
 _synced_count = len(last_sync_data.get('synced', []))
 _last_sync_time = last_sync_data.get('date', '—')
