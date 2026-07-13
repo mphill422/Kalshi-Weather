@@ -290,7 +290,10 @@ GFS_CITY_WEIGHT = {
     'Boston': 0.0, 'Washington DC': 0.0,
 }
 
-HIDDEN_CITIES = set()
+HIDDEN_CITIES = {
+    'Atlanta', 'New Orleans', 'Philadelphia', 'San Antonio',
+    'Denver', 'Dallas', 'New York',
+}
 
 
 SPRING_WIDE_THRESHOLD_CITIES = {'New York', 'Philadelphia', 'Boston', 'Washington DC', 'Los Angeles'}
