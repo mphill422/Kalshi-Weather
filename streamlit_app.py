@@ -272,11 +272,11 @@ DEFAULT_LADDERS = {
 }
 
 BASE_SIGMA = {
-    'New York': 1.8, 'Philadelphia': 1.8, 'Washington DC': 1.9, 'Boston': 1.9,
-    'Los Angeles': 1.7, 'Denver': 1.9, 'Miami': 2.0, 'Minneapolis': 2.1,
-    'New Orleans': 2.1, 'Phoenix': 2.2, 'Las Vegas': 2.2, 'Atlanta': 2.3,
-    'Dallas': 2.3, 'Austin': 2.3, 'Houston': 2.3, 'San Antonio': 2.3,
-    'Oklahoma City': 2.5, 'Chicago': 2.1,
+    'Boston': 3.5, 'Oklahoma City': 3.5, 'San Antonio': 3.2, 'New York': 3.0,
+    'Dallas': 3.0, 'Miami': 3.0, 'Atlanta': 2.8, 'Los Angeles': 2.7,
+    'Austin': 2.6, 'Washington DC': 2.6, 'Chicago': 2.3, 'Minneapolis': 2.2,
+    'Denver': 2.1, 'Houston': 2.1, 'New Orleans': 2.0, 'Philadelphia': 1.7,
+    'Las Vegas': 1.2, 'Phoenix': 0.9,
 }
 
 DESERT_CITIES = {'Phoenix', 'Las Vegas'}
