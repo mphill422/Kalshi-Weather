@@ -2964,8 +2964,6 @@ if forecast is not None:
     import pandas as pd
     st.markdown('<div class="mph-section-header">📈 YES Signals</div>', unsafe_allow_html=True)
     st.dataframe(pd.DataFrame(yes_rows), use_container_width=True, hide_index=True)
-    st.markdown('<div class="mph-section-header">📉 NO Signals</div>', unsafe_allow_html=True)
-    st.dataframe(pd.DataFrame(no_rows), use_container_width=True, hide_index=True)
     st.caption('🚦 = passes all three V5.27.1 gates · 🚫 = blocked by Gate 1 (not model+market consensus)')
 
     # ── V5.27.1 Per-City Gate Status ──
