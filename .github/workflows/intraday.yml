@@ -3,7 +3,7 @@ name: Intraday Atmospherics
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/20 12-23 * * *'
+    - cron: '*/30 15-23,0-2 * * *'
 
 jobs:
   collect:
