@@ -1,10 +1,6 @@
 name: Intraday Atmospherics
-
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '*/30 15-23,0-2 * * *'
-
 jobs:
   collect:
     runs-on: ubuntu-latest
