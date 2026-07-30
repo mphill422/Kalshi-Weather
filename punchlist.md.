@@ -1,0 +1,285 @@
+# MPH Weather Model — Punchlist / State of Things
+
+_Last updated: 2026-07-29 (night session). Live model: V5.29.D. Bankroll still paper._
+
+This is the durable record. My (Claude's) memory carries summarized facts across
+chats but is not guaranteed complete — THIS FILE is the source of truth. Update it
+as things change.
+
+---
+
+## TOMORROW / NEXT UP
+
+- **Lows model build** — paper only. All 20 cities incl. SF + Seattle.
+  Scaffolding already in repo: `fetch_lows.py`, `cli_min_history.py`,
+  `V5.30_lows_spec.md`, `min_timing_probe.py`, `low_source_probe.py`.
+  - First step: VERIFY `KXLOWT{CITY}` tickers exist for all 20, esp. KSFO/KSEA.
+    If SF/Seattle lows aren't live on Kalshi yet → build 18 + stub the two.
+  - Parser change: extract calendar-day MINIMUM from CLI hourly (midnight-midnight,
+    ~10 lines). MIKE PASTES the current CLI parser; do NOT reconstruct from memory.
+  - New cron (separate job), new bets table / strategy tag for lows.
+  - Paper accumulation. No real money until clean settled data confirms edge.
+  - SF/Seattle = genuine unknowns: no calibrated sigma (start on default),
+    marine-layer overnight dynamics. Watch, don't assume.
+
+---
+
+## TONIGHT'S DIAGNOSIS (the big result) — 2026-07-29
+
+Came in for a 10-day intraday cron check, walked out having located the leak.
+
+**Confirmed working / ruled out as the problem:**
+- Intraday collector: HEALTHY. Cadence fixed (7/day → 34-36/day from Jul 25 on).
+  LA afternoon peak no longer clipped (last capture ~23:40 UTC vs old 22:36).
+- Forecasts are GOOD. ECMWF shadow (31 days, 18 cities): our model beats ECMWF
+  in 16/18 cities, most by >1°F. Most cities sub-1.5°F MAE. → **ECMWF idea is DEAD.
+  Stop wondering.** (LA's 9.64 ECMWF MAE = shadow-logger bug, ignore.)
+- Chicago station: CONFIRMED CORRECT (KMDW/Midway across CITIES, WETHR_STATIONS,
+  CLI_STATIONS, lat 41.7868/-87.7522). April fix intact through V5.29.D.
+  Chicago's losses are REAL, not a station artifact.
+- Prediction logging: COMPLETE. 32 days × 18 cities, zero gaps. Forgotten manual
+  days did NOT hole the automated data. The "Collect All 18" button is redundant
+  (cron already logs).
+
+**THE LEAK — located at the betting layer, not forecasting:**
+- Gates bet LOSING cities most, WINNING cities least (inverted selection).
+  Boston: 16 bets, 100%, +91% ROI (starved). New Orleans: 42 bets, −62% (force-fed).
+- All four gate sub-strategies lose (CONVICTION/EDGE × T75/T80), clustered
+  ~48-51% win at ~52¢ avg price. Looser thresholds (more bets) lose MORE.
+  → gates are TOO PERMISSIVE.
+- **Price bucket finding (the sharp one):** edge is at the EXTREMES, loss is the MIDDLE.
+  - 70¢+ favorites: 34-for-34 overall, 30-for-30 on 11-city allowlist. +13-31% ROI.
+    STRONGEST, most robust finding. Held every cut.
+  - 30-44¢ cheap MORNING: +38% ROI on allowlist. Second-strongest.
+  - **45-69¢ MIDDLE: poison. Loses in every config.** Holds ~all the losses.
+  - Cheap AFTER midday: decays to negative (morning-only edge).
+- Price × time interaction is real but thinner-sample; the two extremes are the
+  trustworthy parts.
+
+**CRITICAL CAVEAT on all of the above:** V529D_PAPER data starts **Jul 14** — only
+~2 weeks, all summer (stable/easy weather). The `date >= 2026-05-22` filter was doing
+nothing (no data that early). Cells are 8-42 bets, BELOW the 50-bet discipline bar.
+30-for-30 on 70¢+ is suspiciously perfect — could be real edge OR a selection artifact
+(model only reaches 70¢ on near-certain days). NOT confirmed. NOT a green light.
+
+**Data also includes DROPPED cities** (New Orleans, San Antonio, Dallas, etc.) — the
+cron paper-bets ~all 18, not just the 11 allowlist. Key findings above were re-checked
+on the 11 active cities and HELD.
+
+---
+
+## LIKELY FIX (post-validation — do NOT act yet)
+
+The leak is gate SELECTIVITY, not forecasting, not stations, not city choice,
+not prediction-mode (nws_only vs full_blend). The lever is:
+- **Skip the 45-69¢ middle** (coin-flip prices where model has no edge).
+- **Favor 70¢+ favorites** and morning cheap longshots.
+- Possibly a price×time filter, but the interaction cells need more data.
+- Prediction-mode swaps are probably the WRONG lever for poor cities — forecasts
+  are already good; the leak is downstream at bet selection.
+
+Before trusting the 70¢+ edge: confirm it's not a "only bets sure things" artifact,
+and that it survives non-summer weather.
+
+---
+
+## RESEARCH QUEUE (post-validation, isolated tests, ONE variable at a time)
+
+- **Basket / cluster trade** — see `basket_trade_spec.md`. Top untested thread,
+  surfaced 5+ times. Targets the 45-69¢ dead zone by covering 2 adjacent brackets.
+  Math is a CEILING (combined cost < ~0.90), fees are the gotcha, afternoon-only.
+  Paper tag `V529_PAPER_BASKET_YES`.
+- **Price×time gate filter** — formalize "extremes yes, middle no" once more data.
+- **HRRR re-evaluation** — PARKED, not rejected. Removed in an early version; may
+  interact differently with V5.29.D. Test via isolated shadow only, never on
+  outside say-so. (3 guides push it; Mike tested + removed it before.)
+- **Intraday probability-collapse** — use live obs to narrow brackets in real time.
+  The edge the collector exists for. Data pipeline now confirmed healthy.
+- **Early-timing test (9-10am) for stable cities** — measure accuracy-vs-price per
+  hour; expect a sweet spot, not "earlier = better." Give it non-summer data.
+
+---
+
+## DISCARDED (checked, dead)
+
+- ECMWF integration — model beats it 16/18. Dead per its own success criterion.
+- Early-entry timing (3-5 days out) — 5 sources push it; contradicts validated
+  agreement edge. Mike's edge is near-settlement, not early forecasting.
+- App-based weather sources (TWC/AccuWeather) — station-pinning too slow on phone.
+- MOS for manual capture — raw UTC grid too slow/foreign. (Possible future MODEL
+  input if scripted; not for hand-use.)
+- Within-market arbitrage, LIP market-making, whale-copy — all debunked earlier.
+
+---
+
+## MANUAL TRACKING (Mike, ongoing)
+
+- Capturing market + NWS for all 20 cities at 11 / 12 / 2 ET.
+- NWS forecast link sheet (station-locked) is the forecast source. NWS is the
+  chosen single comparison source (redundant for 6 nws_only in-model cities,
+  useful for blend cities).
+- SF + Seattle tracked manually until lows build brings them into the system.
+  Watch the PRICE of winning brackets, not just whether they win — a stable city
+  that "wins every day" at 90¢ has no edge left to capture.
+- Sheets built: settlement-station reference (KMDW etc.), daily capture grid
+  (ET→CT→PT order), NWS links, MOS+AFD links.
+
+---
+
+## STANDING DISCIPLINE
+
+- No model logic changes during a validation window.
+- No change without 50+ settled bets or a 4+ occurrence repeated pattern.
+- Test one variable at a time, shadow/paper, settled against Iowa State CLI.
+- Win rate ≠ profit. ROI after fees/price is the only real measure.
+  (Proof: several 50%-win cities LOST money in the July data.)
+- Real money only after per-city edge is confirmed on real samples.
+- Edge is concentrated (Boston, maybe Vegas/Phoenix), not broad — size only where
+  confirmed, not on win-rate feel.
+
+
+---
+
+# APPENDIX: Basket / Cluster Trade — Full Spec
+
+_(Referenced above in the Research Queue. Full detail here so it lives in one file.)_
+
+
+**Status:** RESEARCH QUEUE — do not build until (a) highs validation window closes,
+and (b) the price×time edge hypothesis has more than ~2 weeks of data behind it.
+This is a PAPER strategy first. No real money until it settles clean on its own tag.
+
+Surfaced independently 5+ times across research reading + Mike's own instinct +
+prior-session scoping (Jun 10 "cluster trade", Jun 23 V5.30 notes). It is the top
+untested thread. This spec exists so it can be built correctly without
+re-litigating the logic.
+
+---
+
+## The core idea
+
+At/near peak-heat time (the 2pm ET capture window), the daily high is often
+nearly locked to ONE OF TWO adjacent brackets — e.g. it's clearly going to be
+92 or 93, not 88 and not 97. Instead of guessing which single bracket, BUY BOTH.
+If the high lands in either, that leg pays $1.
+
+This is a way to bet the "I know the neighborhood but not the exact bracket"
+situation — which is exactly the 45-69¢ middle-price zone that LOST money as
+single-bracket bets in the July validation data. The basket may rescue that zone
+by covering the uncertainty instead of guessing into it. MAY. Untested.
+
+---
+
+## The math (get this right — it's a CEILING, not a floor)
+
+You buy 2 adjacent brackets. Cost = price_A + price_B. Payout if the high lands
+in either = $1.00 (the winning leg) — the losing leg pays $0.
+
+**Profit when it hits = $1.00 − (price_A + price_B) − fees**
+**Loss when it misses both = (price_A + price_B) + fees**
+
+Therefore:
+- You want the COMBINED price as LOW as possible. Combined cost is your risk.
+- Combined price ≥ $1.00 → CANNOT PROFIT. Never do it. Hard stop.
+- The rule is a CEILING on combined cost, not a floor.
+
+Mike's instinct was "if two brackets total 70¢ or over" — that is BACKWARDS.
+70¢ combined is GOOD (risk 70¢ to win 100¢). 95¢ combined is marginal.
+Over 100¢ is impossible. Lower total = better.
+
+**Working target ceiling:** combined cost < ~$0.90 AND estimated combined
+probability of the two brackets meaningfully above the combined cost. The gap
+between (combined true probability) and (combined price) is the edge, same as
+single bets — just measured across two legs.
+
+---
+
+## The fee gotcha (this kills naive baskets)
+
+Kalshi charges a per-CONTRACT fee. A 2-leg basket pays fees on BOTH legs for
+$1.00 of total exposure. On cheap legs this eats the edge fast. The Maximus
+0-32 post called this out specifically.
+
+Implication: baskets only work when
+1. combined cost is well below $1.00 (leaving room for the fee), AND
+2. combined win probability is near-certain (afternoon, high nearly locked).
+
+Do NOT basket in the morning when each leg is 20-40¢ and you'd pay 60¢+ for a
+~70% combined probability with two fees stacked on top. That's negative after
+fees. Basket is an AFTERNOON / 2pm-window tactic, when you can pay ~$0.80-0.90
+for a near-locked two-bracket window.
+
+---
+
+## When the basket fires (proposed gate)
+
+All of these must hold at the 2pm ET capture (peak-heat window):
+1. Two ADJACENT brackets are the model's top-2 by probability.
+2. Their combined MODEL probability ≥ ~0.90 (near-certain it's one of the two).
+3. Their combined MARKET price ≤ ~0.88 (leaves edge + fee margin).
+4. The day is in the afternoon/near-locked window (obs high already close to
+   the bracket region — reuse existing obs_high logic from fetch_weather.py).
+
+If combined price > combined model probability → no edge, skip.
+If combined price ≥ ~0.95 → fee margin gone, skip.
+
+---
+
+## How to log it (paper, isolated — never touches live model)
+
+New strategy tag: `V529_PAPER_BASKET_YES`
+
+Store as its OWN paper bets so it can be filtered clean, exactly like the
+existing V529D_PAPER tags. Do NOT mix into single-bracket P&L.
+
+Suggested per-basket record (in bets table, or a small companion table):
+- date, city
+- bracket_A_label, price_A
+- bracket_B_label, price_B
+- combined_cost = price_A + price_B
+- model_prob_A, model_prob_B, combined_model_prob
+- placed_at (need the time-of-day; basket is afternoon-only)
+- result: which bracket settled (A / B / neither)
+- profit = (1.00 − combined_cost − fees) if A or B hit, else −(combined_cost+fees)
+- strategy_tag = 'V529_PAPER_BASKET_YES'
+
+Fees: model Kalshi's actual per-contract fee for 2 contracts so paper P&L is
+honest. Do not log fee-free profit — the whole point is the fee is what makes
+or breaks this.
+
+---
+
+## What success looks like (the test)
+
+After enough settled paper baskets (target 50+, same discipline as everything):
+
+Compare `V529_PAPER_BASKET_YES` ROI against:
+- single-bracket bets in the SAME 45-69¢ middle zone (which lost money in July)
+- doing nothing (skip)
+
+Basket EARNS its place ONLY if its ROI, AFTER modeled fees, beats both. If the
+combined cost consistently eats the edge (fees + prices too high), the idea is
+dead and you stop wondering — same bar as the ECMWF shadow test.
+
+---
+
+## What NOT to do
+
+- Do NOT build this during the highs validation window.
+- Do NOT bet real money on it before 50+ settled paper baskets.
+- Do NOT basket in the morning (fees + loose prices = negative EV).
+- Do NOT basket when combined cost ≥ ~0.95 (no room after fees).
+- Do NOT treat "high win rate" as success — a basket that wins 95% of the time
+  but pays 8¢ per win after fees can still be net-negative. ROI after fees is
+  the only measure that matters.
+
+---
+
+## Connection to existing work
+
+- This is the natural use of the 2pm capture window and the intraday collector's
+  "watch the day lock in" data.
+- It targets exactly the 45-69¢ middle zone that lost money as single bets in
+  the July 2026 validation data — the basket is the hypothesis for how to bet
+  that zone profitably (cover it instead of guessing).
+- Prior scoping: Jun 10 (cluster-trade insight), Jun 23 (V5.30 notes).
