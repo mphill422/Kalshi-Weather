@@ -27,6 +27,14 @@ endpoint fallbacks, same caching) with three lows-specific deltas:
         same JSON — the Iowa cli.py response carries both MAXIMUM and MINIMUM.
 
 ────────────────────────────────────────────────────────────────────────────
+2026-07-30 UPDATE: Added San Francisco (KSFO) and Seattle (KSEA) as cities 19-20.
+  Their LOW_SERIES tickers (KXLOWTSF / KXLOWTSEA) are BEST-GUESS following the
+  KXLOWT+code pattern — never in the highs model, so unverified. If either
+  returns 0 brackets on the smoke test, pull the real ticker off Kalshi and fix
+  that one line. CLI stations KSFO/KSEA match the working-18 pattern; NWS
+  settlement page shows CLISFO/CLISEA as the report ids — if V3 CLI comes back
+  null for these two, that's the fallback to try.
+────────────────────────────────────────────────────────────────────────────
 FIRST-RUN VERIFICATION (3 things this scaffold cannot confirm offline):
   V1  LOW_SERIES tickers. Constructed as KXLOWT + highs city code. Run the
       smoke test (`python fetch_lows.py`) — any city whose bracket count comes
@@ -84,6 +92,8 @@ CITIES = {
     'Minneapolis':   {'lat': 44.8848, 'lon': -93.2223},
     'Washington DC': {'lat': 38.8512, 'lon': -77.0402},
     'Chicago':       {'lat': 41.7868, 'lon': -87.7522},
+    'San Francisco': {'lat': 37.6213, 'lon': -122.3790},
+    'Seattle':       {'lat': 47.4502, 'lon': -122.3088},
 }
 
 CITY_TZ = {
@@ -96,6 +106,7 @@ CITY_TZ = {
     'Boston': 'America/New_York', 'Denver': 'America/Denver',
     'Oklahoma City': 'America/Chicago', 'Minneapolis': 'America/Chicago',
     'Washington DC': 'America/New_York', 'Chicago': 'America/Chicago',
+    'San Francisco': 'America/Los_Angeles', 'Seattle': 'America/Los_Angeles',
 }
 
 WETHR_STATIONS = {
@@ -105,6 +116,7 @@ WETHR_STATIONS = {
     'San Antonio': 'KSAT', 'New Orleans': 'KMSY', 'Philadelphia': 'KPHL',
     'Boston': 'KBOS', 'Denver': 'KDEN', 'Oklahoma City': 'KOKC',
     'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KMDW',
+    'San Francisco': 'KSFO', 'Seattle': 'KSEA',
 }
 
 CLI_STATIONS = {
@@ -114,12 +126,14 @@ CLI_STATIONS = {
     'San Antonio': 'KSAT', 'New Orleans': 'KMSY', 'Philadelphia': 'KPHL',
     'Boston': 'KBOS', 'Denver': 'KDEN', 'Oklahoma City': 'KOKC',
     'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KMDW',
+    'San Francisco': 'KSFO', 'Seattle': 'KSEA',
 }
 
 # Δ1 — CONSTRUCTED low-market series tickers: KXLOWT + (highs city code).
 # Highs city codes, for reference: PHX LV LAX DAL AUS HOU ATL MIA NY SATX NOLA
 # PHIL BOS DEN OKC MIN DC CHI. See FIRST-RUN VERIFICATION V1 — confirm each
 # resolves on the smoke test; correct any individual line that returns 0 brackets.
+# SF/SEA (added 2026-07-30) are BEST-GUESS — verify on smoke test, fix if 0 brackets.
 LOW_SERIES = {
     'Phoenix': 'KXLOWTPHX', 'Las Vegas': 'KXLOWTLV',
     'Los Angeles': 'KXLOWTLAX', 'Dallas': 'KXLOWTDAL',
@@ -130,6 +144,7 @@ LOW_SERIES = {
     'Boston': 'KXLOWTBOS', 'Denver': 'KXLOWTDEN',
     'Oklahoma City': 'KXLOWTOKC', 'Minneapolis': 'KXLOWTMIN',
     'Washington DC': 'KXLOWTDC', 'Chicago': 'KXLOWTCHI',
+    'San Francisco': 'KXLOWTSF', 'Seattle': 'KXLOWTSEA',
 }
 
 
