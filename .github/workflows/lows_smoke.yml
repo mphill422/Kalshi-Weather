@@ -13,7 +13,7 @@ jobs:
           python-version: '3.11'
       - name: Install deps
         run: pip install requests pytz
-      - name: Run probe
+      - name: Run lows smoke test
         env:
           WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
-        run: python wethr_probe.py
+        run: python fetch_lows.py
