@@ -144,7 +144,7 @@ LOW_SERIES = {
     'Boston': 'KXLOWTBOS', 'Denver': 'KXLOWTDEN',
     'Oklahoma City': 'KXLOWTOKC', 'Minneapolis': 'KXLOWTMIN',
     'Washington DC': 'KXLOWTDC', 'Chicago': 'KXLOWTCHI',
-    'San Francisco': 'KXLOWTSF', 'Seattle': 'KXLOWTSEA',
+    'San Francisco': 'KXHIGHTSFO', 'Seattle': 'KXLOWTSEA',
 }
 
 
