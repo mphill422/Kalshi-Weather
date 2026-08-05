@@ -1,5 +1,29 @@
 """
-fetch_weather.py — MPH Weather Model V5.29.E
+fetch_weather.py — MPH Weather Model V5.29.F
+
+V5.29.F changes from V5.29.E:
+  - HOUSTON COORDINATE FIX. CITIES['Houston'] was 29.9902/-95.3368 — those
+    are BUSH INTERCONTINENTAL (KIAH) coordinates. Kalshi settles Houston on
+    HOBBY (KHOU), and both WETHR_STATIONS and CLI_STATIONS correctly said
+    KHOU. So settlement was right, but the NWS grid fallback
+    (fetch_nws_grid → gridpoints hourly forecast) and BOTH Open-Meteo calls
+    (fetch_gfs_ensemble, fetch_gfs_forecast_fallback) were pulling forecast
+    data for the WRONG AIRPORT.
+  - Corrected to 29.6459/-95.2769 (KHOU Hobby), matching the station-locked
+    NWS forecast link sheet.
+  - Impact: Houston is the ONLY city with a nonzero GFS_CITY_WEIGHT (0.18),
+    so bad coordinates propagated further here than they would anywhere else.
+    Bush runs warmer than Hobby on light-wind days — expect Houston consensus
+    to shift slightly cooler and Houston bias_correction to re-converge over
+    the next ~10 settled days.
+  - Historical Houston data prior to this fix is contaminated on the forecast
+    side (settlement/actuals were always correct). Treat pre-fix Houston
+    predictions as suspect; settled bets remain valid since they settled on
+    the correct CLI station.
+  - Known trap set (per Kalshi market rules): O'Hare vs Midway (we use KMDW,
+    verified), Bush vs Hobby (KHOU, fixed here), Love Field vs DFW (we use
+    KDFW — STILL UNVERIFIED, check KXHIGHTDAL market rules).
+  - No other change. All logic, gates, thresholds untouched.
 
 V5.29.E changes from V5.29.D:
   - ROSTER EXPANSION ONLY. Added San Francisco (KSFO) and Seattle (KSEA).
@@ -164,7 +188,7 @@ SUPABASE_URL  = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY  = os.environ.get('SUPABASE_KEY', '')
 
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
-HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.29.E', 'Accept': 'application/json'}
+HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.29.F', 'Accept': 'application/json'}
 
 # ── Validator Configuration ──────────────────────────────────────────────────
 PAPER_BET_STAKE       = 3.0
@@ -216,7 +240,7 @@ CITIES = {
     'Los Angeles':   {'lat': 33.9416, 'lon': -118.4085},
     'Dallas':        {'lat': 32.8998, 'lon': -97.0403},
     'Austin':        {'lat': 30.1945, 'lon': -97.6699},
-    'Houston':       {'lat': 29.9902, 'lon': -95.3368},
+    'Houston':       {'lat': 29.6459, 'lon': -95.2769},  # V5.29.F: KHOU Hobby (was Bush/KIAH coords)
     'Atlanta':       {'lat': 33.6407, 'lon': -84.4277},
     'Miami':         {'lat': 25.7959, 'lon': -80.2870},
     'New York':      {'lat': 40.7812, 'lon': -73.9665},
@@ -1917,7 +1941,7 @@ def main():
     now_et = datetime.now(pytz.timezone('America/New_York'))
     utc_now = datetime.utcnow()
 
-    print(f'\n=== V5.29.E Weather Fetch Run ===')
+    print(f'\n=== V5.29.F Weather Fetch Run ===')
     print(f'Date: {today} | ET: {now_et.strftime("%I:%M %p ET")} | UTC: {utc_now.strftime("%H:%M")}')
     print(f'Cities: {len(CITIES)} (all 20 including hidden)\n')
 
