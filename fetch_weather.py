@@ -1,6 +1,25 @@
 """
-fetch_weather.py — MPH Weather Model V5.29.D
-Scheduled weather fetcher + paper-bet validator for GitHub Actions.
+fetch_weather.py — MPH Weather Model V5.29.E
+
+V5.29.E changes from V5.29.D:
+  - ROSTER EXPANSION ONLY. Added San Francisco (KSFO) and Seattle (KSEA).
+    18 cities → 20 cities.
+  - Series tickers verified from live Kalshi URLs 2026-08-04:
+      San Francisco → KXHIGHTSFO
+      Seattle       → KXHIGHTSEA
+    (Note: both use the T-variant with full ICAO code. NOT derivable from
+    the other 18 — KXHIGHLAX/KXHIGHNY have no T, KXHIGHTPHX/KXHIGHTBOS do.
+    Do not guess these patterns; read them off the market URL.)
+  - Both cities start on 'nws_only' prediction mode (safer default, and 10
+    existing cities already run it).
+  - Both cities start with GFS weight 0.0 (unvalidated, marine-influenced).
+  - Both cities deliberately OMITTED from BASE_SIGMA → fall to 2.1 default.
+    Per punchlist: no calibrated sigma, start on default, watch don't assume.
+  - compute_bias_correction() returns 0.0 for both until 3 settled days
+    accumulate. Expect noisy early numbers; do not read into them.
+  - ZERO changes to gates, thresholds, blend weights, probability math,
+    settlement logic, or strategy tags. Strategy tag prefix stays V529D so
+    the current validation window is NOT broken by this roster change.
 
 V5.29.D changes from V5.29.C:
   - ENSEMBLE-AWARE CONSENSUS CORRECTION. When GFS ensemble disagrees with
@@ -145,7 +164,7 @@ SUPABASE_URL  = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY  = os.environ.get('SUPABASE_KEY', '')
 
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
-HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.29.D', 'Accept': 'application/json'}
+HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.29.E', 'Accept': 'application/json'}
 
 # ── Validator Configuration ──────────────────────────────────────────────────
 PAPER_BET_STAKE       = 3.0
@@ -175,7 +194,7 @@ TZ_CITIES = {
     'CT': ['Chicago', 'Dallas', 'Austin', 'Houston', 'San Antonio',
            'New Orleans', 'Oklahoma City', 'Minneapolis'],
     'MT': ['Denver'],
-    'PT': ['Phoenix', 'Las Vegas', 'Los Angeles'],
+    'PT': ['Phoenix', 'Las Vegas', 'Los Angeles', 'San Francisco', 'Seattle'],
 }
 
 CITY_TZ = {
@@ -188,6 +207,7 @@ CITY_TZ = {
     'Boston': 'America/New_York', 'Denver': 'America/Denver',
     'Oklahoma City': 'America/Chicago', 'Minneapolis': 'America/Chicago',
     'Washington DC': 'America/New_York', 'Chicago': 'America/Chicago',
+    'San Francisco': 'America/Los_Angeles', 'Seattle': 'America/Los_Angeles',
 }
 
 CITIES = {
@@ -209,6 +229,8 @@ CITIES = {
     'Minneapolis':   {'lat': 44.8848, 'lon': -93.2223},
     'Washington DC': {'lat': 38.8512, 'lon': -77.0402},
     'Chicago':       {'lat': 41.7868, 'lon': -87.7522},
+    'San Francisco': {'lat': 37.6188, 'lon': -122.3750},
+    'Seattle':       {'lat': 47.4444, 'lon': -122.3138},
 }
 
 WETHR_STATIONS = {
@@ -218,6 +240,7 @@ WETHR_STATIONS = {
     'San Antonio': 'KSAT', 'New Orleans': 'KMSY', 'Philadelphia': 'KPHL',
     'Boston': 'KBOS', 'Denver': 'KDEN', 'Oklahoma City': 'KOKC',
     'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KMDW',
+    'San Francisco': 'KSFO', 'Seattle': 'KSEA',
 }
 
 CLI_STATIONS = {
@@ -227,6 +250,7 @@ CLI_STATIONS = {
     'San Antonio': 'KSAT', 'New Orleans': 'KMSY', 'Philadelphia': 'KPHL',
     'Boston': 'KBOS', 'Denver': 'KDEN', 'Oklahoma City': 'KOKC',
     'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KMDW',
+    'San Francisco': 'KSFO', 'Seattle': 'KSEA',
 }
 
 SERIES = {
@@ -239,6 +263,7 @@ SERIES = {
     'Boston': 'KXHIGHTBOS', 'Denver': 'KXHIGHDEN',
     'Oklahoma City': 'KXHIGHTOKC', 'Minneapolis': 'KXHIGHTMIN',
     'Washington DC': 'KXHIGHTDC', 'Chicago': 'KXHIGHCHI',
+    'San Francisco': 'KXHIGHTSFO', 'Seattle': 'KXHIGHTSEA',
 }
 
 CITY_PREDICTION_MODE = {
@@ -251,6 +276,7 @@ CITY_PREDICTION_MODE = {
     'Oklahoma City': 'nws_only',   'Chicago':       'nws_only',
     'Denver':        'nws_only',   'Austin':        'nws_only',
     'Minneapolis':   'nws_only',   'San Antonio':   'nws_only',
+    'San Francisco': 'nws_only',   'Seattle':       'nws_only',
 }
 
 CITY_WARM_OFFSET = {'Phoenix': 1.0, 'Las Vegas': -1.0}
@@ -265,7 +291,7 @@ GFS_CITY_WEIGHT = {
     'Miami': 0.0, 'New Orleans': 0.0, 'Dallas': 0.0, 'Austin': 0.0,
     'San Antonio': 0.0, 'Oklahoma City': 0.0, 'Atlanta': 0.0, 'Denver': 0.0,
     'Minneapolis': 0.0, 'Chicago': 0.0, 'New York': 0.0, 'Philadelphia': 0.0,
-    'Boston': 0.0, 'Washington DC': 0.0,
+    'Boston': 0.0, 'Washington DC': 0.0, 'San Francisco': 0.0, 'Seattle': 0.0,
 }
 
 # V5.29.B per-city sigma recalibration from observed 28-day data (Jun 17 2026).
@@ -274,6 +300,11 @@ GFS_CITY_WEIGHT = {
 # cities (Phoenix 2.2 vs 0.94, Vegas 2.2 vs 1.24). Capped at 3.5°F to prevent
 # single-day data feed failures (e.g. OKC's 22°F outlier) from over-inflating.
 # Recalibration date: 2026-06-17. Re-run quarterly or after structural changes.
+#
+# V5.29.E NOTE: San Francisco and Seattle are DELIBERATELY ABSENT — they fall
+# to the 2.1 default via BASE_SIGMA.get(city, 2.1). Per punchlist: marine
+# cities are genuine unknowns, start on default, do not assume. Add calibrated
+# values only after ~28 days of settled data.
 BASE_SIGMA = {
     'Boston': 3.5,        # was 1.9 — observed σ 3.66 (capped)
     'Oklahoma City': 3.5, # was 2.5 — observed σ 4.35 (capped, outlier-inflated)
@@ -1886,9 +1917,9 @@ def main():
     now_et = datetime.now(pytz.timezone('America/New_York'))
     utc_now = datetime.utcnow()
 
-    print(f'\n=== V5.29.D Weather Fetch Run ===')
+    print(f'\n=== V5.29.E Weather Fetch Run ===')
     print(f'Date: {today} | ET: {now_et.strftime("%I:%M %p ET")} | UTC: {utc_now.strftime("%H:%M")}')
-    print(f'Cities: {len(CITIES)} (all 18 including hidden)\n')
+    print(f'Cities: {len(CITIES)} (all 20 including hidden)\n')
 
     firing_windows = is_window_time(utc_now)
     if firing_windows:
