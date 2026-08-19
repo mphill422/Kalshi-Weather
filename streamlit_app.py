@@ -2221,7 +2221,7 @@ if rejected_cities or len(qualifying_picks) > 1:
                         'bracket': _pick['label'], 'direction': _pick['side'],
                         'price': _pick['price'], 'amount': PAPER_BET_STAKE_AUTO,
                         'result': 'Pending', 'profit': 0.0, 'payout': 0.0,
-                        'actual': None, 'strategy_tag': 'AUTO_GATED',
+                        'actual': None, 'strategy_tag': 'AUTO_GATED_V2',
                 
                     }
                     if sb_insert_bet(_row):
