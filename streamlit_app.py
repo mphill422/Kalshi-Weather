@@ -1370,22 +1370,26 @@ def apply_prob_floor(prob_rows, consensus, ladder_text):
     if not prob_rows or consensus is None: return prob_rows
     parsed = {lbl: (lo, hi) for lbl, lo, hi in parse_ladder(ladder_text)}
     adjusted = []
-    boost_total = 0.0
     for label, prob in prob_rows:
         lo, hi = parsed.get(label, (None, None))
+        if lo is None and hi is None:
+            adjusted.append((label, prob)); continue
+        # busted brackets stay at zero — do not floor, do not redistribute into
+        if prob <= 0.0:
+            adjusted.append((label, 0.0)); continue
         if lo is not None and hi is not None: mid = (lo + hi) / 2.0
         elif lo is not None: mid = lo + 1.0
-        elif hi is not None: mid = hi - 1.0
-        else: adjusted.append((label, prob)); continue
+        else: mid = hi - 1.0
         distance = abs(mid - consensus)
         new_prob = prob
         if distance <= 4.0 and prob < 0.05: new_prob = 0.05
         elif distance <= 6.0 and prob < 0.02: new_prob = 0.02
-        boost_total += (new_prob - prob)
         adjusted.append((label, new_prob))
-    if boost_total > 0:
-        scale = 1.0 / (1.0 + boost_total)
-        adjusted = [(lbl, round(p * scale, 4)) for lbl, p in adjusted]
+    total = sum(p for _, p in adjusted)
+    if total <= 0:
+        return adjusted
+    adjusted = [(lbl, round(p / total, 4)) for lbl, p in adjusted]
+    adjusted.sort(key=lambda x: x[1], reverse=True)
     return adjusted
 
 
