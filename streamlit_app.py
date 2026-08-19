@@ -2211,7 +2211,7 @@ if rejected_cities or len(qualifying_picks) > 1:
                 _existing = sb_fetch_bets() or []
                 _already = {(b.get('city'), str(b.get('date')))
                             for b in _existing
-                            if (b.get('strategy_tag') or '').startswith('AUTO_GATED')}
+                            if (b.get('strategy_tag') or '').startswith('AUTO_GATED_V2')}
                 _logged_now = []
                 for _c, _pick in qualifying_picks.items():
                     if (_c, _tstr) in _already:
