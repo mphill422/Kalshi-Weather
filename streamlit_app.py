@@ -21,6 +21,18 @@
 #   - Routed Miami full_blend -> nws_only (14-day MAE: -2.04F hot bias, 0.73F worse)
 #   - Version string bumps throughout user-facing text
 #
+# CONSENSUS FLOOR FIX (2026-08-18):
+#   - Observed high is a MEASUREMENT, not a forecast base. It now clamps
+#     consensus from below via max(), applied AFTER city warm offset and
+#     AFTER bias correction, instead of becoming the base those adjustments
+#     are stacked on top of. Previously Phoenix showed consensus 114.35F
+#     (floor 113.0 + offset 1.0 + bias 0.35) while every forecast input read
+#     below 111F. Three sites changed: compute_consensus(),
+#     save_city_prediction(), and the per-city display block.
+#   - apply_prob_floor() now normalizes the ladder to sum to 1.0 (busted
+#     brackets excluded and left at zero). Previously the ladder could sum to
+#     ~14%, making every downstream edge number meaningless.
+#
 # All V5.22 - V5.26.2 forecasting/data/scoring infrastructure preserved exactly.
 # Only the bet-selection / surfacing layer is gated.
 
@@ -1513,6 +1525,10 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
     obs = noaa if noaa is not None else cur
     if obs is not None: consensus = max(base, late_day_floor(fc, obs, local_hour, city))
     else: consensus = base
+    # CONSENSUS FLOOR FIX: obs_high is a MEASUREMENT. Decide here whether it is
+    # trustworthy, but do NOT make it the base — clamp with max() at the end so
+    # the city warm offset applies to the forecast estimate, not to the floor.
+    obs_locked = False
     if obs_high is not None and obs_high > consensus:
         obs_high_trusted = True
         if local_hour < OBS_HIGH_TRUST_HOUR: obs_high_trusted = False
@@ -1521,10 +1537,12 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
             obs_high_trusted = False
         if current_for_check is not None and obs_high < current_for_check:
             obs_high_trusted = False
-        if obs_high_trusted: consensus = obs_high
+        if obs_high_trusted: obs_locked = True
     warm_offset = CITY_WARM_OFFSET.get(city, 0.0)
     if warm_offset != 0.0:
         consensus = consensus + warm_offset
+    if obs_locked:
+        consensus = max(consensus, obs_high)
     return consensus
 
 def bracket_probs(mu, ladder_text, city, obs_high=None, forecast=None):
@@ -1803,7 +1821,12 @@ def save_city_prediction(city, weather, saved_ladders):
     cur = current_temp if current_temp is not None else nws_fc
     consensus_raw = compute_consensus(nws_fc, cur, current_temp, city, obs_high=obs_high)
     bias_correction, _ = compute_bias_correction_db(city)
+    # CONSENSUS FLOOR FIX: if compute_consensus locked to the observed high,
+    # re-clamp after bias so the measurement is never inflated by adjustments.
+    _obs_locked = (obs_high is not None and abs(consensus_raw - obs_high) < 0.05)
     consensus = round(consensus_raw + bias_correction, 1)
+    if _obs_locked:
+        consensus = round(max(consensus, obs_high), 1)
     # V5.29.D: ensemble-aware consensus correction.
     ensemble_mean = weather.get('ensemble_mean')
     if ensemble_mean is not None and nws_fc is not None:
@@ -1989,6 +2012,11 @@ with st.sidebar:
     st.markdown('- All forecasting infra unchanged')
     st.markdown('---')
     st.caption('V5.27.1 reduces bets — does not change predictions.')
+    st.markdown('---')
+    st.markdown('<div class="mph-section-header">🔧 Aug 18 Fixes</div>', unsafe_allow_html=True)
+    st.caption('Obs high now clamps consensus from below (max) instead of '
+               'becoming the base for warm offset + bias. Bracket ladder now '
+               'normalizes to 1.0.')
 
 
 # ── Main App ──────────────────────────────────────────────────────────────────
@@ -2782,7 +2810,12 @@ obs_high_final = override_obs_high if override_obs_high > 0 else obs_high_today
 
 if forecast is not None:
     consensus_raw = compute_consensus(forecast, current if current is not None else forecast, noaa_final, city, obs_high=obs_high_final)
+    # CONSENSUS FLOOR FIX: re-clamp after bias so an observed high is never
+    # inflated by bias correction.
+    _obs_locked = (obs_high_final is not None and abs(consensus_raw - obs_high_final) < 0.05)
     consensus = round(consensus_raw + bias_correction, 1)
+    if _obs_locked:
+        consensus = round(max(consensus, obs_high_final), 1)
     save_city_prediction(city, {
         'nws_fc': forecast, 'current_temp': current, 'obs_high': obs_high_final,
         'ensemble_mean': ensemble_mean, 'source_gap': source_gap,
@@ -3209,5 +3242,4 @@ if bet_log_unlocked:
                                 st.error('Delete failed.')
 
 st.markdown('---')
-st.caption('🌡️ MPH Weather Model V5.27.1 — Three research-validated gates active')
-# working baseline).
+st.caption('🌡️ MPH Weather Model V5.27.1 — Three research-validated gates active · Aug 18 consensus-floor + ladder-normalization fixes')
