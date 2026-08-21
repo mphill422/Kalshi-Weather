@@ -9,15 +9,24 @@ point forecast; this watches the atmosphere evolve through the heating window.
 Runs every 15-30 min on a cron. Writes to a NEW table (intraday_atmospherics).
 Touches nothing in the existing highs model. Read-only w.r.t. everything else.
 
-OVERNIGHT COLLECTION (V2): window widened past midnight to support the V5.30
-lows model. Minimum temperature locks in near sunrise, so the 8am-10pm heating
-window captured none of the relevant decay curve. Two changes support this:
-  - Open-Meteo now requests past_days=1, forecast_days=2 so the hourly array
-    always brackets 'now' regardless of UTC date rollover.
-  - _nearest_hour_index enforces MAX_HOUR_GAP; a match further than that from
-    'now' is treated as no data rather than silently logged as stale.
-  - local_date recorded alongside ET date — overnight captures belong to the
-    city's own calendar date, which diverges from ET after midnight local.
+V2 CHANGES:
+  - Expanded 4 -> 18 cities, matching fetch_weather.py CITIES exactly.
+    Houston coords corrected to KHOU Hobby (29.6459/-95.2769); the prior
+    29.9902/-95.3368 was Bush/KIAH, so all Houston rows before this version
+    profile the wrong airport and should be excluded from Houston analysis.
+  - Overnight-safe Open-Meteo window: past_days=1, forecast_days=2 so the
+    hourly array always brackets 'now' regardless of UTC date rollover. The
+    old forecast_days=1 returned only today's UTC hours, and the nearest-hour
+    search would silently clamp to the array edge and log stale values as live.
+  - MAX_HOUR_GAP_SECONDS staleness guard on that search — a match further than
+    90 min from 'now' is treated as no data rather than logged.
+  - local_date recorded alongside ET date. Overnight captures belong to the
+    city's own calendar date, which diverges from ET after local midnight.
+    Group lows analysis on local_date, not date.
+
+STILL OPEN: wethr_obs has returned NULL on 100% of rows since inception
+(4,215/4,215). The call below is unchanged and still expected to fail — see
+wethr_probe.py and the working implementation in fetch_weather.py.
 
 FEATURES CAPTURED (per city, per run):
   From Open-Meteo (the reversal signal — atmospheric profile the market ignores):
@@ -60,6 +69,8 @@ MIGRATION for V2 (run once, additive — does not touch existing rows):
 
   ALTER TABLE public.intraday_atmospherics
     ADD COLUMN IF NOT EXISTS local_date TEXT;
+  CREATE INDEX IF NOT EXISTS idx_intraday_city_localdate
+    ON public.intraday_atmospherics (city, local_date);
 
 Secrets needed (already in your repo): SUPABASE_URL, SUPABASE_KEY, WETHR_API_KEY.
 ALWAYS exits 0 — a collection hiccup must never spam failure emails.
@@ -82,13 +93,28 @@ HEADERS = {'User-Agent': 'intraday-collector/2.0', 'Accept': 'application/json'}
 # data as if it were live — the exact failure mode overnight collection hits.
 MAX_HOUR_GAP_SECONDS = 5400  # 90 min
 
-# The focused 4 — coastal-east, coastal-west, continental, gulf.
-# lat, lon, IANA tz, wethr station code (for surface obs).
+# All 18 cities. Coords, tz, and station live together so they cannot drift
+# apart. Mirrors CITIES / CITY_TZ / WETHR_STATIONS in fetch_weather.py — if
+# that file changes, change this too.
 CITIES = {
-    'New York':    (40.7812, -73.9665, 'America/New_York',    'KNYC'),
-    'Los Angeles': (33.9416, -118.4085, 'America/Los_Angeles', 'KLAX'),
-    'Chicago':     (41.7868, -87.7522, 'America/Chicago',      'KMDW'),
-    'Houston':     (29.9902, -95.3368, 'America/Chicago',      'KHOU'),
+    'Phoenix':       {'lat': 33.4342, 'lon': -112.0116, 'tz': 'America/Phoenix',     'station': 'KPHX'},
+    'Las Vegas':     {'lat': 36.0840, 'lon': -115.1537, 'tz': 'America/Los_Angeles', 'station': 'KLAS'},
+    'Los Angeles':   {'lat': 33.9416, 'lon': -118.4085, 'tz': 'America/Los_Angeles', 'station': 'KLAX'},
+    'Dallas':        {'lat': 32.8998, 'lon':  -97.0403, 'tz': 'America/Chicago',     'station': 'KDFW'},
+    'Austin':        {'lat': 30.1945, 'lon':  -97.6699, 'tz': 'America/Chicago',     'station': 'KAUS'},
+    'Houston':       {'lat': 29.6459, 'lon':  -95.2769, 'tz': 'America/Chicago',     'station': 'KHOU'},
+    'Atlanta':       {'lat': 33.6407, 'lon':  -84.4277, 'tz': 'America/New_York',    'station': 'KATL'},
+    'Miami':         {'lat': 25.7959, 'lon':  -80.2870, 'tz': 'America/New_York',    'station': 'KMIA'},
+    'New York':      {'lat': 40.7812, 'lon':  -73.9665, 'tz': 'America/New_York',    'station': 'KNYC'},
+    'San Antonio':   {'lat': 29.5337, 'lon':  -98.4698, 'tz': 'America/Chicago',     'station': 'KSAT'},
+    'New Orleans':   {'lat': 29.9934, 'lon':  -90.2580, 'tz': 'America/Chicago',     'station': 'KMSY'},
+    'Philadelphia':  {'lat': 39.8744, 'lon':  -75.2424, 'tz': 'America/New_York',    'station': 'KPHL'},
+    'Boston':        {'lat': 42.3656, 'lon':  -71.0096, 'tz': 'America/New_York',    'station': 'KBOS'},
+    'Denver':        {'lat': 39.8561, 'lon': -104.6737, 'tz': 'America/Denver',      'station': 'KDEN'},
+    'Oklahoma City': {'lat': 35.3931, 'lon':  -97.6007, 'tz': 'America/Chicago',     'station': 'KOKC'},
+    'Minneapolis':   {'lat': 44.8848, 'lon':  -93.2223, 'tz': 'America/Chicago',     'station': 'KMSP'},
+    'Washington DC': {'lat': 38.8512, 'lon':  -77.0402, 'tz': 'America/New_York',    'station': 'KDCA'},
+    'Chicago':       {'lat': 41.7868, 'lon':  -87.7522, 'tz': 'America/Chicago',     'station': 'KMDW'},
 }
 
 OPEN_METEO = 'https://api.open-meteo.com/v1/forecast'
@@ -127,7 +153,7 @@ def _nearest_hour_index(times):
         except Exception:
             continue
     if best_i is None or best_gap > MAX_HOUR_GAP_SECONDS:
-        print(f'      open-meteo: nearest hour is {best_gap/3600:.1f}h from now '
+        print(f'      open-meteo: nearest hour is {best_gap / 3600:.1f}h from now '
               f'— stale, rejecting')
         return None
     return best_i
@@ -181,21 +207,29 @@ def fetch_open_meteo(lat, lon):
 
 
 def fetch_wethr_obs(station):
-    """Live surface observation from Wethr — your data advantage. Best-effort."""
+    """Live surface observation from Wethr — your data advantage. Best-effort.
+
+    KNOWN BROKEN: returns None on 100% of calls. Left unchanged pending a port
+    of the working implementation from fetch_weather.py (which authenticates
+    via WETHR_HEADERS rather than an api_key query param)."""
     if not WETHR_API_KEY:
+        print('      wethr: WETHR_API_KEY not set in this environment')
         return None
     try:
         r = requests.get('https://wethr.net/api/v2/observations.php',
                          params={'station_code': station, 'mode': 'latest',
                                  'api_key': WETHR_API_KEY},
                          headers=HEADERS, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            rec = data[0] if isinstance(data, list) and data else data
-            if isinstance(rec, dict):
-                for k in ('temperature', 'temp', 'current_temp'):
-                    if rec.get(k) is not None:
-                        return round(float(rec[k]), 2)
+        if r.status_code != 200:
+            print(f'      wethr HTTP {r.status_code}: {r.text[:120]}')
+            return None
+        data = r.json()
+        rec = data[0] if isinstance(data, list) and data else data
+        if isinstance(rec, dict):
+            for k in ('temperature', 'temp', 'current_temp'):
+                if rec.get(k) is not None:
+                    return round(float(rec[k]), 2)
+            print(f'      wethr: no temp key in response; keys={list(rec)[:8]}')
         return None
     except Exception as e:
         print(f'      wethr exc: {type(e).__name__}: {str(e)[:80]}')
@@ -208,7 +242,10 @@ def sb_insert(row):
                    'Content-Type': 'application/json', 'Prefer': 'return=minimal'}
         r = requests.post(SUPABASE_URL + '/rest/v1/intraday_atmospherics',
                           headers=headers, json=row, timeout=15)
-        return r.status_code in (200, 201, 204)
+        if r.status_code not in (200, 201, 204):
+            print(f'      sb_insert HTTP {r.status_code}: {r.text[:140]}')
+            return False
+        return True
     except Exception as e:
         print(f'      sb_insert exc: {type(e).__name__}: {str(e)[:80]}')
         return False
@@ -217,21 +254,22 @@ def sb_insert(row):
 def main():
     today = et_date()
     print(f'=== intraday collector v2 | ET {today} | '
-          f'{datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC ===')
+          f'{datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC | '
+          f'{len(CITIES)} cities ===')
     if not SUPABASE_URL or not SUPABASE_KEY:
         print('SUPABASE creds missing — nothing logged (exit 0).')
         sys.exit(0)
 
     logged = 0
-    for city, (lat, lon, tz, station) in CITIES.items():
-        atmo = fetch_open_meteo(lat, lon)
+    for city, cfg in CITIES.items():
+        atmo = fetch_open_meteo(cfg['lat'], cfg['lon'])
         if not atmo or atmo.get('temp_2m') is None:
             print(f'  [{city}] no atmospheric data — skipped')
             continue
-        obs = fetch_wethr_obs(station)
+        obs = fetch_wethr_obs(cfg['station'])
         row = {
-            'date': today, 'local_date': local_date(tz), 'city': city,
-            'local_hour': local_hour(tz),
+            'date': today, 'local_date': local_date(cfg['tz']), 'city': city,
+            'local_hour': local_hour(cfg['tz']),
             'temp_2m': atmo['temp_2m'], 'temp_925': atmo['temp_925'],
             'temp_850': atmo['temp_850'], 'solar': atmo['solar'],
             'cloud_cover': atmo['cloud_cover'], 'wind_speed': atmo['wind_speed'],
