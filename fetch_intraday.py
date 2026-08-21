@@ -9,6 +9,16 @@ point forecast; this watches the atmosphere evolve through the heating window.
 Runs every 15-30 min on a cron. Writes to a NEW table (intraday_atmospherics).
 Touches nothing in the existing highs model. Read-only w.r.t. everything else.
 
+OVERNIGHT COLLECTION (V2): window widened past midnight to support the V5.30
+lows model. Minimum temperature locks in near sunrise, so the 8am-10pm heating
+window captured none of the relevant decay curve. Two changes support this:
+  - Open-Meteo now requests past_days=1, forecast_days=2 so the hourly array
+    always brackets 'now' regardless of UTC date rollover.
+  - _nearest_hour_index enforces MAX_HOUR_GAP; a match further than that from
+    'now' is treated as no data rather than silently logged as stale.
+  - local_date recorded alongside ET date — overnight captures belong to the
+    city's own calendar date, which diverges from ET after midnight local.
+
 FEATURES CAPTURED (per city, per run):
   From Open-Meteo (the reversal signal — atmospheric profile the market ignores):
     - temperature_2m        (current modeled surface temp)
@@ -46,6 +56,11 @@ Create the table once (Supabase SQL editor):
   CREATE INDEX IF NOT EXISTS idx_intraday_city_date
     ON public.intraday_atmospherics (city, date);
 
+MIGRATION for V2 (run once, additive — does not touch existing rows):
+
+  ALTER TABLE public.intraday_atmospherics
+    ADD COLUMN IF NOT EXISTS local_date TEXT;
+
 Secrets needed (already in your repo): SUPABASE_URL, SUPABASE_KEY, WETHR_API_KEY.
 ALWAYS exits 0 — a collection hiccup must never spam failure emails.
 """
@@ -60,7 +75,12 @@ import pytz
 SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY', '')
 WETHR_API_KEY = os.environ.get('WETHR_API_KEY', '')
-HEADERS = {'User-Agent': 'intraday-collector/1.0', 'Accept': 'application/json'}
+HEADERS = {'User-Agent': 'intraday-collector/2.0', 'Accept': 'application/json'}
+
+# Reject any Open-Meteo hour further than this from 'now'. Without this the
+# nearest-hour search silently clamps to the end of the array and logs stale
+# data as if it were live — the exact failure mode overnight collection hits.
+MAX_HOUR_GAP_SECONDS = 5400  # 90 min
 
 # The focused 4 — coastal-east, coastal-west, continental, gulf.
 # lat, lon, IANA tz, wethr station code (for surface obs).
@@ -81,14 +101,22 @@ def et_date():
     return datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
 
 
+def local_date(tz_name):
+    """City-local calendar date. Diverges from ET date overnight — a 1am PT
+    capture is still 'yesterday' locally while ET has already rolled over."""
+    return datetime.now(pytz.timezone(tz_name)).strftime('%Y-%m-%d')
+
+
 def local_hour(tz_name):
     return datetime.now(pytz.timezone(tz_name)).hour
 
 
 def _nearest_hour_index(times):
-    """Open-Meteo returns hourly arrays; pick the index nearest to 'now' UTC."""
+    """Open-Meteo returns hourly arrays; pick the index nearest to 'now' UTC.
+    Returns None if the nearest hour is further than MAX_HOUR_GAP_SECONDS —
+    that means the array does not bracket 'now' and the data is stale."""
     now = datetime.utcnow()
-    best_i, best_gap = 0, 1e9
+    best_i, best_gap = None, 1e9
     for i, t in enumerate(times):
         try:
             # times look like '2026-07-08T14:00'
@@ -98,6 +126,10 @@ def _nearest_hour_index(times):
                 best_gap, best_i = gap, i
         except Exception:
             continue
+    if best_i is None or best_gap > MAX_HOUR_GAP_SECONDS:
+        print(f'      open-meteo: nearest hour is {best_gap/3600:.1f}h from now '
+              f'— stale, rejecting')
+        return None
     return best_i
 
 
@@ -110,7 +142,8 @@ def fetch_open_meteo(lat, lon):
         'temperature_unit': 'fahrenheit',
         'wind_speed_unit': 'mph',
         'timezone': 'UTC',
-        'forecast_days': 1,
+        'past_days': 1,
+        'forecast_days': 2,
     }
     try:
         r = requests.get(OPEN_METEO, params=params, headers=HEADERS, timeout=30)
@@ -123,6 +156,8 @@ def fetch_open_meteo(lat, lon):
             print('      open-meteo: no hourly.time in response')
             return {}
         i = _nearest_hour_index(times)
+        if i is None:
+            return {}
 
         def g(key):
             arr = h.get(key)
@@ -181,7 +216,7 @@ def sb_insert(row):
 
 def main():
     today = et_date()
-    print(f'=== intraday collector | ET {today} | '
+    print(f'=== intraday collector v2 | ET {today} | '
           f'{datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC ===')
     if not SUPABASE_URL or not SUPABASE_KEY:
         print('SUPABASE creds missing — nothing logged (exit 0).')
@@ -195,7 +230,8 @@ def main():
             continue
         obs = fetch_wethr_obs(station)
         row = {
-            'date': today, 'city': city, 'local_hour': local_hour(tz),
+            'date': today, 'local_date': local_date(tz), 'city': city,
+            'local_hour': local_hour(tz),
             'temp_2m': atmo['temp_2m'], 'temp_925': atmo['temp_925'],
             'temp_850': atmo['temp_850'], 'solar': atmo['solar'],
             'cloud_cover': atmo['cloud_cover'], 'wind_speed': atmo['wind_speed'],
@@ -204,9 +240,10 @@ def main():
         }
         if sb_insert(row):
             logged += 1
-            print(f'  [{city}] lh={row["local_hour"]} t2m={atmo["temp_2m"]} '
-                  f'925={atmo["temp_925"]} solar={atmo["solar"]} '
-                  f'cloud={atmo["cloud_cover"]} obs={obs} ✅')
+            print(f'  [{city}] ld={row["local_date"]} lh={row["local_hour"]} '
+                  f't2m={atmo["temp_2m"]} 925={atmo["temp_925"]} '
+                  f'solar={atmo["solar"]} cloud={atmo["cloud_cover"]} '
+                  f'obs={obs} ✅')
         else:
             print(f'  [{city}] captured but DB write failed')
 
