@@ -88,7 +88,7 @@ MAX_HOUR_GAP_SECONDS = 5400  # 90 min
 # Throttle protection. 18 back-to-back calls from a shared Actions IP timed
 # out on 7 cities; spacing them out fixes it at a cost of ~27s per run.
 REQUEST_SPACING_SECONDS = 1.5
-REQUEST_TIMEOUT_SECONDS = 20
+REQUEST_TIMEOUT_SECONDS = 45
 RETRY_BACKOFF_SECONDS = 5
 
 # All 18 cities. Coords, tz, and station live together so they cannot drift
