@@ -30,9 +30,22 @@ V2.1 CHANGES:
     useful observation is the settled minimum, which is collected elsewhere,
     so the surface obs is not worth fixing here. The wethr_obs column is left
     in place but is no longer written.
-  - Rate-limit handling. The first 18-city run lost 7 cities to Open-Meteo
-    ReadTimeouts — 18 rapid calls from a GitHub Actions IP trips throttling.
-    REQUEST_SPACING_SECONDS between cities, plus one retry on timeout.
+  - Rate-limit handling: REQUEST_SPACING_SECONDS between cities, plus one
+    application-level retry on timeout.
+
+V2.2 CHANGES:
+  - Pooled session. The application-level retry from V2.1 never succeeded once
+    across two runs (11/18 then 14/18) — and raising the timeout from 20s to
+    45s changed nothing. A request that fails identically at both limits is
+    not slow, it is not completing. Failures were scattered across cities with
+    no geographic, timezone, or loop-position pattern, which points at the
+    connection rather than the endpoint: the old code opened a fresh TLS
+    connection per city, 18 per run, from a shared Actions runner.
+    SESSION now reuses one keep-alive connection with urllib3 transport-level
+    retries underneath the application retry.
+  - If this still drops cities, the next move is Open-Meteo's multi-coordinate
+    form — one request carrying all 18 lat/lons — which removes the per-city
+    request entirely.
 
 FEATURES CAPTURED (per city, per run), all from Open-Meteo:
     - temperature_2m        (current modeled surface temp)
@@ -74,22 +87,48 @@ import time
 from datetime import datetime
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import pytz
 
 SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY', '')
-HEADERS = {'User-Agent': 'intraday-collector/2.1', 'Accept': 'application/json'}
+HEADERS = {'User-Agent': 'intraday-collector/2.2', 'Accept': 'application/json'}
 
 # Reject any Open-Meteo hour further than this from 'now'. Without this the
 # nearest-hour search silently clamps to the end of the array and logs stale
 # data as if it were live — the exact failure mode overnight collection hits.
 MAX_HOUR_GAP_SECONDS = 5400  # 90 min
 
-# Throttle protection. 18 back-to-back calls from a shared Actions IP timed
-# out on 7 cities; spacing them out fixes it at a cost of ~27s per run.
 REQUEST_SPACING_SECONDS = 1.5
 REQUEST_TIMEOUT_SECONDS = 45
 RETRY_BACKOFF_SECONDS = 5
+
+
+def _make_session():
+    """One pooled, keep-alive connection reused across all 18 cities.
+
+    The per-request retry in V2.1 never once succeeded — a call that times out
+    at 20s also times out at 45s, which means the request is not slow, it is
+    not completing. Opening 18 fresh TLS connections from a shared Actions
+    runner is the likely cause. A single pooled session with transport-level
+    retries handles the connect/read failures below the requests layer."""
+    s = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=1.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(['GET']),
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
+    s.mount('https://', adapter)
+    s.headers.update(HEADERS)
+    return s
+
+
+SESSION = _make_session()
 
 # All 18 cities. Coords, tz, and station live together so they cannot drift
 # apart. Mirrors CITIES / CITY_TZ / WETHR_STATIONS in fetch_weather.py — if
@@ -169,8 +208,8 @@ def _open_meteo_once(lat, lon):
         'past_days': 1,
         'forecast_days': 2,
     }
-    r = requests.get(OPEN_METEO, params=params, headers=HEADERS,
-                     timeout=REQUEST_TIMEOUT_SECONDS)
+    r = SESSION.get(OPEN_METEO, params=params,
+                    timeout=REQUEST_TIMEOUT_SECONDS)
     if r.status_code != 200:
         print(f'      open-meteo HTTP {r.status_code}: {r.text[:120]}')
         return {}
@@ -203,8 +242,8 @@ def _open_meteo_once(lat, lon):
 
 def fetch_open_meteo(lat, lon):
     """Pull the atmospheric reversal features for the hour nearest now.
-    One retry on timeout — throttling is the dominant failure mode, and it
-    clears within a few seconds. Returns {} on failure (logs loudly)."""
+    Application-level retry sits on top of the session's transport retries.
+    Returns {} on failure (logs loudly)."""
     for attempt in (1, 2):
         try:
             return _open_meteo_once(lat, lon)
@@ -239,7 +278,7 @@ def sb_insert(row):
 
 def main():
     today = et_date()
-    print(f'=== intraday collector v2.1 | ET {today} | '
+    print(f'=== intraday collector v2.2 | ET {today} | '
           f'{datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC | '
           f'{len(CITIES)} cities ===')
     if not SUPABASE_URL or not SUPABASE_KEY:
