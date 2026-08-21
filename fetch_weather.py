@@ -1,175 +1,92 @@
 """
-fetch_weather.py — MPH Weather Model V5.29.F
+fetch_weather.py — MPH Weather Model V5.30.0
+
+V5.30.0 changes from V5.29.F:
+  - ROSTER CONTRACTION. San Francisco (KSFO) and Seattle (KSEA) REMOVED.
+    20 cities → 18 cities. Reason: measured performance. Across settled data
+    SF ran a -2.14F residual bias (worst on the board by 4x) with its best
+    available model at 1.8F MAE against narrow marine brackets, and Seattle
+    scattered badly every day of manual-grid logging. Neither would clear a
+    60c price floor often, and when they did we would be betting the two
+    least reliable forecasts we have. They were also never in streamlit_app.py
+    CITIES, so they logged predictions that could never become bets — 20 rows
+    written, 18 bet-eligible.
+
+  - CONSENSUS FLOOR FIX (the important one). An observed high is a
+    MEASUREMENT, not a forecast base. compute_consensus() previously did
+    `consensus = obs_high` and then added the city warm offset on top, and
+    main() then added bias_correction on top of THAT. Phoenix showed
+    consensus 114.35F (floor 113.0 + offset 1.0 + bias 0.35) while every
+    forecast input read below 111F. Now the floor clamps from below via
+    max(), applied AFTER offset and AFTER bias, so adjustments shape the
+    forecast estimate and the measurement can only raise the result, never
+    be inflated by it.
+
+  - LADDER NORMALIZATION. apply_prob_floor() did not normalize. Observed a
+    Phoenix ladder summing to 13.9% (0.0 + 1.6 + 4.1 + 4.1 + 4.1 + 4.1) —
+    four identical values because the floor set them all to 0.05 and the
+    old rescale only divided by (1 + boost_total). Every downstream edge
+    number was computed against a distribution missing ~86% of its mass.
+    Now sums to 1.0, with busted brackets held at zero and excluded from
+    redistribution.
+
+  - BIAS CORRECTION: median → trimmed mean. Across 2,514 settlements the
+    residual bias AFTER correction was still positive in 17 of 18 cities
+    (Boston +1.07, Atlanta +1.06, Miami +1.02, DC +0.91, Chicago +0.77 ...
+    Houston -0.14). statistics.median() was compressing away a persistent
+    small warm drift while correctly ignoring the occasional large miss.
+    Trimmed mean drops only the single highest and single lowest error and
+    averages the rest — keeps outlier robustness, stops discarding the
+    systematic middle. WATCH THIS: if the residual is still ~+0.7 after two
+    weeks the cause is structural (the correction is computed from a
+    consensus that already contains the prior correction) and needs a
+    different fix.
+
+  - PRICE_FLOOR_CENTS DELIBERATELY LEFT AT 30 HERE. The V529D_PAPER_* tags
+    this file writes are the RESEARCH corpus — they are what produced the
+    price-band table showing sub-60c loses across 189 events and 60c+ earns
+    +12.6% ROI on 60 events. Raising the floor here would stop generating
+    the sub-60 rows that make that comparison possible. The 60c floor lives
+    in streamlit_app.py where the AUTO_GATED_V2 strategy tag runs. Two
+    different jobs: this file measures, that file bets.
 
 V5.29.F changes from V5.29.E:
   - HOUSTON COORDINATE FIX. CITIES['Houston'] was 29.9902/-95.3368 — those
     are BUSH INTERCONTINENTAL (KIAH) coordinates. Kalshi settles Houston on
     HOBBY (KHOU), and both WETHR_STATIONS and CLI_STATIONS correctly said
-    KHOU. So settlement was right, but the NWS grid fallback
-    (fetch_nws_grid → gridpoints hourly forecast) and BOTH Open-Meteo calls
-    (fetch_gfs_ensemble, fetch_gfs_forecast_fallback) were pulling forecast
-    data for the WRONG AIRPORT.
-  - Corrected to 29.6459/-95.2769 (KHOU Hobby), matching the station-locked
-    NWS forecast link sheet.
+    KHOU. So settlement was right, but the NWS grid fallback and BOTH
+    Open-Meteo calls were pulling forecast data for the WRONG AIRPORT.
+  - Corrected to 29.6459/-95.2769 (KHOU Hobby).
   - Impact: Houston is the ONLY city with a nonzero GFS_CITY_WEIGHT (0.18),
-    so bad coordinates propagated further here than they would anywhere else.
-    Bush runs warmer than Hobby on light-wind days — expect Houston consensus
-    to shift slightly cooler and Houston bias_correction to re-converge over
-    the next ~10 settled days.
-  - Historical Houston data prior to this fix is contaminated on the forecast
-    side (settlement/actuals were always correct). Treat pre-fix Houston
-    predictions as suspect; settled bets remain valid since they settled on
-    the correct CLI station.
+    so bad coordinates propagated further here than anywhere else.
   - Known trap set (per Kalshi market rules): O'Hare vs Midway (we use KMDW,
-    verified), Bush vs Hobby (KHOU, fixed here), Love Field vs DFW (we use
+    verified), Bush vs Hobby (KHOU, fixed), Love Field vs DFW (we use
     KDFW — STILL UNVERIFIED, check KXHIGHTDAL market rules).
-  - No other change. All logic, gates, thresholds untouched.
-
-V5.29.E changes from V5.29.D:
-  - ROSTER EXPANSION ONLY. Added San Francisco (KSFO) and Seattle (KSEA).
-    18 cities → 20 cities.
-  - Series tickers verified from live Kalshi URLs 2026-08-04:
-      San Francisco → KXHIGHTSFO
-      Seattle       → KXHIGHTSEA
-    (Note: both use the T-variant with full ICAO code. NOT derivable from
-    the other 18 — KXHIGHLAX/KXHIGHNY have no T, KXHIGHTPHX/KXHIGHTBOS do.
-    Do not guess these patterns; read them off the market URL.)
-  - Both cities start on 'nws_only' prediction mode (safer default, and 10
-    existing cities already run it).
-  - Both cities start with GFS weight 0.0 (unvalidated, marine-influenced).
-  - Both cities deliberately OMITTED from BASE_SIGMA → fall to 2.1 default.
-    Per punchlist: no calibrated sigma, start on default, watch don't assume.
-  - compute_bias_correction() returns 0.0 for both until 3 settled days
-    accumulate. Expect noisy early numbers; do not read into them.
-  - ZERO changes to gates, thresholds, blend weights, probability math,
-    settlement logic, or strategy tags. Strategy tag prefix stays V529D so
-    the current validation window is NOT broken by this roster change.
 
 V5.29.D changes from V5.29.C:
   - ENSEMBLE-AWARE CONSENSUS CORRECTION. When GFS ensemble disagrees with
     NWS-derived consensus by >3F, shift consensus halfway toward ensemble
-    (capped at ±2F). Catches days where NWS is systematically wrong but
-    ensemble (or V5.29.C fallback) is closer to reality.
-  - Evidence: Jun 20 data. Dallas NWS 88, ensemble 93.4, actual 93. With
-    V5.29.D consensus would have shifted 88.8→90.8, picking correct bracket.
-    Minneapolis Jun 19 NWS 69, ensemble 74.5, actual 76. Similar pattern.
-  - Safeguards: skip when obs_high already locked, skip when ensemble is
-    wildly off from NWS (>8F probable bad data), hard cap ±2F adjustment.
-  - Logs '🎯 V5.29.D consensus shift' when correction fires.
-  - Strategy tag prefix bumped V529C → V529D for clean validation cutoff.
+    (capped at ±2F). Safeguards: skip when obs_high already locked, skip
+    when ensemble is wildly off from NWS (>8F probable bad data), hard cap.
 
 V5.29.C changes from V5.29.B:
-  - GFS /v1/forecast fallback when /v1/ensemble fails.
-  - Previous behavior: any GFS failure (HTTP timeout, NO TODAY MATCH timezone
-    issue, SPARSE GRID <3 members) returned (None, None) → no ensemble data
-    for that city → bracket probability falls back to sigma-CDF only.
-  - Now: any failure path tries /v1/forecast single-point as backup. Returns
-    a 1-member "ensemble" wrapping the deterministic GFS forecast. Acts as
-    sanity check — if this single value disagrees with model's bracket pick,
-    ens_prob = 0.0 suppresses bet confidence (preventing wild misses).
-  - Targets memory #14 finding: all 4 worst misses (OKC 22°F, Dallas 12°F,
-    Boston 11.2°F) had null ensemble. The 79% null rate for Dallas, 64% for
-    Austin, 57% for Houston should drop dramatically.
-  - Logs '🔁 [{city}] GFS fallback fired ({reason}): mean={X}F' when triggered.
-  - Strategy tag prefix bumped V529B → V529C for clean validation cutoff.
+  - GFS /v1/forecast fallback when /v1/ensemble fails. Any failure path
+    tries single-point as backup, returning a 1-member "ensemble".
 
 V5.29.B changes from V5.29.A:
   - Per-city sigma recalibration from observed 28-day data (2026-06-17).
-  - 14 cities had sigma INCREASED (Boston 1.9→3.5, NYC 1.8→3.0, etc) — these
-    were drastically underconfident, causing high-confidence bets that
-    actually had moderate uncertainty. Expect FEWER but better-calibrated bets.
-  - 2 cities had sigma DECREASED (Phoenix 2.2→0.9, Vegas 2.2→1.2) — these
-    were overconfident, suppressing legitimate high-confidence picks. Expect
-    MORE aggressive picks for Phoenix/Vegas with higher final_prob.
-  - Capped at 3.5°F to prevent single-day outliers (OKC's 22°F miss) from
-    over-inflating any city's sigma.
-  - Strategy tag prefix bumped V529 → V529.B for clean validation cutoff.
-  - This is the FIRST item from the original V5.29 punch list (memory #19,
-    June 4 2026) — should have shipped before V5.29.A Σp gate.
 
 V5.29.A changes from V5.28.4:
-  - NEW: Σp gate. Computes sum of YES implied probabilities across Kalshi
-    ladder for each city. If Σp > 1.15, skip the city entirely (ladder is
-    materially overpriced; fees + favorite-longshot bias eat all expected edge).
-  - Strategy tag prefix bumped V528 → V529 for clean validation cutoff.
-  - sigma_p included in bet notes column for per-bet visibility.
-  - Console summary per window: '🚫 V5.29.A: skipped N city/cities (Σp > 1.15)'.
-  - Starting threshold 1.15 is conservative — Jun 15 data showed 1.05-1.14
-    range, so this catches only clearly overpriced ladders. Tighten over time
-    as V529 paper-bet performance by sigma_p bucket accumulates.
+  - Σp gate. If sum of YES implied probabilities across the Kalshi ladder
+    exceeds 1.15, skip the city (ladder materially overpriced).
 
-V5.28.4 changes from V5.28.3-diag:
-  - ROOT CAUSE FIX. Diagnostic dumps (Jun 15) revealed:
-      1) get_event_ticker() was producing '15JUN26' but Kalshi uses '26JUN15'.
-         The first API endpoint (event_ticker) failed on every cron tick,
-         forcing fallback to series_status_open which returns ALL open markets
-         (today + tomorrow).
-      2) V5.28.2 close_time filter checked today's ET date but Kalshi's
-         close_time starts with tomorrow's UTC date (midnight ET = next UTC day).
-         Filter never matched anything.
-      3) V5.28.2 ticker pattern matching used wrong date format ('15JUN26').
-  - Now: event_ticker endpoint succeeds → returns ONLY today's 6 markets.
-  - Defensive fallback layers (close_time, ticker pattern, take-all) use
-    correct date formats so they also work if primary endpoint fails.
-  - Kept V5.28.3-diag's raw API dump capture for ongoing monitoring.
-  - Expected effect: sigma_p drops from ~2.0 to ~1.0 on all cities.
+V5.28.4 / V5.28.3-diag / V5.28.2 / V5.28.1:
+  - Kalshi event_ticker date-format fix, raw API dump capture, duplicate
+    bracket dedup, market snapshot logger.
 
-V5.28.3-diag changes from V5.28.2:
-  - DIAGNOSTIC PATCH (no behavior change). Adds raw Kalshi API response dump
-    to new Supabase table `kalshi_api_dumps` (you must CREATE TABLE first).
-  - Records which endpoint succeeded (event_ticker / series_status_open /
-    series_only), counts at each filter stage (raw → close_time-filtered →
-    deduped), and the FULL raw response as JSONB for offline analysis.
-  - Console log per city per cron tick:
-    '📋 [{series}] endpoint={X}, raw={Y}, filtered={Z}, final={W}'
-  - Purpose: figure out why Houston returns 2 different ladder structures
-    simultaneously and why some snapshots came in with all prices at $1.00.
-  - Once we have one day of dump data we can write V5.28.4 with confidence.
-
-V5.28.2 changes from V5.28.1:
-  - BUG FIX: fetch_kalshi_brackets() was returning BOTH today's and tomorrow's
-    markets when both were open. Discovered via V5.28.1 snapshot data showing
-    sigma_p ~2.0 (should be ~1.0). Fix: strict close_time filter as primary,
-    label deduplication as backstop.
-  - Side effect of bug: V527/V528 paper bets may have occasionally logged
-    prices from tomorrow's market for same-label brackets. Probably small
-    impact since same-bracket prices are similar across adjacent days, but
-    fix removes that noise going forward.
-  - Will be visible in logs: '⚠️ [{series}] Dropped N duplicate bracket(s)'
-    if/when the legacy filter would have let duplicates through.
-
-V5.28.1 changes from V5.28:
-  - NEW: Kalshi market snapshot logger. On every paper-bet window cron tick,
-    captures the full Kalshi ladder (every bracket + yes/no price) and computes
-    Σp (sum of bucket implied probabilities) for each of the 18 cities.
-  - Writes to new Supabase table `kalshi_snapshots` (you must CREATE TABLE
-    before deploying — SQL provided separately).
-  - Pure data capture. Zero model behavior change. Wrapped in try/except so
-    snapshot failures cannot break paper-bet evaluation.
-  - Enables future analysis: timing optimization (when does model+market
-    agreement peak?), Σp gate development (skip overpriced ladders),
-    cluster detection (adjacent brackets pricing within 15c).
-
-V5.28 changes from V5.27.2:
-  - BLOCK NO bets on the model's TOP bracket (calibration fix). Reason: the model
-    identifies the most-likely bracket and then bets AGAINST it on the NO side
-    because sigma-CDF math caps top-bracket probability at ~35% even when actual
-    bracket-hit rate is 85%+. Model's own top pick is the direction it believes —
-    betting NO against it is internally inconsistent.
-  - Empirical: 75 NO bets, 40% win rate, -$75 profit vs 49 YES bets, 55% win
-    rate, +$21 profit on same brackets in clean-cutoff validation (May 22–Jun 1).
-  - BUSTED brackets (obs_high already > bracket ceiling) keep their auto-fire NO
-    behavior — those are mechanically impossible, not calibration.
-  - Strategy tag prefix bumped V527_ → V528_ so post-fix bets are easy to filter.
-  - Proper sigma recalibration per-city MAE deferred to V5.29 research.
-
-V5.27.2 (still active):
-  - GFS ensemble timeout 20s → 45s + 1 retry on timeout
-  - Diagnostic logging on all 3 ensemble failure modes
-
-V5.27.1 (still active):
-  - All 18 cities, obs-high 10F threshold, NBM percentiles, settlement-via-cron,
-    paper-bet validator with 8 strategy tags, Miami nws_only routing.
+V5.28:
+  - BLOCK NO bets on the model's TOP bracket (calibration fix). Busted
+    brackets keep auto-fire NO behavior.
 """
 
 import math
@@ -188,21 +105,18 @@ SUPABASE_URL  = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY  = os.environ.get('SUPABASE_KEY', '')
 
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
-HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.29.F', 'Accept': 'application/json'}
+HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.30.0', 'Accept': 'application/json'}
 
 # ── Validator Configuration ──────────────────────────────────────────────────
 PAPER_BET_STAKE       = 3.0
+# NOTE (V5.30.0): stays at 30 on purpose. See header. This file generates the
+# research corpus across ALL price bands; the 60c betting floor lives in
+# streamlit_app.py under the AUTO_GATED_V2 tag.
 PRICE_FLOOR_CENTS     = 30
 CONSENSUS_TOP_N       = 2
 TRUST_THRESHOLDS      = [75, 80]
 WINDOW_TOLERANCE_MIN  = 6
 
-# V5.29.A: skip city if Kalshi ladder Σp exceeds this threshold.
-# Σp = sum of YES implied probs across all brackets (should be ~1.0 in fair
-# market). Higher = market overpriced as a whole (favorite-longshot bias +
-# Kalshi fees). Starting conservative at 1.15 — actual data Jun 15 showed
-# 1.05-1.14 range, so this skips only clearly overpriced ladders. Tighten
-# over time as we accumulate V529 paper-bet performance data by sigma_p bucket.
 SIGMA_P_GATE_MAX      = 1.15
 
 WINDOW_SCHEDULE = {
@@ -218,7 +132,7 @@ TZ_CITIES = {
     'CT': ['Chicago', 'Dallas', 'Austin', 'Houston', 'San Antonio',
            'New Orleans', 'Oklahoma City', 'Minneapolis'],
     'MT': ['Denver'],
-    'PT': ['Phoenix', 'Las Vegas', 'Los Angeles', 'San Francisco', 'Seattle'],
+    'PT': ['Phoenix', 'Las Vegas', 'Los Angeles'],
 }
 
 CITY_TZ = {
@@ -231,7 +145,6 @@ CITY_TZ = {
     'Boston': 'America/New_York', 'Denver': 'America/Denver',
     'Oklahoma City': 'America/Chicago', 'Minneapolis': 'America/Chicago',
     'Washington DC': 'America/New_York', 'Chicago': 'America/Chicago',
-    'San Francisco': 'America/Los_Angeles', 'Seattle': 'America/Los_Angeles',
 }
 
 CITIES = {
@@ -253,8 +166,6 @@ CITIES = {
     'Minneapolis':   {'lat': 44.8848, 'lon': -93.2223},
     'Washington DC': {'lat': 38.8512, 'lon': -77.0402},
     'Chicago':       {'lat': 41.7868, 'lon': -87.7522},
-    'San Francisco': {'lat': 37.6188, 'lon': -122.3750},
-    'Seattle':       {'lat': 47.4444, 'lon': -122.3138},
 }
 
 WETHR_STATIONS = {
@@ -264,7 +175,6 @@ WETHR_STATIONS = {
     'San Antonio': 'KSAT', 'New Orleans': 'KMSY', 'Philadelphia': 'KPHL',
     'Boston': 'KBOS', 'Denver': 'KDEN', 'Oklahoma City': 'KOKC',
     'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KMDW',
-    'San Francisco': 'KSFO', 'Seattle': 'KSEA',
 }
 
 CLI_STATIONS = {
@@ -274,7 +184,6 @@ CLI_STATIONS = {
     'San Antonio': 'KSAT', 'New Orleans': 'KMSY', 'Philadelphia': 'KPHL',
     'Boston': 'KBOS', 'Denver': 'KDEN', 'Oklahoma City': 'KOKC',
     'Minneapolis': 'KMSP', 'Washington DC': 'KDCA', 'Chicago': 'KMDW',
-    'San Francisco': 'KSFO', 'Seattle': 'KSEA',
 }
 
 SERIES = {
@@ -287,7 +196,6 @@ SERIES = {
     'Boston': 'KXHIGHTBOS', 'Denver': 'KXHIGHDEN',
     'Oklahoma City': 'KXHIGHTOKC', 'Minneapolis': 'KXHIGHTMIN',
     'Washington DC': 'KXHIGHTDC', 'Chicago': 'KXHIGHCHI',
-    'San Francisco': 'KXHIGHTSFO', 'Seattle': 'KXHIGHTSEA',
 }
 
 CITY_PREDICTION_MODE = {
@@ -300,7 +208,6 @@ CITY_PREDICTION_MODE = {
     'Oklahoma City': 'nws_only',   'Chicago':       'nws_only',
     'Denver':        'nws_only',   'Austin':        'nws_only',
     'Minneapolis':   'nws_only',   'San Antonio':   'nws_only',
-    'San Francisco': 'nws_only',   'Seattle':       'nws_only',
 }
 
 CITY_WARM_OFFSET = {'Phoenix': 1.0, 'Las Vegas': -1.0}
@@ -315,20 +222,12 @@ GFS_CITY_WEIGHT = {
     'Miami': 0.0, 'New Orleans': 0.0, 'Dallas': 0.0, 'Austin': 0.0,
     'San Antonio': 0.0, 'Oklahoma City': 0.0, 'Atlanta': 0.0, 'Denver': 0.0,
     'Minneapolis': 0.0, 'Chicago': 0.0, 'New York': 0.0, 'Philadelphia': 0.0,
-    'Boston': 0.0, 'Washington DC': 0.0, 'San Francisco': 0.0, 'Seattle': 0.0,
+    'Boston': 0.0, 'Washington DC': 0.0,
 }
 
 # V5.29.B per-city sigma recalibration from observed 28-day data (Jun 17 2026).
-# Previous hardcoded values were drastically underconfident for most cities
-# (Boston 1.9 vs observed 3.66, NYC 1.8 vs 3.03) and overconfident for desert
-# cities (Phoenix 2.2 vs 0.94, Vegas 2.2 vs 1.24). Capped at 3.5°F to prevent
-# single-day data feed failures (e.g. OKC's 22°F outlier) from over-inflating.
-# Recalibration date: 2026-06-17. Re-run quarterly or after structural changes.
-#
-# V5.29.E NOTE: San Francisco and Seattle are DELIBERATELY ABSENT — they fall
-# to the 2.1 default via BASE_SIGMA.get(city, 2.1). Per punchlist: marine
-# cities are genuine unknowns, start on default, do not assume. Add calibrated
-# values only after ~28 days of settled data.
+# Capped at 3.5F to prevent single-day data feed failures (e.g. OKC's 22F
+# outlier) from over-inflating. Re-run quarterly or after structural changes.
 BASE_SIGMA = {
     'Boston': 3.5,        # was 1.9 — observed σ 3.66 (capped)
     'Oklahoma City': 3.5, # was 2.5 — observed σ 4.35 (capped, outlier-inflated)
@@ -499,58 +398,17 @@ def sb_count_paper_bets_today(city, strategy_tag):
 
 
 # ── V5.28.1: Kalshi market snapshot logger ───────────────────────────────────
-# Captures the full Kalshi ladder for each city on every paper-bet window tick.
-# Computes Σp (sum of YES implied probs across all brackets) which signals when
-# the whole market is mispriced. Stored in `kalshi_snapshots` table.
-#
-# Schema (create once in Supabase SQL editor before deploying V5.28.1):
-#
-#   CREATE TABLE IF NOT EXISTS public.kalshi_snapshots (
-#     id BIGSERIAL PRIMARY KEY,
-#     snapshot_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-#     date TEXT NOT NULL,           -- ET date 'YYYY-MM-DD'
-#     city TEXT NOT NULL,
-#     bracket_label TEXT NOT NULL,  -- normalized, e.g. '81-82' or '90 or above'
-#     yes_price_cents INTEGER,
-#     no_price_cents INTEGER,
-#     bracket_rank INTEGER,         -- 1 = highest yes_ask for this city/snapshot
-#     sigma_p NUMERIC(5,4),         -- sum of (yes_price/100) across whole ladder
-#     window_tz TEXT,               -- 'ET'/'CT'/'MT'/'PT'
-#     window_label TEXT,            -- 'EDGE' / 'CONVICTION'
-#     utc_hour INTEGER,             -- UTC hour the snapshot was captured
-#     model_top_bracket TEXT        -- our model's #1 pick at this moment
-#   );
-#   CREATE INDEX IF NOT EXISTS idx_snap_city_date ON public.kalshi_snapshots(city, date);
-#   CREATE INDEX IF NOT EXISTS idx_snap_time ON public.kalshi_snapshots(snapshot_time);
-#   ALTER TABLE public.kalshi_snapshots ENABLE ROW LEVEL SECURITY;
-#   CREATE POLICY "Allow all access" ON public.kalshi_snapshots
-#     FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);
-
-
 def snapshot_kalshi_market(city, kalshi_markets, window_tz, window_label,
                            model_top_bracket, utc_now):
-    """Snapshot the full Kalshi ladder for one city to kalshi_snapshots table.
-
-    Args:
-      city: city name
-      kalshi_markets: list of (label, yes_ask, no_ask) from fetch_kalshi_brackets
-      window_tz: 'ET'/'CT'/'MT'/'PT' (or '' if not in a window)
-      window_label: 'EDGE'/'CONVICTION' (or '' if not in a window)
-      model_top_bracket: our model's #1 bracket pick at this moment
-      utc_now: datetime.utcnow()
-
-    Returns count of rows inserted (best-effort; failures logged but not raised).
-    """
+    """Snapshot the full Kalshi ladder for one city to kalshi_snapshots table."""
     if not kalshi_markets:
         return 0
     try:
-        # Compute sigma_p: sum of yes_ask cents / 100 across all brackets
         valid_yes = [m[1] for m in kalshi_markets if m[1] is not None]
         if not valid_yes:
             return 0
         sigma_p = round(sum(valid_yes) / 100.0, 4)
 
-        # Compute bracket_rank by yes_ask (highest = 1)
         ranked = sorted(
             [(idx, m) for idx, m in enumerate(kalshi_markets) if m[1] is not None],
             key=lambda x: x[1][1],
@@ -578,7 +436,6 @@ def snapshot_kalshi_market(city, kalshi_markets, window_tz, window_label,
                 'model_top_bracket': normalize_label(model_top_bracket) if model_top_bracket else None,
             })
 
-        # Bulk insert
         r = requests.post(
             sb_url('kalshi_snapshots'),
             headers=sb_headers(),
@@ -591,46 +448,14 @@ def snapshot_kalshi_market(city, kalshi_markets, window_tz, window_label,
             print(f'    ⚠️ Snapshot insert non-200 for {city}: HTTP {r.status_code}')
             return 0
     except Exception as e:
-        # Non-fatal — snapshot failures must NOT block paper-bet evaluation
         print(f'    ⚠️ Snapshot exception for {city} (non-fatal): {type(e).__name__}: {str(e)[:120]}')
         return 0
 
 
 # ── V5.28.3-diag: Raw Kalshi API dump (diagnostic only) ──────────────────────
-# Captures the EXACT JSON Kalshi returns from fetch_kalshi_brackets API calls,
-# so we can analyze:
-#   - How Kalshi structures multiple ladders per city (Houston had 12 brackets
-#     across 2 different ladder structures)
-#   - Why some snapshots came in with all prices at $1.00 (illiquid markets?)
-#   - Whether close_time is reliable as a today-filter
-#
-# Schema (create once in Supabase SQL editor before deploying):
-#
-#   CREATE TABLE IF NOT EXISTS public.kalshi_api_dumps (
-#     id BIGSERIAL PRIMARY KEY,
-#     dump_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-#     date TEXT NOT NULL,
-#     city TEXT NOT NULL,
-#     series TEXT NOT NULL,
-#     endpoint_used TEXT,           -- which fallback succeeded: 'event_ticker',
-#                                   --   'series_status_open', 'series_only'
-#     market_count INTEGER,         -- total markets returned by API
-#     filtered_count INTEGER,       -- count after close_time filter
-#     final_count INTEGER,          -- count after dedup
-#     raw_response JSONB            -- full Kalshi response (limited to 30 markets)
-#   );
-#   CREATE INDEX IF NOT EXISTS idx_dumps_city_date ON public.kalshi_api_dumps(city, date);
-#   ALTER TABLE public.kalshi_api_dumps ENABLE ROW LEVEL SECURITY;
-#   CREATE POLICY "Allow all access" ON public.kalshi_api_dumps
-#     FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);
-
-
 def dump_raw_kalshi_response(city, series, raw_data, endpoint_used,
                               market_count, filtered_count, final_count):
-    """Dump raw Kalshi API response to kalshi_api_dumps table for diagnosis.
-
-    Best-effort — failures cannot break paper-bet evaluation.
-    """
+    """Dump raw Kalshi API response to kalshi_api_dumps table for diagnosis."""
     if not raw_data:
         return
     try:
@@ -643,7 +468,7 @@ def dump_raw_kalshi_response(city, series, raw_data, endpoint_used,
             'market_count': market_count,
             'filtered_count': filtered_count,
             'final_count': final_count,
-            'raw_response': raw_data,  # JSONB column accepts dict directly
+            'raw_response': raw_data,
         }
         r = requests.post(
             sb_url('kalshi_api_dumps'),
@@ -654,11 +479,33 @@ def dump_raw_kalshi_response(city, series, raw_data, endpoint_used,
         if r.status_code not in (200, 201):
             print(f'    ⚠️ API dump insert non-200 for {city}: HTTP {r.status_code}')
     except Exception as e:
-        # Non-fatal
         print(f'    ⚠️ API dump exception for {city} (non-fatal): {type(e).__name__}: {str(e)[:120]}')
 
 
-# ── Bias correction ──────────────────────────────────────────────────────────
+# ── Bias correction (V5.30.0: trimmed mean) ──────────────────────────────────
+def _trimmed_mean(errors):
+    """Drop the single highest and lowest error, average the rest.
+
+    V5.30.0 BIAS FIX. statistics.median() discarded the systematic middle of a
+    skewed error distribution. Across 2,514 settlements the residual bias AFTER
+    correction was still positive in 17 of 18 cities (Boston +1.07, Atlanta
+    +1.06, Miami +1.02, DC +0.91, Chicago +0.77 ... Houston -0.14, NYC -0.07).
+    The model was settling roughly half a degree to a degree warmer than it
+    predicted almost everywhere — on a 2F bracket that means systematically
+    picking one bracket low.
+
+    Trimmed mean keeps outlier robustness (a +12F sensor-spike style error is
+    still dropped, where a plain mean would blow the correction up to +1.6)
+    without throwing away the persistent drift the median was compressing.
+    """
+    if not errors:
+        return 0.0
+    if len(errors) < 4:
+        return sum(errors) / len(errors)
+    s = sorted(errors)[1:-1]
+    return sum(s) / len(s)
+
+
 def compute_bias_correction(city, n_recent=10):
     rows = sb_fetch_city(city)
     complete = [r for r in rows if r.get('actual') is not None and r.get('consensus') is not None]
@@ -671,12 +518,12 @@ def compute_bias_correction(city, n_recent=10):
             if len(prior_complete) >= 3:
                 recent = prior_complete[-n_recent:]
                 errors = [r['actual'] - r['consensus'] for r in recent]
-                med_error = statistics.median(errors)
+                med_error = _trimmed_mean(errors)
                 return round(max(-3.0, min(3.0, med_error)), 2), len(complete)
         return 0.0, len(complete)
     recent = complete[-n_recent:]
     errors = [r['actual'] - r['consensus'] for r in recent]
-    med_error = statistics.median(errors)
+    med_error = _trimmed_mean(errors)
     if city in NWS_BIAS_BOOST_CITIES:
         med_error = med_error * NWS_BIAS_BOOST_MULTIPLIER
     return round(max(-3.0, min(3.0, med_error)), 2), len(recent)
@@ -800,16 +647,7 @@ def fetch_obs_high(city):
 
 # ── GFS ensemble (V5.27.2: 45s timeout + retry) ──────────────────────────────
 def fetch_gfs_forecast_fallback(city):
-    """V5.29.C: Single-point GFS forecast fallback when ensemble fails.
-
-    Uses Open-Meteo's /v1/forecast endpoint with models=gfs_seamless.
-    Returns ([single_max_temp], single_max_temp) to mimic ensemble signature.
-    The 1-member "ensemble" gives downstream code something to blend against
-    instead of None. Acts as a sanity check — if this single forecast disagrees
-    with model's bracket pick, ens_prob = 0.0 suppresses bet confidence.
-
-    Returns (None, None) on any failure.
-    """
+    """V5.29.C: Single-point GFS forecast fallback when ensemble fails."""
     coords = CITIES[city]
     lat, lon = coords['lat'], coords['lon']
     params = {
@@ -877,7 +715,6 @@ def fetch_gfs_ensemble(city):
             else:
                 print(f'    ⚠️ [{city}] GFS ensemble fetch FAILED (timeout after retry): '
                       f'{type(e).__name__}: {str(e)[:120]}')
-                # V5.29.C: try /v1/forecast single-point fallback
                 fb_members, fb_mean = fetch_gfs_forecast_fallback(city)
                 if fb_members is not None:
                     print(f'    🔁 [{city}] GFS fallback fired (timeout): mean={fb_mean}F')
@@ -885,13 +722,11 @@ def fetch_gfs_ensemble(city):
         except Exception as e:
             print(f'    ⚠️ [{city}] GFS ensemble fetch FAILED (network/HTTP): '
                   f'{type(e).__name__}: {str(e)[:120]}')
-            # V5.29.C: try /v1/forecast single-point fallback
             fb_members, fb_mean = fetch_gfs_forecast_fallback(city)
             if fb_members is not None:
                 print(f'    🔁 [{city}] GFS fallback fired (network): mean={fb_mean}F')
             return fb_members, fb_mean
     if data is None:
-        # V5.29.C: try fallback if main loop somehow exited without data
         fb_members, fb_mean = fetch_gfs_forecast_fallback(city)
         if fb_members is not None:
             print(f'    🔁 [{city}] GFS fallback fired (no_data): mean={fb_mean}F')
@@ -907,7 +742,6 @@ def fetch_gfs_ensemble(city):
         sample_times = times[:3] if times else []
         print(f'    ⚠️ [{city}] GFS ensemble NO TODAY MATCH: looking for "{today}", '
               f'series has {len(times)} entries, sample: {sample_times}')
-        # V5.29.C: try /v1/forecast single-point fallback
         fb_members, fb_mean = fetch_gfs_forecast_fallback(city)
         if fb_members is not None:
             print(f'    🔁 [{city}] GFS fallback fired (no_today_match): mean={fb_mean}F')
@@ -927,7 +761,6 @@ def fetch_gfs_ensemble(city):
                                if k != 'time' and 'temperature_2m' in k)
         print(f'    ⚠️ [{city}] GFS ensemble SPARSE GRID: got {len(member_maxes)} member maxes '
               f'(need ≥3); response had {member_key_count} ensemble keys total')
-        # V5.29.C: try /v1/forecast single-point fallback
         fb_members, fb_mean = fetch_gfs_forecast_fallback(city)
         if fb_members is not None:
             print(f'    🔁 [{city}] GFS fallback fired (sparse_grid): mean={fb_mean}F')
@@ -1018,9 +851,38 @@ def late_day_floor(fc, obs, local_hour, city=''):
 
 
 def compute_consensus(fc, cur, noaa, city, obs_high=None):
+    """V5.30.0 CONSENSUS FLOOR FIX.
+
+    An observed high is a MEASUREMENT, not a forecast. Previously this
+    function did `consensus = obs_high` and then added the city warm offset
+    on top, and main() added bias_correction on top of that — so Phoenix
+    reported consensus 114.35F from a 113.0F floor while every forecast
+    input read below 111F.
+
+    Now: decide whether the observed high is trustworthy, but apply it as a
+    max() clamp AFTER the warm offset. The offset shapes the forecast
+    estimate; the measurement can only raise the result from below, never
+    become the base that adjustments stack on. Returns a flag-free value —
+    main() re-clamps after bias for the same reason.
+    """
     mode = CITY_PREDICTION_MODE.get(city, 'full_blend')
+    obs_locked = False
+
     if mode == 'nws_only':
         consensus = float(fc)
+        local_hour = get_local_hour(city)
+        obs = noaa if noaa is not None else cur
+        if obs_high is not None and obs_high > consensus:
+            trusted = True
+            if local_hour < OBS_HIGH_TRUST_HOUR:
+                trusted = False
+            current_for_check = obs if obs is not None else cur
+            if current_for_check is not None and obs_high > current_for_check + OBS_HIGH_MAX_OVERSHOOT:
+                trusted = False
+            if current_for_check is not None and obs_high < current_for_check:
+                trusted = False
+            if trusted:
+                obs_locked = True
     else:
         local_hour = get_local_hour(city)
         is_fc_heavy = city in FORECAST_HEAVY_CITIES
@@ -1057,11 +919,16 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
             if current_for_check is not None and obs_high < current_for_check:
                 trusted = False
             if trusted:
-                consensus = obs_high
+                obs_locked = True
 
     warm_offset = CITY_WARM_OFFSET.get(city, 0.0)
     if warm_offset != 0.0:
         consensus += warm_offset
+
+    # V5.30.0: measurement clamps from below, AFTER the offset.
+    if obs_locked:
+        consensus = max(consensus, obs_high)
+
     return consensus
 
 
@@ -1170,33 +1037,50 @@ def blend_probs(sigma_prob, ensemble_prob, members, city='', nbm_active=False):
 
 
 def apply_prob_floor(prob_rows, consensus, ladder_text):
+    """V5.30.0 LADDER NORMALIZATION FIX.
+
+    The old version applied a probability floor to near-consensus brackets and
+    then rescaled by 1/(1+boost_total), which does NOT normalize. Observed a
+    Phoenix ladder summing to 13.9% with four identical 4.1% values — the floor
+    had set several brackets to 0.05 and the rescale left the total far from 1.
+    Every edge number downstream was computed against a distribution missing
+    most of its mass.
+
+    Now: floor as before, then divide by the true total so the ladder sums to
+    1.0. Busted brackets (already zeroed by the obs_high check upstream) stay
+    at exactly zero and are excluded from redistribution — a bracket the
+    observed high has already passed is impossible, not merely unlikely.
+    """
     if not prob_rows or consensus is None:
         return prob_rows
     parsed = {lbl: (lo, hi) for lbl, lo, hi in parse_ladder(ladder_text)}
     adjusted = []
-    boost_total = 0.0
     for label, prob in prob_rows:
         lo, hi = parsed.get(label, (None, None))
+        if lo is None and hi is None:
+            adjusted.append((label, prob))
+            continue
+        if prob <= 0.0:
+            adjusted.append((label, 0.0))
+            continue
         if lo is not None and hi is not None:
             mid = (lo + hi) / 2.0
         elif lo is not None:
             mid = lo + 1.0
-        elif hi is not None:
-            mid = hi - 1.0
         else:
-            adjusted.append((label, prob))
-            continue
+            mid = hi - 1.0
         distance = abs(mid - consensus)
         new_prob = prob
         if distance <= 4.0 and prob < 0.05:
             new_prob = 0.05
         elif distance <= 6.0 and prob < 0.02:
             new_prob = 0.02
-        boost_total += (new_prob - prob)
         adjusted.append((label, new_prob))
-    if boost_total > 0:
-        scale = 1.0 / (1.0 + boost_total)
-        adjusted = [(lbl, round(p * scale, 4)) for lbl, p in adjusted]
+    total = sum(p for _, p in adjusted)
+    if total <= 0:
+        return adjusted
+    adjusted = [(lbl, round(p / total, 4)) for lbl, p in adjusted]
+    adjusted.sort(key=lambda x: x[1], reverse=True)
     return adjusted
 
 
@@ -1239,9 +1123,6 @@ def get_eastern_datetime():
 
 def get_event_ticker(series):
     # V5.28.4 fix: Kalshi uses YY-MON-DD format (e.g., '26JUN15'), not DD-MON-YY.
-    # The previous '%d%b%y' format ('15JUN26') was wrong — caused endpoint #1
-    # (event_ticker param) to fail on every call, forcing fallback to endpoint
-    # #2 which returns ALL open markets in the series (including tomorrow's).
     return series + '-' + get_eastern_datetime().strftime('%y%b%d').upper()
 
 
@@ -1312,18 +1193,11 @@ def get_price_cents(m):
 
 
 def fetch_kalshi_brackets(series, city=''):
-    """Fetch and parse Kalshi market ladder for a city.
-
-    V5.28.3-diag: accepts optional `city` param for diagnostic dump correlation.
-    Dumps raw API response to kalshi_api_dumps table for offline analysis.
-    """
+    """Fetch and parse Kalshi market ladder for a city."""
     url = 'https://api.elections.kalshi.com/trade-api/v2/markets'
     event_ticker = get_event_ticker(series)
     today_date = get_eastern_date()
 
-    # V5.28.4: Kalshi's ticker format is YY-MON-DD (e.g., '26JUN15'), not
-    # DD-MON-YY. Also, markets close at midnight ET = early next UTC day,
-    # so close_time starts with tomorrow's UTC date, not today's.
     today_et_dt = get_eastern_datetime()
     today_kalshi_fmt = today_et_dt.strftime('%y%b%d').upper()  # '26JUN15'
     tomorrow_utc_date = (today_et_dt + timedelta(days=1)).strftime('%Y-%m-%d')
@@ -1336,7 +1210,6 @@ def fetch_kalshi_brackets(series, city=''):
         except Exception:
             return None
 
-    # Track which endpoint succeeded for diagnostic purposes
     endpoint_used = None
     data = _try({'event_ticker': event_ticker, 'limit': 30})
     if data and data.get('markets'):
@@ -1355,15 +1228,6 @@ def fetch_kalshi_brackets(series, city=''):
     all_markets = data['markets']
     raw_market_count = len(all_markets)
 
-    # V5.28.4 filtering chain — three layers + last-resort fallback:
-    #
-    # Layer 1: event_ticker pattern match (primary). Today's markets have
-    #   event_ticker like 'KXHIGHTHOU-26JUN15'. Match the '26JUN15' substring.
-    # Layer 2: close_time match. Markets settle at midnight ET = ~04-06 UTC
-    #   of the next calendar day, so close_time starts with tomorrow's UTC date.
-    # Layer 3: ticker pattern match (legacy fallback).
-    # Layer 4: take everything (warn loudly — should be very rare).
-
     markets = [m for m in all_markets if today_kalshi_fmt in (m.get('event_ticker') or '').upper()]
     if not markets:
         markets = [m for m in all_markets if (m.get('close_time') or '').startswith(tomorrow_utc_date)]
@@ -1375,7 +1239,6 @@ def fetch_kalshi_brackets(series, city=''):
 
     filtered_count = len(markets)
 
-    # Dedup by normalized bracket label as defensive backstop.
     parsed = []
     seen_labels = set()
     duplicates_dropped = 0
@@ -1394,12 +1257,10 @@ def fetch_kalshi_brackets(series, city=''):
     if duplicates_dropped > 0:
         print(f'    ⚠️ [{series}] Dropped {duplicates_dropped} duplicate bracket(s) after dedup')
 
-    # V5.28.3-diag: dump raw API response for offline analysis.
-    # Wrapped internally — dump failures don't break paper-bet evaluation.
     print(f'    📋 [{series}] endpoint={endpoint_used}, raw={raw_market_count}, '
           f'filtered={filtered_count}, final={len(parsed)}')
     dump_raw_kalshi_response(
-        city=city or series,  # fall back to series name if city not passed
+        city=city or series,
         series=series,
         raw_data=data,
         endpoint_used=endpoint_used,
@@ -1706,10 +1567,6 @@ def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction,
     if not kalshi_markets or len(kalshi_markets) < 2:
         return None
 
-    # V5.29.A: Σp gate — compute sum of YES implied probs across whole ladder.
-    # Σp > 1.15 means market is materially overpriced (Kalshi fees + favorite-
-    # longshot bias + market maker margin compounding to >15% overhead).
-    # Skip the city — any bet here pays too much overhead for our edge.
     valid_yes_prices = [m[1] for m in kalshi_markets if m[1] is not None]
     sigma_p = round(sum(valid_yes_prices) / 100.0, 4) if valid_yes_prices else None
 
@@ -1724,9 +1581,6 @@ def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction,
     model_pick_label = prob_rows[0][0]
     target_base_prob = prob_rows[0][1]
 
-    # V5.28.1: snapshot the full Kalshi ladder now that we know our model's top
-    # pick. Captures market state + our state in one row for later analysis.
-    # Best-effort — failures cannot block paper-bet logic.
     if utc_now is not None:
         snapshot_kalshi_market(
             city=city,
@@ -1737,7 +1591,6 @@ def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction,
             utc_now=utc_now,
         )
 
-    # V5.29.A: Σp gate check (after snapshot so we still capture overpriced data)
     if sigma_p is not None and sigma_p > SIGMA_P_GATE_MAX:
         return {
             'gate1_pass': False,
@@ -1810,28 +1663,13 @@ def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction,
 
 
 def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
-    """V5.29.A: Σp gate active. V5.28 NO-bet block carried forward.
-
-    V5.29.A NEW: skip cities where Kalshi ladder Σp > 1.15 (overpriced ladder).
-    Strategy tag prefix bumped V528 → V529 (clean validation cutoff).
-
-    V5.28: NO bets on the model's TOP bracket are BLOCKED. The model identified
-    this bracket as MOST LIKELY — betting against it is internally inconsistent.
-    Empirical: 75 NO bets, 40% win rate, -$75 vs 49 YES bets, 55% win rate,
-    +$21 on same brackets (May 22–Jun 1 validation).
-
-    BUSTED brackets (obs_high > ceiling) still auto-fire NO at ≤5c — those
-    are mechanically impossible to hit, different mechanism from calibration.
-
-    V5.28.1: passes window_tz / window_label / utc_now into evaluate so the
-    Kalshi snapshot logger has context for timing analysis.
-    """
+    """V5.29.A Σp gate + V5.28 NO-bet block, both carried forward unchanged."""
     cities = TZ_CITIES.get(tz_key, [])
     today = get_eastern_date()
     logged = []
-    no_blocks = 0           # count of NO bets blocked by V5.28 rule
-    sigma_p_blocks = 0      # V5.29.A: count of cities skipped by Σp gate
-    utc_now = datetime.utcnow()  # single timestamp for all snapshots this window
+    no_blocks = 0
+    sigma_p_blocks = 0
+    utc_now = datetime.utcnow()
 
     for city in cities:
         wx_data = weather_results.get(city)
@@ -1848,7 +1686,6 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
         )
         if eval_result is None:
             continue
-        # V5.29.A: count Σp gate fails for visibility
         if eval_result.get('sigma_p_pass') is False:
             sigma_p_blocks += 1
             sp = eval_result.get('sigma_p')
@@ -1865,9 +1702,8 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
         contains_consensus = eval_result['contains_consensus']
         trust_yes = eval_result['trust_yes']
         trust_no  = eval_result['trust_no']
-        sigma_p   = eval_result.get('sigma_p')  # V5.29.A
+        sigma_p   = eval_result.get('sigma_p')
 
-        # YES side qualification (unchanged from V5.27.2)
         yes_qualifies = (
             yes_ask is not None
             and yes_ask >= PRICE_FLOOR_CENTS
@@ -1877,22 +1713,17 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
             and final_prob >= 0.10
         )
 
-        # V5.28 CHANGE: NO bets on non-busted top brackets are BLOCKED.
-        # Calibration bug: model says "X is most likely" then bets ¬X with 65%
-        # claimed conviction. Internally inconsistent. Only BUSTED → NO fires.
         no_qualifies = False
         if no_ask is not None and no_ask < 99:
             if busted and no_ask <= 5:
                 no_qualifies = True
             elif (1.0 - final_prob) >= 0.10 and not busted:
-                # Would have qualified pre-V5.28 — count the block for visibility.
                 no_blocks += 1
 
-        # Log YES bets across both thresholds
         if yes_qualifies and trust_yes is not None:
             for threshold in TRUST_THRESHOLDS:
                 if trust_yes >= threshold:
-                    tag = f'V529D_PAPER_YES_{window_label}_T{threshold}'
+                    tag = f'V530_PAPER_YES_{window_label}_T{threshold}'
                     if sb_count_paper_bets_today(city, tag) > 0:
                         continue
                     sp_str = f' | Σp {sigma_p:.3f}' if sigma_p is not None else ''
@@ -1907,11 +1738,10 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
                     if sb_insert_paper_bet(bet_row):
                         logged.append(f'{city} {bracket} YES @ {yes_ask}c [{tag}] Trust {trust_yes:.1f}')
 
-        # Log BUSTED NO bets (the only kind that now fire)
         if no_qualifies and trust_no is not None:
             for threshold in TRUST_THRESHOLDS:
                 if trust_no >= threshold:
-                    tag = f'V529D_PAPER_NO_{window_label}_T{threshold}'
+                    tag = f'V530_PAPER_NO_{window_label}_T{threshold}'
                     if sb_count_paper_bets_today(city, tag) > 0:
                         continue
                     bust_note = ' [BUSTED]' if busted else ''
@@ -1941,9 +1771,9 @@ def main():
     now_et = datetime.now(pytz.timezone('America/New_York'))
     utc_now = datetime.utcnow()
 
-    print(f'\n=== V5.29.F Weather Fetch Run ===')
+    print(f'\n=== V5.30.0 Weather Fetch Run ===')
     print(f'Date: {today} | ET: {now_et.strftime("%I:%M %p ET")} | UTC: {utc_now.strftime("%H:%M")}')
-    print(f'Cities: {len(CITIES)} (all 20 including hidden)\n')
+    print(f'Cities: {len(CITIES)}\n')
 
     firing_windows = is_window_time(utc_now)
     if firing_windows:
@@ -2004,31 +1834,24 @@ def main():
 
             cur = current_temp if current_temp is not None else nws_fc
             consensus_raw = compute_consensus(nws_fc, cur, current_temp, city, obs_high=obs_high)
+
+            # V5.30.0: if compute_consensus locked onto the observed high, the
+            # bias correction must not inflate a measurement. Re-clamp after.
+            _obs_locked = (obs_high is not None and abs(consensus_raw - obs_high) < 0.05)
             consensus = round(consensus_raw + bias_correction, 1)
+            if _obs_locked:
+                consensus = round(max(consensus, obs_high), 1)
+
             warm_offset = CITY_WARM_OFFSET.get(city, 0.0)
+            lock_note = ' [obs-locked]' if _obs_locked else ''
             print(f'    Consensus: {consensus}F (raw={consensus_raw:.1f}, '
-                  f'bias={bias_correction:+.2f}, offset={warm_offset:+.1f})')
+                  f'bias={bias_correction:+.2f}, offset={warm_offset:+.1f}){lock_note}')
 
             # V5.29.D: ensemble-aware consensus correction.
-            # When the GFS ensemble disagrees with NWS-derived consensus by >3F,
-            # shift consensus halfway toward ensemble (capped at ±2F). This
-            # catches days where NWS is systematically wrong but ensemble (or
-            # V5.29.C fallback) is closer to reality. Jun 20 data: Dallas NWS
-            # 88, ensemble 93.4, actual 93 — would have shifted consensus
-            # 88.8→90.8, picking the correct bracket.
-            #
-            # Safeguards:
-            #   - Skip if obs_high is locked in and consensus matches obs_high
-            #     (don't second-guess observed reality)
-            #   - Skip if ensemble_mean differs from NWS by >8F (probably a
-            #     bad fallback value, not real signal)
-            #   - Cap adjustment at ±2F to prevent catastrophic over-correction
             if ensemble_mean is not None and nws_fc is not None:
                 gap = ensemble_mean - consensus
                 nws_ensemble_gap = abs(ensemble_mean - nws_fc)
-                # Skip correction if obs_high is the consensus (already locked)
                 obs_locked = (obs_high is not None and abs(consensus - obs_high) < 0.1)
-                # Skip if ensemble is wildly off from NWS (likely bad data)
                 ensemble_wildly_off = nws_ensemble_gap > 8.0
                 if abs(gap) > 3.0 and not obs_locked and not ensemble_wildly_off:
                     adjustment = max(-2.0, min(2.0, 0.5 * gap))
@@ -2071,7 +1894,7 @@ def main():
         print(f'Failed: {", ".join(save_fail)}')
 
     if firing_windows and _TRUST_AVAILABLE:
-        print(f'\n=== Paper-Bet Validator (V5.28: NO blocked on top bracket) ===')
+        print(f'\n=== Paper-Bet Validator (V5.30.0) ===')
         run_iso = datetime.now(pytz.timezone('America/New_York')).isoformat()
         all_logged = []
         for tz_key, window_label in firing_windows:
