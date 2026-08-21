@@ -1,4 +1,4 @@
-# Kalshi High Temperature Model - V5.27.1
+# Kalshi High Temperature Model - V5.30.0
 # V5.27 BUILD GOALS — bet frequency reduction (research-validated):
 #   After 43 live bets resulted in -$75.02 / -21.5% ROI / 27.9% win rate,
 #   public Kalshi weather strategies (gopher-lab/kalshi-go and
@@ -14,7 +14,7 @@
 #   GATE 2 (Price floor): Entry >= 30c on side bought.
 #   GATE 3 (One bet/day): Single highest Trust accuracy bet across all cities.
 #
-# V5.27.1 HOTFIX (2026-05-12):
+# V5.30.0 HOTFIX (2026-05-12):
 #   - Tightened obs-vs-current threshold 15F -> 10F (both backend and display)
 #     to catch May 11 KNYC sensor-spike pattern
 #   - Fixed NO Signals table Model% showing YES probability instead of NO
@@ -67,7 +67,7 @@ def _check_app_password():
     .mph-login-badge { display: inline-block; padding: 0.2rem 0.7rem; background: rgba(0, 255, 136, 0.12); border: 1px solid rgba(0, 255, 136, 0.4); border-radius: 999px; color: #00ff88; font-size: 0.75rem; font-weight: 600; letter-spacing: 0.05em; margin-left: 0.5rem; }
     </style>
     <div class="mph-login-wrap">
-      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.27.1</span></div>
+      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.30.0</span></div>
       <div class="mph-login-sub">Private — enter access password to continue</div>
     </div>
     """, unsafe_allow_html=True)
@@ -147,7 +147,7 @@ PAPER_BET_STAKE_AUTO = 10.0
 CONSENSUS_TOP_N = 2
 ONE_CITY_PER_DAY = False
 
-HEADERS = {'User-Agent': 'kalshi-temp-model/5.27.1', 'Accept': 'application/geo+json, application/json, text/html'}
+HEADERS = {'User-Agent': 'kalshi-temp-model/5.30.0', 'Accept': 'application/geo+json, application/json, text/html'}
 try:
     WETHR_API_KEY = st.secrets['wethr']['api_key']
 except Exception:
@@ -302,7 +302,7 @@ GFS_CITY_WEIGHT = {
     'Boston': 0.0, 'Washington DC': 0.0,
 }
 
-HIDDEN_CITIES = set()
+HIDDEN_CITIES = set()   # all 18 cities live (Aug 19 2026)
 
 
 SPRING_WIDE_THRESHOLD_CITIES = {'New York', 'Philadelphia', 'Boston', 'Washington DC', 'Los Angeles'}
@@ -311,7 +311,7 @@ DESERT_CITIES = {'Phoenix', 'Las Vegas'}
 REGIONAL_PRIOR_BIAS = {'Chicago': 'Minneapolis'}
 
 # Miami: 14-day MAE showed full_blend ran -2.04F hot bias and 0.73F worse
-# than nws_only. Routed to nws_only 2026-05-12 (V5.27.1).
+# than nws_only. Routed to nws_only 2026-05-12 (V5.30.0).
 CITY_PREDICTION_MODE = {
     'New York': 'full_blend', 'Houston': 'full_blend', 'Dallas': 'full_blend',
     'Los Angeles': 'full_blend', 'Phoenix': 'full_blend',
@@ -513,6 +513,27 @@ def run_auto_settlement():
             settled.append({'city': city, 'date': row_date, 'actual': actual, 'error': error})
     return len(settled), settled
 
+def _trimmed_mean(errors):
+    """Drop the single highest and lowest error, average the rest.
+
+    BIAS FIX (2026-08-19). statistics.median() discarded the systematic
+    middle of a skewed error distribution. Across 2,514 settlements the
+    residual bias AFTER correction was still positive in 17 of 18 cities
+    (Boston +1.07, Atlanta +1.06, Miami +1.02 ... Houston -0.14). The model
+    was settling roughly half a degree to a degree warmer than it predicted
+    almost everywhere, which on a 2F bracket means systematically picking
+    one bracket low. Trimmed mean keeps outlier robustness (the +4.2 and
+    -3.2 style misses still get dropped) without throwing away the
+    persistent drift that the median was compressing away.
+    """
+    if not errors:
+        return 0.0
+    if len(errors) < 4:
+        return sum(errors) / len(errors)
+    s = sorted(errors)[1:-1]
+    return sum(s) / len(s)
+
+
 def compute_bias_correction_db(city, n_recent=10):
     import statistics
     rows = sb_fetch_city(city)
@@ -525,12 +546,12 @@ def compute_bias_correction_db(city, n_recent=10):
             if len(prior_complete) >= 3:
                 recent = prior_complete[-n_recent:]
                 errors = [r['actual'] - r['consensus'] for r in recent]
-                med_error = statistics.median(errors)
+                med_error = _trimmed_mean(errors)
                 return round(max(-3.0, min(3.0, med_error)), 2), len(complete)
         return 0.0, len(complete)
     recent = complete[-n_recent:]
     errors = [r['actual'] - r['consensus'] for r in recent]
-    med_error = statistics.median(errors)
+    med_error = _trimmed_mean(errors)
     if city in NWS_BIAS_BOOST_CITIES:
         med_error = med_error * NWS_BIAS_BOOST_MULTIPLIER
     return round(max(-3.0, min(3.0, med_error)), 2), len(recent)
@@ -1980,7 +2001,7 @@ with st.sidebar:
     st.markdown('**Kelly fraction:** 15% (conservative)')
     st.markdown('**Max per trade:** min(5% bankroll, $100)')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚦 V5.27.1 Three Gates</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mph-section-header">🚦 V5.30.0 Three Gates</div>', unsafe_allow_html=True)
     st.markdown(f'**Gate 1 — Consensus:** Model pick must equal market #1 or #2 by yes-ask')
     st.markdown(f'**Gate 2 — Price floor:** Entry ≥{PRICE_FLOOR_CENTS}c on side bought')
     st.markdown('**Gate 3 — One bet/city:** Best side (YES or NO) per city only — no spreading')
@@ -1992,7 +2013,7 @@ with st.sidebar:
     st.markdown('---')
     st.markdown('<div class="mph-section-header">🎯 Trust Columns</div>', unsafe_allow_html=True)
     st.markdown('**Trust 💎** — Edge trust (0-100)')
-    st.markdown('**Trust 🎯** — Accuracy trust ← V5.27.1 tie-breaker')
+    st.markdown('**Trust 🎯** — Accuracy trust ← V5.30.0 tie-breaker')
     st.markdown('---')
     st.markdown('<div class="mph-section-header">🔵 Ensemble</div>', unsafe_allow_html=True)
     st.markdown('🔵 HIGH · 🟡 MED · ⚪ LOW')
@@ -2000,7 +2021,7 @@ with st.sidebar:
     st.markdown('<div class="mph-section-header">🔬 MAE Guide</div>', unsafe_allow_html=True)
     st.markdown('✅ <2.5F · 🟡 2.5-4F · 🔴 >4F')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚦 V5.27.1</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mph-section-header">🚦 V5.30.0</div>', unsafe_allow_html=True)
     st.markdown('Bet frequency reduction.')
     st.markdown('- Three research-validated gates')
     st.markdown('- Banner shows ALL qualifying picks (ranked by Trust 🎯)')
@@ -2008,7 +2029,7 @@ with st.sidebar:
     st.markdown('- ~50% of days expected to be skips')
     st.markdown('- All forecasting infra unchanged')
     st.markdown('---')
-    st.caption('V5.27.1 reduces bets — does not change predictions.')
+    st.caption('V5.30.0 reduces bets — does not change predictions.')
     st.markdown('---')
     st.markdown('<div class="mph-section-header">🔧 Aug 18 Fixes</div>', unsafe_allow_html=True)
     st.caption('Obs high now clamps consensus from below (max) instead of '
@@ -2027,7 +2048,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.27.1</span>
+                <span class="mph-version-badge">V5.30.0</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -2099,7 +2120,7 @@ _last_sync_time = last_sync_data.get('date', '—')
 st.markdown(f"""
 <div class="mph-stats-bar">
     <div class="mph-stat">
-        <span class="mph-stat-value">{_n_cities}/11</span>
+        <span class="mph-stat-value">{_n_cities}/18</span>
         <span class="mph-stat-label">Cities Live</span>
     </div>
     <div class="mph-stat {'mph-stat-neutral' if _synced_count < 18 else ''}">
@@ -2122,14 +2143,14 @@ components.html('<script>setTimeout(function(){window.location.reload();}, 60000
 
 
 # ── V5.27 Cross-City Evaluation ───────────────────────────────────────────────
-with st.spinner('Running V5.27.1 three-gate evaluation across all cities...'):
+with st.spinner('Running V5.30.0 three-gate evaluation across all cities...'):
     v527_eval = evaluate_all_cities_v527(saved_ladders, bankroll=bankroll)
 
 best_overall = v527_eval['best_overall']
 qualifying_picks = v527_eval['qualifying_picks']
 rejected_cities = v527_eval['rejected']
 
-st.markdown('<div class="mph-section-header">🚦 V5.27.1 — Today\'s Qualifying Bets</div>', unsafe_allow_html=True)
+st.markdown('<div class="mph-section-header">🚦 V5.30.0 — Today\'s Qualifying Bets</div>', unsafe_allow_html=True)
 
 if not qualifying_picks:
     n_evaluated = len(qualifying_picks) + len(rejected_cities)
@@ -2179,7 +2200,7 @@ else:
 
 # Audit panel
 if rejected_cities or len(qualifying_picks) > 1:
-    with st.expander(f'📋 V5.27.1 Gate Audit ({len(qualifying_picks)} passing · {len(rejected_cities)} rejected)', expanded=False):
+    with st.expander(f'📋 V5.30.0 Gate Audit ({len(qualifying_picks)} passing · {len(rejected_cities)} rejected)', expanded=False):
         st.caption('Diagnostic visibility into why each city was selected or skipped. Verify the gate is firing correctly during the 2-week validation window.')
         if qualifying_picks:
             st.markdown('**Cities that passed all three gates:**')
@@ -2231,7 +2252,7 @@ if rejected_cities or len(qualifying_picks) > 1:
                 else:
                     st.caption('Nothing new to log (already logged today).')
 
-with st.expander('🔬 V5.27.1 Diagnostic Dashboard — Trust the Model?', expanded=False):
+with st.expander('🔬 V5.30.0 Diagnostic Dashboard — Trust the Model?', expanded=False):
     st.caption('This panel measures whether the model deserves your trust today. '
                'It does NOT change any predictions — it tells you when predictions are likely reliable.')
 
@@ -2424,8 +2445,8 @@ def get_phase_label(tz_key, et_hour):
     if et_hhmm < bet_start: return '⏳ EARLY', '#94a3b8'
     return '', '#64748b'
 
-st.markdown('<div class="mph-section-header">🎯 Best Bets By Timezone Window (V5.27.1 Gated)</div>', unsafe_allow_html=True)
-st.caption('Only V5.27.1-qualifying picks shown. Cities not listed did not pass all three gates — see V5.27.1 Gate Audit above.')
+st.markdown('<div class="mph-section-header">🎯 Best Bets By Timezone Window (V5.30.0 Gated)</div>', unsafe_allow_html=True)
+st.caption('Only V5.30.0-qualifying picks shown. Cities not listed did not pass all three gates — see V5.30.0 Gate Audit above.')
 
 _et_hour_now = get_et_hour()
 
@@ -2485,7 +2506,7 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
     <div style="color:#00b4d8; font-size:11px; margin-bottom:8px; font-family:'JetBrains Mono',monospace;">🌡️ Peak heat: {peak_heat_str}</div>
     <div style="color:#64748b; font-size:11px; margin-bottom:10px; font-family:'JetBrains Mono',monospace;">{city_list_str}</div>
     <div>
-        <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:6px;">V5.27.1 Qualifying Picks</div>
+        <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:6px;">V5.30.0 Qualifying Picks</div>
         {picks_html}
     </div>
 </div>
@@ -2998,19 +3019,19 @@ if forecast is not None:
     import pandas as pd
     st.markdown('<div class="mph-section-header">📈 YES Signals</div>', unsafe_allow_html=True)
     st.dataframe(pd.DataFrame(yes_rows), use_container_width=True, hide_index=True)
-    st.caption('🚦 = passes all three V5.27.1 gates · 🚫 = blocked by Gate 1 (not model+market consensus)')
+    st.caption('🚦 = passes all three V5.30.0 gates · 🚫 = blocked by Gate 1 (not model+market consensus)')
 
-    # ── V5.27.1 Per-City Gate Status ──
+    # ── V5.30.0 Per-City Gate Status ──
     city_pick = qualifying_picks.get(city)
     if city_pick:
         side_color = '#00ff88' if city_pick['side'] == 'YES' else '#00b4d8'
         st.success(
-            f'✅ V5.27.1 GATE STATUS: PASS — {city_pick["label"]} {city_pick["side"]} @ {city_pick["price"]}c · '
+            f'✅ V5.30.0 GATE STATUS: PASS — {city_pick["label"]} {city_pick["side"]} @ {city_pick["price"]}c · '
             f'+{city_pick["edge"]}c · Kelly ${city_pick["kelly"]} · Trust 🎯 {city_pick["trust_accuracy"]} · {city_pick["gate_reason"]}'
         )
     else:
         rejected_reason = rejected_cities.get(city, 'Did not pass three-gate filter')
-        st.warning(f'⏸️ V5.27.1 GATE STATUS: REJECTED — {rejected_reason}')
+        st.warning(f'⏸️ V5.30.0 GATE STATUS: REJECTED — {rejected_reason}')
 
 
 # ── Per-City Quality Score Panel ──
@@ -3239,4 +3260,4 @@ if bet_log_unlocked:
                                 st.error('Delete failed.')
 
 st.markdown('---')
-st.caption('🌡️ MPH Weather Model V5.27.1 — Three research-validated gates active · Aug 18 consensus-floor + ladder-normalization fixes')
+st.caption('🌡️ MPH Weather Model V5.30.0 — Three research-validated gates active · Aug 18 consensus-floor + ladder-normalization fixes')
