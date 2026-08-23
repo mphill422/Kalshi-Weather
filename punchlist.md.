@@ -1,6 +1,6 @@
 # MPH Weather Model — Punchlist / State of Things
 
-_Last updated: 2026-07-29 (night session). Live model: V5.29.D. Bankroll still paper._
+_Last updated: 2026-08-22 (night session). Live model: V5.30.0. Bankroll still paper._
 
 This is the durable record. My (Claude's) memory carries summarized facts across
 chats but is not guaranteed complete — THIS FILE is the source of truth. Update it
@@ -8,29 +8,182 @@ as things change.
 
 ---
 
+## CURRENT STATE (2026-08-22)
+
+- **Highs model: V5.30.0** live in `streamlit_app.py` + `fetch_weather.py`.
+- **18 cities.** SF and Seattle REMOVED (were 20 as of the Jul 29 entry below).
+- **Active auto tag:** `AUTO_GATED_V2`, ≥60¢ price floor.
+- **Research paper tags:** `V530_PAPER_YES_{EDGE,CONVICTION}_{T75,T80}`.
+  Confirmed writing as of Aug 22 15:35 UTC — the V529D_ → V530_ bump landed,
+  which also confirms the three V5.30.0 math fixes are live.
+- `PRICE_FLOOR_CENTS` stays at 30 in `fetch_weather.py` deliberately, to keep the
+  research corpus collecting sub-60¢ rows. The 60¢ floor is applied at the gate.
+
+### Deployed in V5.30.0 (Aug 20)
+1. **Consensus floor fix** — `obs_high` now clamps via `max()` after offsets
+   instead of being used as the base.
+2. **Ladder normalization** — `apply_prob_floor` divides by the true total, so
+   the ladder sums to 1.0.
+3. **Trimmed-mean bias correction** — replaces `statistics.median()`, which was
+   compressing small persistent drift.
+4. SF/Seattle removed; paper tags bumped.
+
+---
+
+## OPEN CLOCK: residual warm bias re-run (~Sep 4)
+
+Residual warm bias measured **+0.7 to +1.1°F in 17 of 18 cities** AFTER bias
+correction. Trimmed mean (fix #3 above) is the hypothesis for why.
+
+**Re-run the residual query ~2 weeks from Aug 21.** If the bias is unchanged,
+the trimmed mean was not the cause and the remaining explanation is the
+**self-referential loop** — the model feeding its own warm outputs back into its
+own bias correction.
+
+**No model logic changes until that window closes.** Infrastructure fixes are
+fine; model math resets the clock. This is why the SPREAD filter below is parked.
+
+---
+
 ## TOMORROW / NEXT UP
 
-- **Lows model build** — paper only. All 20 cities incl. SF + Seattle.
-  Scaffolding already in repo: `fetch_lows.py`, `cli_min_history.py`,
-  `V5.30_lows_spec.md`, `min_timing_probe.py`, `low_source_probe.py`.
-  - First step: VERIFY `KXLOWT{CITY}` tickers exist for all 20, esp. KSFO/KSEA.
-    If SF/Seattle lows aren't live on Kalshi yet → build 18 + stub the two.
+- **Widen fetch_intraday cron** — ✅ DONE Aug 22. See below.
+- **Scope V5.30 lows model** — see `V5.30_lows_spec.md`. Now unblocked by the
+  cron change, but note: **overnight data starts accumulating Aug 22.** Any
+  analysis of when minima actually occur needs several days first. Scope now,
+  validate assumptions later.
+  - Shape inversion: for lows, the observed minimum is a **CEILING, not a floor**,
+    and it locks in at **sunrise**, not mid-afternoon. Dewpoint is the physical
+    floor constraint. This is not the highs model with a sign flip.
+  - Was scoped for 20 cities incl. SF/Seattle; those are now out of the highs
+    model, so decide whether lows launches at 18 or reintroduces them.
   - Parser change: extract calendar-day MINIMUM from CLI hourly (midnight-midnight,
     ~10 lines). MIKE PASTES the current CLI parser; do NOT reconstruct from memory.
   - New cron (separate job), new bets table / strategy tag for lows.
-  - Paper accumulation. No real money until clean settled data confirms edge.
-  - SF/Seattle = genuine unknowns: no calibrated sigma (start on default),
-    marine-layer overnight dynamics. Watch, don't assume.
+- **SPREAD (max−min across model columns) as a skip filter** — PARKED. This is a
+  model logic change and would reset the residual-bias clock. Build after ~Sep 4.
+  Manual-grid evidence is strong: spread ≤1° → ~88% bracket accuracy;
+  spread >2° → ~25%.
+- **Gate volume audit** — open the audit expander during market hours and count
+  Gate 1 vs Gate 2 rejections. That determines whether loosening consensus to
+  market top-3 is the volume lever. `AUTO_GATED_V2` produced only 1 qualifying
+  pick in ~36 hours; at that rate, 25 settled bets is a very long wait.
+
+---
+
+## INTRADAY COLLECTOR — fixed Aug 20-22
+
+`fetch_intraday.py` now **V2.2**, 18 cities, running 24h.
+
+**What was wrong and what fixed it:**
+- **4 cities → 18.** Now mirrors `fetch_weather.py` CITIES exactly. Coords, tz,
+  and station live in one dict so they cannot drift apart.
+- **Houston coords were wrong.** Collector had 29.9902/-95.3368 = Bush/KIAH.
+  Corrected to 29.6459/-95.2769 = KHOU/Hobby. **All Houston intraday rows before
+  Aug 20 profile the wrong airport — exclude them from Houston analysis.**
+  ~30 miles inland; real thermal difference on sea-breeze days.
+- **Overnight staleness bug.** `forecast_days=1` + `timezone=UTC` returned only
+  today's UTC hours, and `_nearest_hour_index` had no distance limit — outside
+  that range it silently clamped to the array edge and logged stale values as
+  live. Now `past_days=1, forecast_days=2` + `MAX_HOUR_GAP_SECONDS=5400` guard.
+- **`local_date` column added.** City-local calendar date. Diverges from ET
+  overnight — a 5am PT minimum belongs to the Pacific date, not the ET date that
+  already rolled over. **Group lows analysis on `local_date`, not `date`.**
+- **Wethr removed.** Returned HTTP 401 `{"error":"API key missing."}` on every
+  call since inception — `wethr_obs` null on 4,215/4,215 rows. Never worked once.
+  For lows the useful observation is the settled minimum, collected elsewhere.
+  Column remains in the table but is no longer written.
+- **The 18-city timeout problem (the real lesson).** First 18-city run logged
+  11/18, all losses `ReadTimeout`. Spacing + application-level retry → 14/18.
+  Raising the timeout 20s → 45s changed **nothing** — every retry failed too.
+  A request that fails identically at 20s and 45s is not slow, it is not
+  completing. Failures were scattered across cities with no geographic, timezone,
+  or loop-position pattern. **Cause: a fresh TLS connection per city, 18 per run,
+  from a shared Actions runner.** Fix: one pooled `requests.Session` with
+  `HTTPAdapter` + urllib3 `Retry`. Result: **18/18 on every hour since.**
+
+**Cron (Aug 22):** was `*/20 0-2,15-23 * * *` UTC — a **13-hour dead zone at
+hours 3–14 UTC**, which is exactly when lows form in every timezone (ET minima
+~09:00–10:00 UTC, PT ~12:00–13:00 UTC). The collector had **never** captured a
+sunrise minimum. Now `*/20 * * * *`, all 24 hours, ~72 runs/day, ~1,300
+Open-Meteo calls/day (free tier is 10k). Full-day rather than a surgical 07:00–15:00
+window on purpose: when minima actually occur per city is one of the things the
+lows model needs to LEARN, and carving a window now would presuppose the answer.
+Failure notification raised from 1 to 5 consecutive.
+
+---
+
+## RESEARCH CORPUS — SAMPLE SIZE CORRECTION (important, Aug 21)
+
+The four `V529D_PAPER` tags are **not four independent arms.** 707 total rows
+resolve to **234 distinct picks** (date × city × bracket × direction).
+
+- T75/T80 are **nested by construction** — anything clearing an 80 threshold also
+  clears 75. T80 is a filtered SUBSET of T75, not an independent arm.
+- EDGE vs CONVICTION **do genuinely diverge**: 128 picks found by both, 55 EDGE-only,
+  51 CONVICTION-only. ~45% of the corpus is unique to one arm. **Two real
+  strategies — keep both code paths.**
+- **Never pool across tags.** Any win rate or ROI computed on all four counts the
+  same pick 2–4× and silently double-weights the T80 subset inside T75.
+  Analyze **per-tag only**.
+- 234 is picks PLACED, not settled. Settled is lower, and splits per-tag.
+
+Same failure mode was already caught once on the auto path. Now confirmed on the
+research path too.
+
+**Open follow-up:** do EDGE-only and CONVICTION-only picks have different win
+rates? If one arm's unique picks are the losers, that's a gate to tighten.
+Needs per-tag settled counts (`result` column).
+
+---
+
+## ⚠️ UNRESOLVED CONTRADICTION — price floor vs. July findings
+
+The Jul 29 analysis below found **30–44¢ cheap MORNING bets were +38% ROI on the
+allowlist — the second-strongest finding.** The current `AUTO_GATED_V2` gate uses
+a **≥60¢ floor**, which excludes that band entirely, on the basis that sub-60¢
+loses money.
+
+These cannot both be right. Possible resolutions:
+- The 30–44¢ edge was morning-only and time-of-day is not in the current gate.
+- The July cells were 8–42 bets, below the discipline bar, and the +38% did not
+  survive more data.
+- The two analyses used different tag populations (and the pooling error above
+  means at least one of them may have been computed on inflated sample).
+
+**Do not act on either until this is settled per-tag on settled rows.** Flagging
+it here so it stops being rediscovered.
+
+---
+
+## AUTO_GATED_V2 STATUS
+
+Two rows as of Aug 22:
+- id 1588 — DC, Aug 19, 89-90 YES @ 74¢, **settled Won**, actual 90.0.
+  Placed under V5.29.D math.
+- id 1637 — Miami, Aug 21, 92-93 YES @ 72¢, unsettled. First row under V5.30.0.
+
+A delete of 1588 was attempted Aug 20 and did not take (row is still present with
+its original id and a pre-delete settlement timestamp — most likely the statement
+never committed). **Leaving it.** It is a settled winning bet under the same ≥60¢
+gate and is legitimate data; two rows is nowhere near the 25-settled threshold
+anyway. Just note the V5.29.D / V5.30.0 boundary when evaluating.
+
+Both prices ≥60 — the floor is working as deployed.
 
 ---
 
 ## TONIGHT'S DIAGNOSIS (the big result) — 2026-07-29
 
+_Retained from the Jul 29 entry. Still the best account of where the leak is,
+but see the price-floor contradiction flagged above, and note the sample-size
+correction — these findings were computed before the pooling error was known._
+
 Came in for a 10-day intraday cron check, walked out having located the leak.
 
 **Confirmed working / ruled out as the problem:**
-- Intraday collector: HEALTHY. Cadence fixed (7/day → 34-36/day from Jul 25 on).
-  LA afternoon peak no longer clipped (last capture ~23:40 UTC vs old 22:36).
+- Intraday collector: healthy at the time for its 4-city scope. (Superseded —
+  see the V2.2 section above; it had several real bugs that only surfaced at 18.)
 - Forecasts are GOOD. ECMWF shadow (31 days, 18 cities): our model beats ECMWF
   in 16/18 cities, most by >1°F. Most cities sub-1.5°F MAE. → **ECMWF idea is DEAD.
   Stop wondering.** (LA's 9.64 ECMWF MAE = shadow-logger bug, ignore.)
@@ -51,6 +204,7 @@ Came in for a 10-day intraday cron check, walked out having located the leak.
   - 70¢+ favorites: 34-for-34 overall, 30-for-30 on 11-city allowlist. +13-31% ROI.
     STRONGEST, most robust finding. Held every cut.
   - 30-44¢ cheap MORNING: +38% ROI on allowlist. Second-strongest.
+    **⚠️ Contradicted by the current ≥60¢ floor — see above.**
   - **45-69¢ MIDDLE: poison. Loses in every config.** Holds ~all the losses.
   - Cheap AFTER midday: decays to negative (morning-only edge).
 - Price × time interaction is real but thinner-sample; the two extremes are the
@@ -61,6 +215,8 @@ Came in for a 10-day intraday cron check, walked out having located the leak.
 nothing (no data that early). Cells are 8-42 bets, BELOW the 50-bet discipline bar.
 30-for-30 on 70¢+ is suspiciously perfect — could be real edge OR a selection artifact
 (model only reaches 70¢ on near-certain days). NOT confirmed. NOT a green light.
+**And per the Aug 21 correction, the underlying row counts were inflated ~3× by
+tag pooling — re-run these cuts per-tag before trusting any of the cell sizes.**
 
 **Data also includes DROPPED cities** (New Orleans, San Antonio, Dallas, etc.) — the
 cron paper-bets ~all 18, not just the 11 allowlist. Key findings above were re-checked
@@ -85,16 +241,19 @@ and that it survives non-summer weather.
 
 ## RESEARCH QUEUE (post-validation, isolated tests, ONE variable at a time)
 
-- **Basket / cluster trade** — see `basket_trade_spec.md`. Top untested thread,
+- **Basket / cluster trade** — see appendix below. Top untested thread,
   surfaced 5+ times. Targets the 45-69¢ dead zone by covering 2 adjacent brackets.
   Math is a CEILING (combined cost < ~0.90), fees are the gotcha, afternoon-only.
   Paper tag `V529_PAPER_BASKET_YES`.
-- **Price×time gate filter** — formalize "extremes yes, middle no" once more data.
+- **SPREAD skip filter** — parked on the residual clock, see above.
+- **Price×time gate filter** — formalize "extremes yes, middle no" once more data,
+  and once the price-floor contradiction is resolved.
 - **HRRR re-evaluation** — PARKED, not rejected. Removed in an early version; may
-  interact differently with V5.29.D. Test via isolated shadow only, never on
+  interact differently with V5.30.0. Test via isolated shadow only, never on
   outside say-so. (3 guides push it; Mike tested + removed it before.)
 - **Intraday probability-collapse** — use live obs to narrow brackets in real time.
-  The edge the collector exists for. Data pipeline now confirmed healthy.
+  The edge the collector exists for. Pipeline now genuinely healthy at 18 cities
+  with 24h coverage, which it was not before Aug 22.
 - **Early-timing test (9-10am) for stable cities** — measure accuracy-vs-price per
   hour; expect a sweet spot, not "earlier = better." Give it non-summer data.
 
@@ -103,26 +262,41 @@ and that it survives non-summer weather.
 ## DISCARDED (checked, dead)
 
 - ECMWF integration — model beats it 16/18. Dead per its own success criterion.
+- **Wethr surface obs in the intraday collector** — 401 on 100% of calls since
+  inception; removed Aug 22 rather than fixed. Not needed for lows.
 - Early-entry timing (3-5 days out) — 5 sources push it; contradicts validated
   agreement edge. Mike's edge is near-settlement, not early forecasting.
 - App-based weather sources (TWC/AccuWeather) — station-pinning too slow on phone.
 - MOS for manual capture — raw UTC grid too slow/foreign. (Possible future MODEL
   input if scripted; not for hand-use.)
 - Within-market arbitrage, LIP market-making, whale-copy — all debunked earlier.
+- NowCast.trade — evaluated, not renewing. Break-even ROI at observed accuracy,
+  ~$300 order book depth prevents meaningful sizing.
 
 ---
 
 ## MANUAL TRACKING (Mike, ongoing)
 
-- Capturing market + NWS for all 20 cities at 11 / 12 / 2 ET.
-- NWS forecast link sheet (station-locked) is the forecast source. NWS is the
-  chosen single comparison source (redundant for 6 nws_only in-model cities,
-  useful for blend cities).
-- SF + Seattle tracked manually until lows build brings them into the system.
-  Watch the PRICE of winning brackets, not just whether they win — a stable city
+- Daily Capture Grid, ~20 cities, simplified to ONE 12:30 ET pass, four columns:
+  NWS Wethr / NWS grid / wethr leaderboard #1 (log model identity) / observed high
+  so far. The 5 PM pass was dropped in favor of pulling settled temps next morning.
+- Seattle, SF, LA cut from the grid (marine layer / freeze-and-reprice failure).
+  Phoenix, Vegas, Denver kept as forecast-only (obs column blank).
+  Dallas flagged as a possible station-offset city.
+- **Column-spread rule** — strongest manual signal found. Spread ≤1° across model
+  columns → ~88% bracket accuracy; spread >2° → ~25%. Independently corroborated
+  by NowCast's 0–2° high-confidence threshold.
+- **Consensus thesis:** 7-for-8 across two days at 61–71¢ entries.
+- **Disagreement problem:** col 1 beating market bracket runs ~32% (~11/34), well
+  below the 60–70% break-even. Consistent with the general finding that the market
+  is right ~75–80% of the time when the model disagrees.
+- Watch the PRICE of winning brackets, not just whether they win — a stable city
   that "wins every day" at 90¢ has no edge left to capture.
-- Sheets built: settlement-station reference (KMDW etc.), daily capture grid
-  (ET→CT→PT order), NWS links, MOS+AFD links.
+- **Pending one-time task:** backward count through three weeks of sheets, scoring
+  every day the two NWS columns landed within 0.5°.
+- **Pending experiment:** obs-truncation, Philadelphia + Denver at 5 PM ET only,
+  four fields each — testing whether the observed high already eliminates brackets
+  that are still being priced.
 
 ---
 
@@ -136,14 +310,16 @@ and that it survives non-summer weather.
 - Real money only after per-city edge is confirmed on real samples.
 - Edge is concentrated (Boston, maybe Vegas/Phoenix), not broad — size only where
   confirmed, not on win-rate feel.
-
+- **Never pool strategy tags.** Per-tag analysis only. (Aug 21.)
+- **Never reconstruct a file from memory** — always work from the current paste.
+- Real-money config when go-live: $5 flat/bet, YES-only, conviction tier preferred,
+  skip Phoenix (bracket-width problem), max 3–5 bets/day.
 
 ---
 
 # APPENDIX: Basket / Cluster Trade — Full Spec
 
 _(Referenced above in the Research Queue. Full detail here so it lives in one file.)_
-
 
 **Status:** RESEARCH QUEUE — do not build until (a) highs validation window closes,
 and (b) the price×time edge hypothesis has more than ~2 weeks of data behind it.
@@ -230,7 +406,7 @@ If combined price ≥ ~0.95 → fee margin gone, skip.
 New strategy tag: `V529_PAPER_BASKET_YES`
 
 Store as its OWN paper bets so it can be filtered clean, exactly like the
-existing V529D_PAPER tags. Do NOT mix into single-bracket P&L.
+existing paper tags. Do NOT mix into single-bracket P&L.
 
 Suggested per-basket record (in bets table, or a small companion table):
 - date, city
