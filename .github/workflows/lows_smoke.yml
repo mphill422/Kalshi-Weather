@@ -17,3 +17,7 @@ jobs:
         env:
           WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
         run: python fetch_lows.py
+      - name: Run wethr field probe
+        env:
+          WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
+        run: python wethr_probe.py
