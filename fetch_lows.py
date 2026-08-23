@@ -79,7 +79,7 @@ CITIES = {
     'Los Angeles':   {'lat': 33.9416, 'lon': -118.4085},
     'Dallas':        {'lat': 32.8998, 'lon': -97.0403},
     'Austin':        {'lat': 30.1945, 'lon': -97.6699},
-    'Houston':       {'lat': 29.9902, 'lon': -95.3368},
+    'Houston': {'lat': 29.9902, 'lon': -95.3368},
     'Atlanta':       {'lat': 33.6407, 'lon': -84.4277},
     'Miami':         {'lat': 25.7959, 'lon': -80.2870},
     'New York':      {'lat': 40.7812, 'lon': -73.9665},
