@@ -29,3 +29,7 @@ jobs:
         env:
           WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
         run: python lows_timing_probe.py
+      - name: Lows value dispersion
+        env:
+          WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
+        run: python lows_value_probe.py
