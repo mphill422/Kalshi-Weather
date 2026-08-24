@@ -21,3 +21,7 @@ jobs:
         env:
           WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
         run: python wethr_probe.py
+      - name: Validate lows source
+        env:
+          WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
+        run: python lows_source_validate.py
