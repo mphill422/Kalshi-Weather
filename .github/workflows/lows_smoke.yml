@@ -33,3 +33,7 @@ jobs:
         env:
           WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
         run: python lows_value_probe.py
+      - name: Lows ladder pricing
+        env:
+          WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
+        run: python lows_price_probe.py
