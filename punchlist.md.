@@ -1,6 +1,6 @@
 # MPH Weather Model — Punchlist / State of Things
 
-_Last updated: 2026-08-22 (night session). Live model: V5.30.0. Bankroll still paper._
+_Last updated: 2026-08-24 (evening session). Live model: V5.30.0. Bankroll still paper._
 
 This is the durable record. My (Claude's) memory carries summarized facts across
 chats but is not guaranteed complete — THIS FILE is the source of truth. Update it
@@ -8,16 +8,18 @@ as things change.
 
 ---
 
-## CURRENT STATE (2026-08-22)
+## CURRENT STATE (2026-08-24)
 
 - **Highs model: V5.30.0** live in `streamlit_app.py` + `fetch_weather.py`.
-- **18 cities.** SF and Seattle REMOVED (were 20 as of the Jul 29 entry below).
+- **18 cities.** SF and Seattle REMOVED.
 - **Active auto tag:** `AUTO_GATED_V2`, ≥60¢ price floor.
 - **Research paper tags:** `V530_PAPER_YES_{EDGE,CONVICTION}_{T75,T80}`.
-  Confirmed writing as of Aug 22 15:35 UTC — the V529D_ → V530_ bump landed,
-  which also confirms the three V5.30.0 math fixes are live.
 - `PRICE_FLOOR_CENTS` stays at 30 in `fetch_weather.py` deliberately, to keep the
   research corpus collecting sub-60¢ rows. The 60¢ floor is applied at the gate.
+- **No real-money bet placed since May.** Three months of paper. The blocker is
+  not analysis — see the Aug 24 section below. The model currently loses to the
+  market when the two disagree, and the fix is gated behind the residual clock.
+  **Lows are the faster path to a live bet and are NOT under the freeze.**
 
 ### Deployed in V5.30.0 (Aug 20)
 1. **Consensus floor fix** — `obs_high` now clamps via `max()` after offsets
@@ -30,86 +32,360 @@ as things change.
 
 ---
 
-## OPEN CLOCK: residual warm bias re-run (~Sep 4)
+## ⚠️ THE BIG RESULT — 2026-08-24: the model loses to the market
 
-Residual warm bias measured **+0.7 to +1.1°F in 17 of 18 cities** AFTER bias
-correction. Trimmed mean (fix #3 above) is the hypothesis for why.
+Source: `kalshi_snapshots` joined to `settlements`. 15,027 snapshot rows,
+72 days, 20 cities, Jun 13 – Aug 23. This table was sitting unused. It holds the
+market's full 6-bracket ladder at both windows plus `model_top_bracket`, so the
+model's pick can be scored against the market's pick against actual settlement.
 
-**Re-run the residual query ~2 weeks from Aug 21.** If the bias is unchanged,
-the trimmed mean was not the cause and the remaining explanation is the
-**self-referential loop** — the model feeding its own warm outputs back into its
-own bias correction.
+### 1. When model and market disagree, the market wins 762 to 171
+
+On 1,269 disagreements where either side was right:
+
+| outcome | n |
+|---|---|
+| MARKET right | 762 |
+| both wrong | 336 |
+| MODEL right | 171 |
+
+**81.7% of decided disagreements go to the market.** The punchlist's own
+manual-grid note said "market is right ~75-80% when model disagrees" — this is
+worse, on a much larger automated sample. **This is the same monotonic-inverse
+pattern that killed the tennis model.** It is not a small-sample artifact.
+
+### 2. Model AGREEMENT is anti-predictive
+
+Splitting the market's rank-1 bracket by whether the model agreed with it:
+
+| window / band | AGREE hit / PnL¢ | DISAGREE hit / PnL¢ |
+|---|---|---|
+| CONV 45-59 | 36.6% / **−16.12** | 52.0% / −0.20 |
+| CONV 60-69 | 56.3% / **−7.83** | 69.8% / **+5.94** |
+| EDGE 45-59 | 42.5% / −9.76 | 52.6% / +0.70 |
+| EDGE 60-69 | 61.8% / −1.56 | 72.9% / **+9.10** |
+
+In 7 of 8 cells the market's favorite performs WORSE when the model agrees with
+it. At ~64¢ agreement drops the hit rate from 69.8% to 56.3%. **The model's
+endorsement is currently a negative signal.**
+
+**The one exception:** `EDGE / AGREE / 70+` → 86.7% hit at 75.4¢ avg, **+11.30¢**,
+n=30. This is the July "34-for-34 on 70¢+" finding surviving into an independent
+dataset. It is the only agreement cell that pays. n=30 over 72 days is roughly one
+qualifying bet every other day and is below the 50-bet discipline bar.
+
+Label formats were verified to match (`NN-NN` on both sides) before trusting this
+split — this is not a string-matching artifact.
+
+### 3. THE MECHANISM — bracket selection is cold, the forecast is not
+
+Model's chosen bracket floor vs actual, and market's bracket floor vs actual:
+
+| city | model_vs_actual | market_vs_actual | consensus_vs_actual |
+|---|---|---|---|
+| Atlanta | −3.03 | −0.73 | −0.75 |
+| Denver | −2.74 | −0.78 | −0.41 |
+| Washington DC | −2.62 | −0.24 | −0.72 |
+| Phoenix | −2.25 | −0.59 | −0.40 |
+| Austin | −2.22 | −0.51 | −0.45 |
+| Las Vegas | −2.13 | −0.71 | −1.20 |
+| Dallas | +0.04 | −0.42 | +0.24 |
+
+**The consensus forecast is roughly centered** (mixed sign, mostly within ±0.8°F).
+**The market is nearly unbiased** (−0.09 to −0.78, avg ~−0.44, well inside a 2°F
+bracket). **But the model's chosen bracket is 1–3°F cold.**
+
+Atlanta: consensus off by −0.75°F, chosen bracket off by −3.03°F.
+Denver: consensus −0.41, bracket −2.74. DC: −0.72 vs −2.62.
+
+**A ~0.5°F consensus error is being amplified into a 1–3°F bracket error.** The
+leak is in the ladder/probability placement BETWEEN consensus and bracket choice —
+not in the forecast, and not (only) in gate permissiveness as the July analysis
+concluded. Trimmed mean does not address this.
+
+The model is cold in 19 of 20 cities (only Dallas and SF are not). The offset is
+NOT uniform — measured against the market it ranges from −0.16 (New York) to
+−2.36 (Washington DC), so any correction is per-city, not global.
+
+### 4. Market-level price bands (rank-1 bracket, ignoring model)
+
+Actual P&L per contract at real prices, not band midpoints:
+
+| band | n | avg price | CONV PnL¢ | EDGE PnL¢ |
+|---|---|---|---|---|
+| <45 | 255 | ~41¢ | **+7.91** | **+3.32** |
+| 45-59 | 1229 | ~52¢ | **−5.47** | −2.56 |
+| 60-69 | 450 | ~64¢ | +1.13 | **+5.49** |
+| 70+ | 250 | ~76¢ | −3.14 | +0.43 |
+
+The 45-59¢ poison band is **independently confirmed** on 1,229 observations —
+this reproduces the July finding on a completely different dataset. The 60¢ floor
+correctly excludes it.
+
+**CAVEAT — this is the MARKET's top bracket, not the model's pick.** It describes
+market structure. It does NOT say the model would profit in these bands. See the
+price-floor section below.
+
+### 5. Market microstructure: Edge → Conviction drift
+
+The favorite gains price between windows in **all 20 cities** without exception —
+the day resolves. But the useful column is bracket-identity FLIP rate:
+
+- **Las Vegas 8.8% flips**, highest Edge price (66.3¢) — settled early, no
+  waiting premium and no discount.
+- **Los Angeles 35.3% flips, +11.9¢ drift** — the outlier. Favorite identity
+  changes a third of the time and then resolves harder than anywhere (72.2¢ at
+  Conviction). Strongest Conviction city, worst Edge city.
+- **Denver 23.7%, Houston 23.1%, Boston 23.0%, Dallas 22.7%** — churning late.
+  Early entry buys a bracket that changes identity ~1 day in 4.
+- **Atlanta (14.8%) and Washington DC (18.0%)** are the interesting cell: low
+  flip rate, CHEAPEST Edge prices on the board (50.8¢, 49.6¢), near-zero drift.
+  Market prices them as uncertain and they aren't actually moving.
+
+Flip rate measures whether the MARKET changed its mind, not whether it was right.
+
+---
+
+## OPEN CLOCK: residual bias re-run (~Sep 4)
+
+**SIGN CONVENTION — read this before interpreting anything.** The residual query
+in `streamlit_app.py` (`compute_bias_correction_db`, ~line 548) computes:
+
+```python
+errors = [r['actual'] - r['consensus'] for r in recent]
+```
+
+**actual MINUS consensus.** So the recorded "+0.7 to +1.1°F in 17 of 18 cities"
+means **settlement came in WARMER than the model predicted** — i.e. the model
+runs COLD. It does NOT mean the model runs warm. This ambiguity caused a wrong
+call on Aug 24; the phrase "residual warm bias" is retired in favor of the
+explicit statement below.
+
+**The finding:** after bias correction, actual was still landing +0.7 to +1.1°F
+above consensus in 17 of 18 cities (Boston +1.07, Atlanta +1.06, Miami +1.02,
+Houston −0.14). The `_trimmed_mean` docstring (V5.30.0, Aug 19) states the
+consequence directly: *"on a 2F bracket means systematically picking one bracket
+low."* Trimmed mean (fix #3) is the hypothesis for why the median was hiding it.
+
+**Re-run the residual query ~Sep 4.** If unchanged, trimmed mean was not the
+cause and the remaining explanation is the **self-referential loop** — the model
+feeding its own cold outputs back into its own bias correction.
+
+**This clock is legitimate and the diagnosis is correct.** The Aug 24 data agrees
+with it: consensus IS cold. What Aug 24 adds is that the bracket error (1-3°F) is
+much larger than the consensus error (~0.5°F), which trimmed mean does not fix.
 
 **No model logic changes until that window closes.** Infrastructure fixes are
-fine; model math resets the clock. This is why the SPREAD filter below is parked.
+fine; model math resets the clock.
 
 ---
 
 ## TOMORROW / NEXT UP
 
-- **Widen fetch_intraday cron** — ✅ DONE Aug 22. See below.
-- **Scope V5.30 lows model** — see `V5.30_lows_spec.md`. Now unblocked by the
-  cron change, but note: **overnight data starts accumulating Aug 22.** Any
-  analysis of when minima actually occur needs several days first. Scope now,
-  validate assumptions later.
-  - Shape inversion: for lows, the observed minimum is a **CEILING, not a floor**,
-    and it locks in at **sunrise**, not mid-afternoon. Dewpoint is the physical
-    floor constraint. This is not the highs model with a sign flip.
-  - Was scoped for 20 cities incl. SF/Seattle; those are now out of the highs
-    model, so decide whether lows launches at 18 or reintroduces them.
-  - Parser change: extract calendar-day MINIMUM from CLI hourly (midnight-midnight,
-    ~10 lines). MIKE PASTES the current CLI parser; do NOT reconstruct from memory.
-  - New cron (separate job), new bets table / strategy tag for lows.
-- **SPREAD (max−min across model columns) as a skip filter** — PARKED. This is a
-  model logic change and would reset the residual-bias clock. Build after ~Sep 4.
-  Manual-grid evidence is strong: spread ≤1° → ~88% bracket accuracy;
-  spread >2° → ~25%.
-- **Gate volume audit** — open the audit expander during market hours and count
-  Gate 1 vs Gate 2 rejections. That determines whether loosening consensus to
-  market top-3 is the volume lever. `AUTO_GATED_V2` produced only 1 qualifying
-  pick in ~36 hours; at that rate, 25 settled bets is a very long wait.
+- **Lows model** — the unblocked path to a live bet. See the LOWS section below;
+  the data-source question is fully resolved as of Aug 23-24.
+- **Re-run `lows_price_probe.py` at 06:00-07:30 local.** The Aug 23 run fired at
+  10pm ET against SETTLED markets — every reading was garbage (top=100¢, top-two
+  sums over $1.00, which is arbitrage-impossible). Needs a live-market run.
+- **Rewrite `V5.30_lows_spec.md`** — §1, §2, §3, §5 are all materially wrong now.
+- **Gate volume audit** — open the audit expander DURING MARKET HOURS and count
+  Gate 1 vs Gate 2 rejections. Determines whether loosening consensus to market
+  top-3 is the volume lever. Has slipped repeatedly because it requires being at
+  the Mac during ET/CT windows (14:00-16:30 UTC). **If evening-only Mac time is
+  the norm, this measurement will never happen as designed** — the alternative is
+  persisting rejections to Supabase, which is model-path code and waits for Sep 4.
+  There is no audit/rejection table today; the expander renders live and is lost.
+- **Bracket-placement investigation (post-Sep 4)** — the Aug 24 finding that a
+  0.5°F consensus error becomes a 1-3°F bracket error. This is now the single
+  highest-value open question on the highs side.
+- **SPREAD (max−min across model columns) as a skip filter** — PARKED on the
+  residual clock. Manual-grid evidence is strong: spread ≤1° → ~88% bracket
+  accuracy; spread >2° → ~25%.
+
+---
+
+## LOWS MODEL (V5.30) — data source RESOLVED 2026-08-23/24
+
+**`V5.30_lows_spec.md` is now substantially WRONG and needs a rewrite.** What
+changed:
+
+### wethr relays Iowa CLI EXACTLY — 179/179, MAE 0.00°F
+
+`https://wethr.net/api/v2/daily_extremes_api.php?station=KATL&days=31&logic=nws`
+
+Documented `/api/v2/` namespace, Bearer auth via `WETHR_HEADERS`. Returns a dated
+series: `date, high, low, high_time_utc, low_time_utc, high_source, low_source,
+dsm_rejected_high, dsm_rejected_low, is_final`. Every row carries
+`low_source: "cli"`.
+
+`lows_source_validate.py` compared it against Iowa State `cli.py` across 18
+cities × 10 days: **179/179 exact matches, MAE 0.00°F.**
+
+**Consequences:**
+- **§2's obs-history reconstruction is UNNECESSARY — delete it.** No chunked
+  ≤24h pulls, no local-day regrouping, no "Range too large" handling, no 0.32°F
+  accuracy assumption to validate.
+- One call per station returns a month of settled extremes.
+- **KEEP the Iowa CLI parser as an independent cross-check.** It is what proved
+  this. A single source with no cross-check is exactly how the Wethr outage went
+  unnoticed for six weeks.
+
+### Other endpoint findings (from `wethr_probe.py`)
+
+- `nws_forecasts.php` DOES carry a `low` key, and it IS the calendar-day minimum
+  (equals `min(hourly_temps)` for every probe city). **Q2 in the spec is CLOSED.**
+- `observations.php mode='wethr_low'` **DOES NOT EXIST.** Server enumerates its
+  modes: `latest`, `wethr_high`, or omitted for history. The spec's symmetry
+  guess was wrong.
+- `observations.php` raw `temperature` is **INTEGER CELSIUS** (Miami 28 vs
+  `temperature_display` 82.4). Any reconstruction must use **`temperature_f`**.
+  §2 says to use raw `temperature` — that would silently yield Celsius at ~0.9°F
+  granularity, destroying most of the accuracy the spec counts on.
+- All precomputed extremes fields on `observations.php` (`cli_high/low`,
+  `dsm_high/low`, `six_hour_*`, `twentyfour_hour_*`) return **None**.
+- `marketv2.php?action=fetch_asos_data_dev` also exists and takes a local `date`
+  + `timezone`, but it is an internal `_dev` path NOT under `/api/v2/`. **Do not
+  build on it.**
+
+### ⚠️ THE SPEC'S CENTRAL PREMISE IS FALSE — timing cannot anchor the model
+
+`lows_timing_probe.py`, 31 days × 18 cities of `low_time_utc` converted to local:
+
+- **Only 3/18 cities have tight timing** (spread ≤3h): Dallas (1.7h), Houston
+  (2.4h), New Orleans (2.7h).
+- **9/18 have p10-p90 spreads over 6h.** Phoenix is **23.0h** — its minimum has
+  landed at essentially every hour of the day.
+- **8/18 put the minimum OUTSIDE the 03:00-09:00 dawn window on ≥20% of days.**
+  Miami does it **48%** of the time.
+- Median timing IS stable everywhere (05:36 to 07:30 across all 18). The
+  distribution has a tight center and **fat tails**.
+
+So "the observed minimum is a CEILING that locks at sunrise" — the premise the
+whole certainty-curve play rests on — **is false for most cities.** There is no
+reliable locked moment. A timing-gated lows model would be wrong about half the
+time in the worst cases.
+
+Confirmed independently in the intraday collector: on Aug 23 Miami's `temp_2m`
+bottomed near 19:00 local at 74.7°F, ~5°F below anything the night produced,
+after an afternoon convective collapse. Miami was the ONLY city of 18 where the
+evening minimum undercut the overnight minimum that day — but the 31-day timing
+data says it happens there 48% of the time. Not a one-off storm.
+
+### THE AXIS THAT WORKS: value dispersion, not timing
+
+`lows_value_probe.py`, same 31 days, against the 2°F Kalshi bracket width:
+
+| city | stdev | d/d abs delta | ≤2F next day | brackets spanned |
+|---|---|---|---|---|
+| Los Angeles | 1.06 | 0.67 | **100%** | 1.5 |
+| San Antonio | 1.29 | 1.07 | 93% | 2.5 |
+| Houston | 1.46 | 1.47 | 80% | 4.0 |
+| New Orleans | 1.62 | 1.30 | 93% | 3.0 |
+| Atlanta | 2.09 | 2.03 | 63% | 4.5 |
+| Dallas | 2.35 | 1.73 | 77% | 6.0 |
+| Miami | 2.66 | 2.53 | 57% | 5.5 |
+| Denver | 5.51 | 4.30 | 23% | 13.5 |
+| Las Vegas | 5.90 | 2.00 | 70% | 11.5 |
+
+**Timing spread and diurnal range are INVERSELY related** — tight-timing cities
+have big ranges (Dallas 20.9°F, OKC 27.4°F, Denver 31.2°F), loose-timing cities
+are compressed (LA 11.1°F, Miami 14.1°F, Boston 14.1°F). Physically sensible: a
+large diurnal swing has a sharp bottom; a compressed one is flat and any hour can
+win by a tenth of a degree.
+
+**Los Angeles proves the point.** Timing spread 6.8h, late-min 29% of days — the
+timing premise would have EXCLUDED it. Its value stdev is 1.06°F with 100%
+day-over-day persistence. It is the most predictable city on the board.
+
+**→ The lows model should gate on VALUE, not on the clock.** No certainty curve,
+no observed-min tracker, no cron window tuned to sunrise.
+
+**BUT — predictable ≠ profitable.** A city whose low sits in 1.5 brackets all
+month will have that bracket priced at 90¢+, which is the same trap already found
+on the highs side. The interesting band is the MIDDLE (Atlanta 2.09, Dallas 2.35,
+Austin 2.46, Miami 2.66): dispersed enough that the market cannot just price
+persistence, tight enough that a forecast might beat it. **This is unresolved —
+the price probe has not yet run against live markets.**
+
+### Other lows facts confirmed
+
+- **All 20 low tickers resolve on Kalshi**, including the previously-unverified
+  `KXLOWTSFO` and `KXLOWTSEA` guesses. V1 verification CLOSED.
+- `fetch_lows.py` Houston coords were **Bush/KIAH** (29.9902/−95.3368) — same
+  wrong-airport bug as the intraday collector. Corrected to KHOU Hobby
+  (29.6459/−95.2769) on Aug 23.
+- **CAVEAT ON ALL LOWS NUMBERS ABOVE:** the window is ~Jul 24 – Aug 23, peak
+  summer. Both the fat timing tails and the value dispersion are seasonal.
+  Re-run in October and January before trusting any per-city tiering.
+
+### Lows probe scripts now in repo (all read-only, freeze-safe)
+
+`lows_source_validate.py`, `lows_timing_probe.py`, `lows_value_probe.py`,
+`lows_price_probe.py` — all wired into `.github/workflows/lows_smoke.yml`
+alongside `fetch_lows.py` and `wethr_probe.py`.
 
 ---
 
 ## INTRADAY COLLECTOR — fixed Aug 20-22
 
-`fetch_intraday.py` now **V2.2**, 18 cities, running 24h.
+`fetch_intraday.py` now **V2.2**, 18 cities, running 24h. Verified 18/18 on every
+hour bucket across a full 25-hour window on Aug 23.
 
-**What was wrong and what fixed it:**
-- **4 cities → 18.** Now mirrors `fetch_weather.py` CITIES exactly. Coords, tz,
-  and station live in one dict so they cannot drift apart.
-- **Houston coords were wrong.** Collector had 29.9902/-95.3368 = Bush/KIAH.
-  Corrected to 29.6459/-95.2769 = KHOU/Hobby. **All Houston intraday rows before
-  Aug 20 profile the wrong airport — exclude them from Houston analysis.**
-  ~30 miles inland; real thermal difference on sea-breeze days.
+- **4 cities → 18.** Mirrors `fetch_weather.py` CITIES exactly. Coords, tz, and
+  station live in one dict so they cannot drift apart.
+- **Houston coords were wrong.** Collector had 29.9902/−95.3368 = Bush/KIAH.
+  Corrected to KHOU/Hobby. **All Houston intraday rows before Aug 20 profile the
+  wrong airport — exclude them from Houston analysis.**
 - **Overnight staleness bug.** `forecast_days=1` + `timezone=UTC` returned only
   today's UTC hours, and `_nearest_hour_index` had no distance limit — outside
   that range it silently clamped to the array edge and logged stale values as
   live. Now `past_days=1, forecast_days=2` + `MAX_HOUR_GAP_SECONDS=5400` guard.
-- **`local_date` column added.** City-local calendar date. Diverges from ET
-  overnight — a 5am PT minimum belongs to the Pacific date, not the ET date that
-  already rolled over. **Group lows analysis on `local_date`, not `date`.**
-- **Wethr removed.** Returned HTTP 401 `{"error":"API key missing."}` on every
-  call since inception — `wethr_obs` null on 4,215/4,215 rows. Never worked once.
-  For lows the useful observation is the settled minimum, collected elsewhere.
-  Column remains in the table but is no longer written.
-- **The 18-city timeout problem (the real lesson).** First 18-city run logged
-  11/18, all losses `ReadTimeout`. Spacing + application-level retry → 14/18.
-  Raising the timeout 20s → 45s changed **nothing** — every retry failed too.
-  A request that fails identically at 20s and 45s is not slow, it is not
-  completing. Failures were scattered across cities with no geographic, timezone,
-  or loop-position pattern. **Cause: a fresh TLS connection per city, 18 per run,
+- **`local_date` column added.** **Group lows analysis on `local_date`, not
+  `date`.**
+- **Wethr removed** — 401 on 100% of calls, `wethr_obs` null on 4,215/4,215 rows.
+  **NOTE: the 401 was OUR bug, not a dead key.** The intraday script passed the
+  key as an `api_key` query param with generic headers; the working highs code
+  authenticates via `WETHR_HEADERS` (`Authorization: Bearer`). Wethr is alive and
+  is now the confirmed lows settlement source. Removal from the intraday
+  collector still stands — `temp_2m` is what that table is for.
+- **The 18-city timeout problem (the real lesson).** 11/18 → spacing + retry →
+  14/18. Raising the timeout 20s → 45s changed **nothing**; every retry failed
+  too. A request that fails identically at 20s and 45s is not slow, it is not
+  completing. Failures were scattered with no geographic, timezone, or
+  loop-position pattern. **Cause: a fresh TLS connection per city, 18 per run,
   from a shared Actions runner.** Fix: one pooled `requests.Session` with
-  `HTTPAdapter` + urllib3 `Retry`. Result: **18/18 on every hour since.**
+  `HTTPAdapter` + urllib3 `Retry`. Result: **18/18 every hour since.**
 
 **Cron (Aug 22):** was `*/20 0-2,15-23 * * *` UTC — a **13-hour dead zone at
-hours 3–14 UTC**, which is exactly when lows form in every timezone (ET minima
-~09:00–10:00 UTC, PT ~12:00–13:00 UTC). The collector had **never** captured a
-sunrise minimum. Now `*/20 * * * *`, all 24 hours, ~72 runs/day, ~1,300
-Open-Meteo calls/day (free tier is 10k). Full-day rather than a surgical 07:00–15:00
-window on purpose: when minima actually occur per city is one of the things the
-lows model needs to LEARN, and carving a window now would presuppose the answer.
-Failure notification raised from 1 to 5 consecutive.
+hours 3-14 UTC**, exactly when lows form in every timezone. The collector had
+**never** captured a sunrise minimum. Now `*/20 * * * *`, all 24 hours, ~72
+runs/day, ~1,300 Open-Meteo calls/day (free tier 10k). Failure notification
+raised from 1 to 5 consecutive.
+
+---
+
+## `kalshi_snapshots` — the underused table (found Aug 24)
+
+15,027 rows, 72 days, 20 cities, Jun 13 – Aug 23. Columns: `snapshot_time, date,
+city, bracket_label, yes_price_cents, no_price_cents, bracket_rank, sigma_p,
+window_tz, window_label, utc_hour, model_top_bracket`.
+
+**What it is:** exactly TWO snapshots per city-day — one EDGE, one CONVICTION,
+1-2h apart depending on tz (ET 14/15 UTC, CT 14/16, PT 15/18, MT 16/18).
+`bracket_rank` is the MARKET's price ranking (rank 1 avg 57.4¢ declining
+monotonically to 1.5¢ at rank 6). Exactly 2,493 rows at each of ranks 1-6.
+
+**What it can answer:** Edge→Conviction drift, bracket flip rates, model-vs-market
+agreement, per-city bias, price-band P&L. All read-only, all freeze-safe.
+
+**What it CANNOT answer:** intraday price evolution. There is no morning reading,
+no late-afternoon reading, nothing near settlement. **The afternoon
+near-certainty strategy ($0.85+ near-locked plays) happens AFTER the last capture
+and cannot be evaluated from this table** — it needs new collection at later hours.
+
+**Data hygiene:** ranks 7-12 are contamination (~40 rows vs 2,493, and rank 7
+averages 13.5¢ against rank 6's 1.5¢ — structurally impossible in a price-sorted
+ladder). Exclude `bracket_rank > 6` from all analysis.
 
 ---
 
@@ -118,41 +394,38 @@ Failure notification raised from 1 to 5 consecutive.
 The four `V529D_PAPER` tags are **not four independent arms.** 707 total rows
 resolve to **234 distinct picks** (date × city × bracket × direction).
 
-- T75/T80 are **nested by construction** — anything clearing an 80 threshold also
-  clears 75. T80 is a filtered SUBSET of T75, not an independent arm.
-- EDGE vs CONVICTION **do genuinely diverge**: 128 picks found by both, 55 EDGE-only,
-  51 CONVICTION-only. ~45% of the corpus is unique to one arm. **Two real
-  strategies — keep both code paths.**
-- **Never pool across tags.** Any win rate or ROI computed on all four counts the
-  same pick 2–4× and silently double-weights the T80 subset inside T75.
-  Analyze **per-tag only**.
-- 234 is picks PLACED, not settled. Settled is lower, and splits per-tag.
-
-Same failure mode was already caught once on the auto path. Now confirmed on the
-research path too.
+- T75/T80 are **nested by construction** — anything clearing 80 also clears 75.
+  T80 is a filtered SUBSET of T75, not an independent arm.
+- EDGE vs CONVICTION **do genuinely diverge**: 128 found by both, 55 EDGE-only,
+  51 CONVICTION-only. ~45% unique to one arm. **Two real strategies — keep both.**
+- **Never pool across tags.** Pooling counts the same pick 2-4× and silently
+  double-weights T80 inside T75. Analyze **per-tag only**.
+- 234 is picks PLACED, not settled.
 
 **Open follow-up:** do EDGE-only and CONVICTION-only picks have different win
 rates? If one arm's unique picks are the losers, that's a gate to tighten.
-Needs per-tag settled counts (`result` column).
 
 ---
 
-## ⚠️ UNRESOLVED CONTRADICTION — price floor vs. July findings
+## PRICE FLOOR — status after Aug 24
 
-The Jul 29 analysis below found **30–44¢ cheap MORNING bets were +38% ROI on the
-allowlist — the second-strongest finding.** The current `AUTO_GATED_V2` gate uses
-a **≥60¢ floor**, which excludes that band entirely, on the basis that sub-60¢
-loses money.
+The July analysis found 30-44¢ cheap MORNING bets at +38% ROI, contradicting the
+current ≥60¢ floor. Aug 24 adds market-level evidence that the **<45¢ band is
+genuinely profitable** (+7.91¢/contract at Conviction, +3.32¢ at Edge, n=255) and
+that the **45-59¢ band genuinely loses** (−5.47¢, n=1,229).
 
-These cannot both be right. Possible resolutions:
-- The 30–44¢ edge was morning-only and time-of-day is not in the current gate.
-- The July cells were 8–42 bets, below the discipline bar, and the +38% did not
-  survive more data.
-- The two analyses used different tag populations (and the pooling error above
-  means at least one of them may have been computed on inflated sample).
+**This still does not justify changing the floor**, for three reasons:
 
-**Do not act on either until this is settled per-tag on settled rows.** Flagging
-it here so it stops being rediscovered.
+1. **Different population.** Every Aug 24 row is the MARKET's top bracket. The
+   model picks its own bracket, and the BIG RESULT section shows those diverge
+   badly. The July corpus said sub-60¢ MODEL bets lost across 189 events. Both
+   can be true.
+2. **Changing the floor is model logic** and resets the residual clock.
+3. Until both are computed on the same population, changing the floor means
+   picking whichever number was seen most recently.
+
+**The resolution path:** per-tag settled P&L on the model's own picks by price
+band. Not the market's rank-1 bracket.
 
 ---
 
@@ -161,142 +434,128 @@ it here so it stops being rediscovered.
 Two rows as of Aug 22:
 - id 1588 — DC, Aug 19, 89-90 YES @ 74¢, **settled Won**, actual 90.0.
   Placed under V5.29.D math.
-- id 1637 — Miami, Aug 21, 92-93 YES @ 72¢, unsettled. First row under V5.30.0.
+- id 1637 — Miami, Aug 21, 92-93 YES @ 72¢. First row under V5.30.0.
 
-A delete of 1588 was attempted Aug 20 and did not take (row is still present with
-its original id and a pre-delete settlement timestamp — most likely the statement
-never committed). **Leaving it.** It is a settled winning bet under the same ≥60¢
-gate and is legitimate data; two rows is nowhere near the 25-settled threshold
-anyway. Just note the V5.29.D / V5.30.0 boundary when evaluating.
+A delete of 1588 was attempted Aug 20 and did not take. **Leaving it** — it is a
+settled winning bet under the same ≥60¢ gate and is legitimate data. Note the
+V5.29.D / V5.30.0 boundary when evaluating.
 
 Both prices ≥60 — the floor is working as deployed.
 
+**Volume problem:** 2 qualifying picks in ~5 days. At that rate 25 settled bets is
+a two-month wait, too slow to validate anything. This is what the gate volume
+audit is meant to diagnose.
+
 ---
 
-## TONIGHT'S DIAGNOSIS (the big result) — 2026-07-29
+## HOUSEKEEPING — Aug 24
 
-_Retained from the Jul 29 entry. Still the best account of where the leak is,
-but see the price-floor contradiction flagged above, and note the sample-size
-correction — these findings were computed before the pooling error was known._
+- **Health Monitor** was failing nightly ~01:41 with "settlement lag (Iowa CLI):
+  2 settlement rows older than 2d still have null actual." **The monitor was
+  right.** Cause: SF and Seattle rows for 2026-08-20 were logged in the morning
+  and then those cities were removed by V5.30.0 before the evening settlement
+  pass ran — stranded, unsettleable, tripping the 2-day check forever. Writes for
+  those cities stop at Aug 20, confirming no live code path still references
+  them. **Rows deleted Aug 24; alert should stop.**
+- `paper_bets` table: 8 rows from two days in April, 4 settled. Abandoned early
+  experiment, does NOT affect the 234-pick corpus. Ignore it.
+- No `audit_log` / `rejections` / `gate_log` table exists. Gate rejections are
+  rendered live in Streamlit and lost.
+- `settlements` has `obs_high` anomalies worth a later look: Phoenix −1.42°F and
+  Seattle −3.20°F vs actual. `obs_high` should track actual closely.
 
-Came in for a 10-day intraday cron check, walked out having located the leak.
+---
+
+## JULY DIAGNOSIS — 2026-07-29
+
+_Retained. Superseded in part by the Aug 24 findings above — specifically, "the
+leak is gate SELECTIVITY" is now too coarse; the leak is in bracket placement.
+Note also the sample-size correction: these were computed before the tag-pooling
+error was known._
 
 **Confirmed working / ruled out as the problem:**
-- Intraday collector: healthy at the time for its 4-city scope. (Superseded —
-  see the V2.2 section above; it had several real bugs that only surfaced at 18.)
-- Forecasts are GOOD. ECMWF shadow (31 days, 18 cities): our model beats ECMWF
-  in 16/18 cities, most by >1°F. Most cities sub-1.5°F MAE. → **ECMWF idea is DEAD.
-  Stop wondering.** (LA's 9.64 ECMWF MAE = shadow-logger bug, ignore.)
+- Forecasts are GOOD. ECMWF shadow (31 days, 18 cities): model beats ECMWF in
+  16/18 cities, most by >1°F. Most cities sub-1.5°F MAE. → **ECMWF idea is DEAD.**
+  (LA's 9.64 ECMWF MAE = shadow-logger bug, ignore.) **Aug 24 corroborates: the
+  consensus forecast is well-centered. The problem is downstream of it.**
 - Chicago station: CONFIRMED CORRECT (KMDW/Midway across CITIES, WETHR_STATIONS,
-  CLI_STATIONS, lat 41.7868/-87.7522). April fix intact through V5.29.D.
-  Chicago's losses are REAL, not a station artifact.
-- Prediction logging: COMPLETE. 32 days × 18 cities, zero gaps. Forgotten manual
-  days did NOT hole the automated data. The "Collect All 18" button is redundant
-  (cron already logs).
+  CLI_STATIONS, lat 41.7868/−87.7522). Chicago's losses are REAL, not a station
+  artifact.
+- Prediction logging: COMPLETE. 32 days × 18 cities, zero gaps.
 
-**THE LEAK — located at the betting layer, not forecasting:**
+**THE LEAK — at the betting layer, not forecasting:**
 - Gates bet LOSING cities most, WINNING cities least (inverted selection).
-  Boston: 16 bets, 100%, +91% ROI (starved). New Orleans: 42 bets, −62% (force-fed).
-- All four gate sub-strategies lose (CONVICTION/EDGE × T75/T80), clustered
-  ~48-51% win at ~52¢ avg price. Looser thresholds (more bets) lose MORE.
-  → gates are TOO PERMISSIVE.
-- **Price bucket finding (the sharp one):** edge is at the EXTREMES, loss is the MIDDLE.
-  - 70¢+ favorites: 34-for-34 overall, 30-for-30 on 11-city allowlist. +13-31% ROI.
-    STRONGEST, most robust finding. Held every cut.
-  - 30-44¢ cheap MORNING: +38% ROI on allowlist. Second-strongest.
-    **⚠️ Contradicted by the current ≥60¢ floor — see above.**
-  - **45-69¢ MIDDLE: poison. Loses in every config.** Holds ~all the losses.
+  Boston: 16 bets, 100%, +91% ROI (starved). New Orleans: 42 bets, −62%.
+- All four gate sub-strategies lose, clustered ~48-51% win at ~52¢ avg price.
+  Looser thresholds lose MORE. → gates TOO PERMISSIVE.
+- **Price bucket finding:** edge at the EXTREMES, loss in the MIDDLE.
+  - 70¢+ favorites: 34-for-34 overall, 30-for-30 on 11-city allowlist, +13-31%
+    ROI. **Aug 24 partially corroborates — `EDGE/AGREE/70+` pays +11.30¢ at 86.7%,
+    but `CONV/AGREE/70+` LOSES (−2.09¢ at 75.4%). The edge is Edge-window only.**
+  - 30-44¢ cheap MORNING: +38% ROI. **Aug 24 corroborates at market level.**
+  - **45-69¢ MIDDLE: poison.** **Aug 24 confirms on 1,229 independent obs.**
   - Cheap AFTER midday: decays to negative (morning-only edge).
-- Price × time interaction is real but thinner-sample; the two extremes are the
-  trustworthy parts.
 
-**CRITICAL CAVEAT on all of the above:** V529D_PAPER data starts **Jul 14** — only
-~2 weeks, all summer (stable/easy weather). The `date >= 2026-05-22` filter was doing
-nothing (no data that early). Cells are 8-42 bets, BELOW the 50-bet discipline bar.
-30-for-30 on 70¢+ is suspiciously perfect — could be real edge OR a selection artifact
-(model only reaches 70¢ on near-certain days). NOT confirmed. NOT a green light.
-**And per the Aug 21 correction, the underlying row counts were inflated ~3× by
-tag pooling — re-run these cuts per-tag before trusting any of the cell sizes.**
-
-**Data also includes DROPPED cities** (New Orleans, San Antonio, Dallas, etc.) — the
-cron paper-bets ~all 18, not just the 11 allowlist. Key findings above were re-checked
-on the 11 active cities and HELD.
-
----
-
-## LIKELY FIX (post-validation — do NOT act yet)
-
-The leak is gate SELECTIVITY, not forecasting, not stations, not city choice,
-not prediction-mode (nws_only vs full_blend). The lever is:
-- **Skip the 45-69¢ middle** (coin-flip prices where model has no edge).
-- **Favor 70¢+ favorites** and morning cheap longshots.
-- Possibly a price×time filter, but the interaction cells need more data.
-- Prediction-mode swaps are probably the WRONG lever for poor cities — forecasts
-  are already good; the leak is downstream at bet selection.
-
-Before trusting the 70¢+ edge: confirm it's not a "only bets sure things" artifact,
-and that it survives non-summer weather.
+**CRITICAL CAVEAT:** V529D_PAPER data starts Jul 14 — ~2 weeks, all summer. Cells
+are 8-42 bets, BELOW the 50-bet bar. 30-for-30 on 70¢+ is suspiciously perfect —
+could be real edge OR a selection artifact. **And row counts were inflated ~3× by
+tag pooling — re-run per-tag before trusting any cell size.**
 
 ---
 
 ## RESEARCH QUEUE (post-validation, isolated tests, ONE variable at a time)
 
-- **Basket / cluster trade** — see appendix below. Top untested thread,
-  surfaced 5+ times. Targets the 45-69¢ dead zone by covering 2 adjacent brackets.
-  Math is a CEILING (combined cost < ~0.90), fees are the gotcha, afternoon-only.
-  Paper tag `V529_PAPER_BASKET_YES`.
-- **SPREAD skip filter** — parked on the residual clock, see above.
-- **Price×time gate filter** — formalize "extremes yes, middle no" once more data,
-  and once the price-floor contradiction is resolved.
-- **HRRR re-evaluation** — PARKED, not rejected. Removed in an early version; may
-  interact differently with V5.30.0. Test via isolated shadow only, never on
-  outside say-so. (3 guides push it; Mike tested + removed it before.)
-- **Intraday probability-collapse** — use live obs to narrow brackets in real time.
-  The edge the collector exists for. Pipeline now genuinely healthy at 18 cities
-  with 24h coverage, which it was not before Aug 22.
-- **Early-timing test (9-10am) for stable cities** — measure accuracy-vs-price per
-  hour; expect a sweet spot, not "earlier = better." Give it non-summer data.
+- **Bracket-placement investigation** — NEW, Aug 24, now the top highs-side
+  question. Why does a 0.5°F consensus error become a 1-3°F bracket error?
+- **Basket / cluster trade** — see appendix. Targets the 45-69¢ dead zone by
+  covering 2 adjacent brackets. Math is a CEILING (combined cost < ~0.90), fees
+  are the gotcha, afternoon-only. Paper tag `V529_PAPER_BASKET_YES`.
+- **SPREAD skip filter** — parked on the residual clock.
+- **Price×time gate filter** — formalize "extremes yes, middle no" once the price
+  floor is resolved on the model's own picks.
+- **HRRR re-evaluation** — PARKED, not rejected. Isolated shadow only.
+- **Intraday probability-collapse** — use live obs to narrow brackets in real
+  time. Pipeline now genuinely healthy at 18 cities with 24h coverage.
+- **Later-window snapshot collection** — `kalshi_snapshots` stops at the
+  Conviction window, so the afternoon near-certainty play is unmeasurable. Adding
+  a late capture is infrastructure, not model logic.
 
 ---
 
 ## DISCARDED (checked, dead)
 
 - ECMWF integration — model beats it 16/18. Dead per its own success criterion.
-- **Wethr surface obs in the intraday collector** — 401 on 100% of calls since
-  inception; removed Aug 22 rather than fixed. Not needed for lows.
-- Early-entry timing (3-5 days out) — 5 sources push it; contradicts validated
-  agreement edge. Mike's edge is near-settlement, not early forecasting.
+- **§2 lows obs-history reconstruction** — unnecessary; `daily_extremes_api.php`
+  relays CLI exactly (179/179).
+- **`observations.php mode='wethr_low'`** — does not exist. Server-confirmed.
+- **Timing-gated lows model** — premise false in 15/18 cities. Gate on value.
+- **Wethr surface obs in the intraday collector** — removed Aug 22. (The 401 was
+  our auth bug, but the removal stands on its own merits.)
+- Early-entry timing (3-5 days out) — contradicts the agreement edge.
 - App-based weather sources (TWC/AccuWeather) — station-pinning too slow on phone.
-- MOS for manual capture — raw UTC grid too slow/foreign. (Possible future MODEL
-  input if scripted; not for hand-use.)
-- Within-market arbitrage, LIP market-making, whale-copy — all debunked earlier.
-- NowCast.trade — evaluated, not renewing. Break-even ROI at observed accuracy,
-  ~$300 order book depth prevents meaningful sizing.
+- MOS for manual capture — raw UTC grid too slow/foreign.
+- Within-market arbitrage, LIP market-making, whale-copy — debunked earlier.
+- NowCast.trade — break-even ROI, ~$300 book depth prevents meaningful sizing.
 
 ---
 
-## MANUAL TRACKING (Mike, ongoing)
+## MANUAL TRACKING (Mike, ongoing — kept SEPARATE from automated work)
 
-- Daily Capture Grid, ~20 cities, simplified to ONE 12:30 ET pass, four columns:
-  NWS Wethr / NWS grid / wethr leaderboard #1 (log model identity) / observed high
-  so far. The 5 PM pass was dropped in favor of pulling settled temps next morning.
-- Seattle, SF, LA cut from the grid (marine layer / freeze-and-reprice failure).
-  Phoenix, Vegas, Denver kept as forecast-only (obs column blank).
+- Daily Capture Grid, ~20 cities, ONE 12:30 ET pass, four columns: NWS Wethr /
+  NWS grid / wethr leaderboard #1 (log model identity) / observed high so far.
+- Seattle, SF, LA cut from the grid. Phoenix, Vegas, Denver forecast-only.
   Dallas flagged as a possible station-offset city.
-- **Column-spread rule** — strongest manual signal found. Spread ≤1° across model
-  columns → ~88% bracket accuracy; spread >2° → ~25%. Independently corroborated
-  by NowCast's 0–2° high-confidence threshold.
-- **Consensus thesis:** 7-for-8 across two days at 61–71¢ entries.
-- **Disagreement problem:** col 1 beating market bracket runs ~32% (~11/34), well
-  below the 60–70% break-even. Consistent with the general finding that the market
-  is right ~75–80% of the time when the model disagrees.
-- Watch the PRICE of winning brackets, not just whether they win — a stable city
-  that "wins every day" at 90¢ has no edge left to capture.
+- **Column-spread rule** — strongest manual signal. Spread ≤1° → ~88% bracket
+  accuracy; spread >2° → ~25%. Corroborated by NowCast's 0-2° threshold.
+- **Consensus thesis:** 7-for-8 across two days at 61-71¢ entries.
+- **Disagreement problem:** col 1 beating market bracket runs ~32% (~11/34).
+  **Aug 24 automated data agrees and is harsher: 171/933 = 18.3%.**
+- **Sum-of-top-two entry filter: STILL COLLECTING. Not settled.** Do not treat
+  any specific threshold as decided.
+- Watch the PRICE of winning brackets, not just whether they win.
 - **Pending one-time task:** backward count through three weeks of sheets, scoring
   every day the two NWS columns landed within 0.5°.
-- **Pending experiment:** obs-truncation, Philadelphia + Denver at 5 PM ET only,
-  four fields each — testing whether the observed high already eliminates brackets
-  that are still being priced.
+- **Pending experiment:** obs-truncation, Philadelphia + Denver at 5 PM ET only.
 
 ---
 
@@ -306,156 +565,93 @@ and that it survives non-summer weather.
 - No change without 50+ settled bets or a 4+ occurrence repeated pattern.
 - Test one variable at a time, shadow/paper, settled against Iowa State CLI.
 - Win rate ≠ profit. ROI after fees/price is the only real measure.
-  (Proof: several 50%-win cities LOST money in the July data.)
+  **Aug 24 proof: `CONV/AGREE/70+` hits 75.4% and still LOSES 2.09¢/contract,
+  because it pays 77.5¢ to do it.**
 - Real money only after per-city edge is confirmed on real samples.
-- Edge is concentrated (Boston, maybe Vegas/Phoenix), not broad — size only where
-  confirmed, not on win-rate feel.
-- **Never pool strategy tags.** Per-tag analysis only. (Aug 21.)
+- Edge is concentrated, not broad — size only where confirmed.
+- **Never pool strategy tags.** Per-tag analysis only.
 - **Never reconstruct a file from memory** — always work from the current paste.
-- Real-money config when go-live: $5 flat/bet, YES-only, conviction tier preferred,
-  skip Phoenix (bracket-width problem), max 3–5 bets/day.
+- **Check the sign convention before interpreting any bias number.**
+- **Distinguish the MARKET's top bracket from the MODEL's pick.** They are
+  different populations and conflating them produces opposite conclusions.
+- Real-money config when go-live: $5 flat/bet, YES-only, conviction tier
+  preferred, skip Phoenix (bracket-width problem), max 3-5 bets/day.
 
 ---
 
 # APPENDIX: Basket / Cluster Trade — Full Spec
 
-_(Referenced above in the Research Queue. Full detail here so it lives in one file.)_
-
-**Status:** RESEARCH QUEUE — do not build until (a) highs validation window closes,
-and (b) the price×time edge hypothesis has more than ~2 weeks of data behind it.
-This is a PAPER strategy first. No real money until it settles clean on its own tag.
-
-Surfaced independently 5+ times across research reading + Mike's own instinct +
-prior-session scoping (Jun 10 "cluster trade", Jun 23 V5.30 notes). It is the top
-untested thread. This spec exists so it can be built correctly without
-re-litigating the logic.
-
----
+**Status:** RESEARCH QUEUE — do not build until (a) the highs validation window
+closes, and (b) the price×time edge hypothesis has more than ~2 weeks behind it.
+PAPER first. No real money until it settles clean on its own tag.
 
 ## The core idea
 
-At/near peak-heat time (the 2pm ET capture window), the daily high is often
-nearly locked to ONE OF TWO adjacent brackets — e.g. it's clearly going to be
-92 or 93, not 88 and not 97. Instead of guessing which single bracket, BUY BOTH.
-If the high lands in either, that leg pays $1.
+At/near peak-heat time, the daily high is often nearly locked to ONE OF TWO
+adjacent brackets — e.g. clearly 92 or 93, not 88 and not 97. Instead of guessing
+which, BUY BOTH. If the high lands in either, that leg pays $1.
 
-This is a way to bet the "I know the neighborhood but not the exact bracket"
-situation — which is exactly the 45-69¢ middle-price zone that LOST money as
-single-bracket bets in the July validation data. The basket may rescue that zone
-by covering the uncertainty instead of guessing into it. MAY. Untested.
+This targets the 45-69¢ middle-price zone that LOST money as single-bracket bets —
+now confirmed twice, in July and again Aug 24 on 1,229 independent observations.
+The basket may rescue that zone by covering the uncertainty instead of guessing
+into it. MAY. Untested.
 
----
+## The math (a CEILING, not a floor)
 
-## The math (get this right — it's a CEILING, not a floor)
-
-You buy 2 adjacent brackets. Cost = price_A + price_B. Payout if the high lands
-in either = $1.00 (the winning leg) — the losing leg pays $0.
+Cost = price_A + price_B. Payout if the high lands in either = $1.00.
 
 **Profit when it hits = $1.00 − (price_A + price_B) − fees**
 **Loss when it misses both = (price_A + price_B) + fees**
 
-Therefore:
-- You want the COMBINED price as LOW as possible. Combined cost is your risk.
-- Combined price ≥ $1.00 → CANNOT PROFIT. Never do it. Hard stop.
+- COMBINED price as LOW as possible. Combined cost is your risk.
+- Combined price ≥ $1.00 → CANNOT PROFIT. Hard stop.
 - The rule is a CEILING on combined cost, not a floor.
 
-Mike's instinct was "if two brackets total 70¢ or over" — that is BACKWARDS.
-70¢ combined is GOOD (risk 70¢ to win 100¢). 95¢ combined is marginal.
-Over 100¢ is impossible. Lower total = better.
+Mike's original instinct "if two brackets total 70¢ or over" is BACKWARDS. 70¢
+combined is GOOD (risk 70¢ to win 100¢). 95¢ is marginal. Over 100¢ is impossible.
 
-**Working target ceiling:** combined cost < ~$0.90 AND estimated combined
-probability of the two brackets meaningfully above the combined cost. The gap
-between (combined true probability) and (combined price) is the edge, same as
-single bets — just measured across two legs.
+**Working target:** combined cost < ~$0.90 AND estimated combined probability
+meaningfully above combined cost.
 
----
+## The fee gotcha
 
-## The fee gotcha (this kills naive baskets)
+Kalshi charges per CONTRACT. A 2-leg basket pays fees on BOTH legs for $1.00 of
+exposure. On cheap legs this eats the edge fast.
 
-Kalshi charges a per-CONTRACT fee. A 2-leg basket pays fees on BOTH legs for
-$1.00 of total exposure. On cheap legs this eats the edge fast. The Maximus
-0-32 post called this out specifically.
-
-Implication: baskets only work when
-1. combined cost is well below $1.00 (leaving room for the fee), AND
-2. combined win probability is near-certain (afternoon, high nearly locked).
-
-Do NOT basket in the morning when each leg is 20-40¢ and you'd pay 60¢+ for a
-~70% combined probability with two fees stacked on top. That's negative after
-fees. Basket is an AFTERNOON / 2pm-window tactic, when you can pay ~$0.80-0.90
-for a near-locked two-bracket window.
-
----
+Baskets only work when (1) combined cost is well below $1.00, AND (2) combined
+win probability is near-certain (afternoon, high nearly locked). Do NOT basket in
+the morning when each leg is 20-40¢ — that's negative after two stacked fees.
 
 ## When the basket fires (proposed gate)
 
-All of these must hold at the 2pm ET capture (peak-heat window):
+At the 2pm ET capture:
 1. Two ADJACENT brackets are the model's top-2 by probability.
-2. Their combined MODEL probability ≥ ~0.90 (near-certain it's one of the two).
-3. Their combined MARKET price ≤ ~0.88 (leaves edge + fee margin).
-4. The day is in the afternoon/near-locked window (obs high already close to
-   the bracket region — reuse existing obs_high logic from fetch_weather.py).
+2. Combined MODEL probability ≥ ~0.90.
+3. Combined MARKET price ≤ ~0.88.
+4. Afternoon/near-locked (obs high already close to the bracket region — reuse
+   existing `obs_high` logic).
 
-If combined price > combined model probability → no edge, skip.
+If combined price > combined model probability → skip.
 If combined price ≥ ~0.95 → fee margin gone, skip.
 
----
+## How to log it
 
-## How to log it (paper, isolated — never touches live model)
+Tag: `V529_PAPER_BASKET_YES`. Its OWN paper rows, filtered clean. Do NOT mix into
+single-bracket P&L. Record: date, city, both bracket labels and prices,
+combined_cost, both model probs and their sum, `placed_at` (basket is
+afternoon-only), which bracket settled, and profit WITH modeled fees.
 
-New strategy tag: `V529_PAPER_BASKET_YES`
+## What success looks like
 
-Store as its OWN paper bets so it can be filtered clean, exactly like the
-existing paper tags. Do NOT mix into single-bracket P&L.
-
-Suggested per-basket record (in bets table, or a small companion table):
-- date, city
-- bracket_A_label, price_A
-- bracket_B_label, price_B
-- combined_cost = price_A + price_B
-- model_prob_A, model_prob_B, combined_model_prob
-- placed_at (need the time-of-day; basket is afternoon-only)
-- result: which bracket settled (A / B / neither)
-- profit = (1.00 − combined_cost − fees) if A or B hit, else −(combined_cost+fees)
-- strategy_tag = 'V529_PAPER_BASKET_YES'
-
-Fees: model Kalshi's actual per-contract fee for 2 contracts so paper P&L is
-honest. Do not log fee-free profit — the whole point is the fee is what makes
-or breaks this.
-
----
-
-## What success looks like (the test)
-
-After enough settled paper baskets (target 50+, same discipline as everything):
-
-Compare `V529_PAPER_BASKET_YES` ROI against:
-- single-bracket bets in the SAME 45-69¢ middle zone (which lost money in July)
-- doing nothing (skip)
-
-Basket EARNS its place ONLY if its ROI, AFTER modeled fees, beats both. If the
-combined cost consistently eats the edge (fees + prices too high), the idea is
-dead and you stop wondering — same bar as the ECMWF shadow test.
-
----
+After 50+ settled paper baskets, compare ROI against (a) single-bracket bets in
+the same 45-69¢ zone, and (b) doing nothing. Basket earns its place ONLY if its
+after-fee ROI beats both. Same bar as the ECMWF shadow test.
 
 ## What NOT to do
 
-- Do NOT build this during the highs validation window.
-- Do NOT bet real money on it before 50+ settled paper baskets.
-- Do NOT basket in the morning (fees + loose prices = negative EV).
-- Do NOT basket when combined cost ≥ ~0.95 (no room after fees).
-- Do NOT treat "high win rate" as success — a basket that wins 95% of the time
-  but pays 8¢ per win after fees can still be net-negative. ROI after fees is
-  the only measure that matters.
-
----
-
-## Connection to existing work
-
-- This is the natural use of the 2pm capture window and the intraday collector's
-  "watch the day lock in" data.
-- It targets exactly the 45-69¢ middle zone that lost money as single bets in
-  the July 2026 validation data — the basket is the hypothesis for how to bet
-  that zone profitably (cover it instead of guessing).
-- Prior scoping: Jun 10 (cluster-trade insight), Jun 23 (V5.30 notes).
+- Not during the highs validation window.
+- No real money before 50+ settled paper baskets.
+- Never in the morning.
+- Never when combined cost ≥ ~0.95.
+- Never treat "high win rate" as success — a basket winning 95% but paying 8¢ per
+  win after fees is net-negative.
