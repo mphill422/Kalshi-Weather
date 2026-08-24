@@ -37,3 +37,10 @@ jobs:
         env:
           WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
         run: python lows_price_probe.py
+      - name: Lows settlement collector
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
+          DAYS_BACK: '90'
+        run: python fetch_lows_settlements.py
