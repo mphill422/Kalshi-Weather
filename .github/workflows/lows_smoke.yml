@@ -25,3 +25,7 @@ jobs:
         env:
           WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
         run: python lows_source_validate.py
+      - name: Lows timing characterization
+        env:
+          WETHR_API_KEY: ${{ secrets.WETHR_API_KEY }}
+        run: python lows_timing_probe.py
