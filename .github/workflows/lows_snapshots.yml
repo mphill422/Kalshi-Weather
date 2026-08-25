@@ -1,0 +1,26 @@
+name: Lows Snapshots
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every 30 minutes, all hours. Deliberately NOT narrowed to a dawn window —
+    # the 31-day timing study found minimum timing is unreliable in 15/18 cities
+    # (Phoenix p10-p90 spread is 23h), so a dawn-only window would presuppose the
+    # answer to the question this table exists to answer.
+    - cron: '*/30 * * * *'
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install requests pytz
+      - name: Collect lows ladder snapshots
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python fetch_lows_snapshots.py
