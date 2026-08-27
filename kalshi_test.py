@@ -1,4 +1,4 @@
-import os, time, base64, requests
+import os, time, base64, json, requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
@@ -29,10 +29,19 @@ def get(path, params=None):
     print("STATUS:", r.status_code)
     return r
 
-# 8/25/26 16:30-18:30 UTC  (12:30-2:30 PM ET)
-START = 1787070600
-END = 1787077800
+# Aug 25 2026, 14:00-20:00 UTC (10am-4pm ET)
+START = 1787666400
+END = 1787688000
 
 r = get("/trade-api/v2/series/KXHIGHNY/events/KXHIGHNY-26AUG25/candlesticks",
         {"period_interval": 60, "start_ts": START, "end_ts": END})
-print(r.text[:4000])
+
+d = r.json()
+for tick, candles in zip(d.get("market_tickers", []),
+                         d.get("market_candlesticks", [])):
+    print(f"\n{tick}  candles={len(candles)}")
+    for c in candles[:8]:
+        p = c.get("price", {})
+        print("  ts", c.get("end_period_ts"),
+              "close", p.get("close_dollars") or p.get("close"),
+              "vol", c.get("volume_fp") or c.get("volume"))
