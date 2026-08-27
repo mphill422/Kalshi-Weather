@@ -92,7 +92,7 @@ for series in series_list:
         if edate < cutoff: continue
 
         start = int(dt.datetime.combine(edate, dt.time(12, 0)).timestamp())
-        end = start + 10 * 3600
+        end = start + 22 * 3600
 
         c = kget(f"/trade-api/v2/series/{series}/events/{et}/candlesticks",
                  {"period_interval": 1, "start_ts": start, "end_ts": end})
