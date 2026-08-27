@@ -29,6 +29,10 @@ def get(path, params=None):
     print("STATUS:", r.status_code)
     return r
 
-r = get("/trade-api/v2/events",
-        {"series_ticker": "KXHIGHNY", "limit": 10, "status": "settled"})
-print(r.text[:3000])
+# 8/25/26 16:30-18:30 UTC  (12:30-2:30 PM ET)
+START = 1787070600
+END = 1787077800
+
+r = get("/trade-api/v2/series/KXHIGHNY/events/KXHIGHNY-26AUG25/candlesticks",
+        {"period_interval": 60, "start_ts": START, "end_ts": END})
+print(r.text[:4000])
