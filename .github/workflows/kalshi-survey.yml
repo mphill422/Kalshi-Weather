@@ -14,4 +14,5 @@ jobs:
       - env:
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+          CATEGORY: "Economics"
         run: python kalshi_survey.py
