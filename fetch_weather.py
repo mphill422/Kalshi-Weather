@@ -1,5 +1,59 @@
 """
-fetch_weather.py — MPH Weather Model V5.30.0
+fetch_weather.py — MPH Weather Model V5.31.0
+
+V5.31.0 changes from V5.30.0:
+  - NBM CONSENSUS ANCHOR. This is the big one, and it changes every bet.
+
+    The bracket ladder was built ENTIRELY from NBM percentiles. `consensus`
+    was passed into bracket_probs() but only reached the math when
+    nbm_bracket_prob() returned None for an individual bracket. Net effect:
+    the NWS/GFS blend, the per-city warm offsets, the bias correction, and
+    the V5.30 trimmed-mean fix all moved a number that got logged, displayed,
+    and stored in settlements.consensus — but NEVER reached bet selection.
+    NBM alone picked the bracket.
+
+    Measured on kalshi_snapshots joined to settlements (72 days, 20 cities):
+      * The chosen bracket midpoint sat BELOW the model's own consensus in
+        18 of 20 cities. LA -2.34F, DC -1.93F, Atlanta -1.89F, Denver -1.76F,
+        Philadelphia -1.42F, Phoenix -1.41F, Austin -1.41F. Only Dallas
+        (+0.21) and New Orleans (+0.12) were positive.
+      * The cities with the worst ladder offset were the SAME cities with the
+        worst bracket-vs-actual error — near one-to-one, so the offset
+        explains most of the cold bias rather than being a separate problem.
+      * Consensus itself is well calibrated. After the V5.30 trimmed mean,
+        actual-minus-consensus ran +1.23 (Las Vegas) to -0.69 (New York),
+        11 cities positive and 7 negative, mean near +0.18.
+      * The market's own favorite ran -0.44F vs actual — near unbiased.
+      * When model and market disagreed, the market won 762 to 171 (81.7%).
+
+    Ruled out before landing here: BASE_SIGMA (no correlation — Boston at
+    sigma 3.5 offsets -1.00 while Phoenix at 0.9 offsets -1.41),
+    CITY_PREDICTION_MODE (both modes appear in both groups), and
+    NWS_BIAS_BOOST_CITIES (San Antonio is in the set at -0.17 while LA and
+    Atlanta are not in it and are the worst two).
+
+    Fix: nbm_bracket_prob() now takes an `anchor` and shifts the whole
+    percentile distribution so its p50 lands on consensus. NBM still supplies
+    the SHAPE — the spread, and therefore the uncertainty structure — while
+    consensus supplies the CENTER.
+
+    NBM_CONSENSUS_ANCHOR controls it:
+      1.0 = fully centered on consensus   (V5.31 default)
+      0.5 = halfway blend
+      0.0 = exact V5.30 behavior          (rollback — change the number only)
+
+  - PAPER TAGS BUMPED V530_ → V531_. Required, not cosmetic. Picks made
+    under two different bracket-selection models must not share a strategy
+    tag, or the corpus mixes populations and no per-tag comparison is valid.
+    The V530_ rows stay where they are as the pre-change baseline.
+
+  - HONEST CAVEAT ON THE DIAGNOSIS. We measured that the chosen bracket sits
+    below consensus, and that consensus is now calibrated. We did NOT measure
+    NBM p50 against actual directly — NBM percentiles are fetched live and
+    never stored, so there is no history to check. "NBM runs cold" is an
+    inference from the offset, not an observation. If NBM is right and
+    consensus is wrong on the days that matter, this change makes things
+    worse. Watch the settled results, not just the offset going to zero.
 
 V5.30.0 changes from V5.29.F:
   - ROSTER CONTRACTION. San Francisco (KSFO) and Seattle (KSEA) REMOVED.
@@ -37,17 +91,19 @@ V5.30.0 changes from V5.29.F:
     small warm drift while correctly ignoring the occasional large miss.
     Trimmed mean drops only the single highest and single lowest error and
     averages the rest — keeps outlier robustness, stops discarding the
-    systematic middle. WATCH THIS: if the residual is still ~+0.7 after two
-    weeks the cause is structural (the correction is computed from a
-    consensus that already contains the prior correction) and needs a
-    different fix.
+    systematic middle.
+    VERIFIED WORKING 2026-08-29 on 9 settled days per city under V5.30.0:
+    the one-directional bias is gone, mean residual now ~+0.18F. This fix
+    did its job. Note the sign convention: errors are actual MINUS
+    consensus, so a POSITIVE residual means settlement came in WARMER than
+    predicted — the model runs COLD, not warm.
 
-  - PRICE_FLOOR_CENTS DELIBERATELY LEFT AT 30 HERE. The V529D_PAPER_* tags
-    this file writes are the RESEARCH corpus — they are what produced the
-    price-band table showing sub-60c loses across 189 events and 60c+ earns
-    +12.6% ROI on 60 events. Raising the floor here would stop generating
-    the sub-60 rows that make that comparison possible. The 60c floor lives
-    in streamlit_app.py where the AUTO_GATED_V2 strategy tag runs. Two
+  - PRICE_FLOOR_CENTS DELIBERATELY LEFT AT 30 HERE. The paper tags this file
+    writes are the RESEARCH corpus — they are what produced the price-band
+    table showing sub-60c loses across 189 events and 60c+ earns +12.6% ROI
+    on 60 events. Raising the floor here would stop generating the sub-60
+    rows that make that comparison possible. The 60c floor lives in
+    streamlit_app.py where the AUTO_GATED_V2 strategy tag runs. Two
     different jobs: this file measures, that file bets.
 
 V5.29.F changes from V5.29.E:
@@ -105,7 +161,7 @@ SUPABASE_URL  = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY  = os.environ.get('SUPABASE_KEY', '')
 
 WETHR_HEADERS = {'Authorization': f'Bearer {WETHR_API_KEY}', 'Accept': 'application/json'}
-HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.30.0', 'Accept': 'application/json'}
+HEADERS       = {'User-Agent': 'kalshi-weather-fetcher/5.31.0', 'Accept': 'application/json'}
 
 # ── Validator Configuration ──────────────────────────────────────────────────
 PAPER_BET_STAKE       = 3.0
@@ -118,6 +174,20 @@ TRUST_THRESHOLDS      = [75, 80]
 WINDOW_TOLERANCE_MIN  = 6
 
 SIGMA_P_GATE_MAX      = 1.15
+
+# V5.31: how much the NBM ladder is re-centered on consensus.
+#   1.0 = fully centered on consensus (NBM supplies shape only)   [default]
+#   0.5 = halfway blend
+#   0.0 = original V5.30 behavior (NBM owns placement entirely)   [rollback]
+# MUST MATCH the value in streamlit_app.py. If the two files disagree, the
+# app and the cron will pick different brackets for the same city on the same
+# day, and the paper corpus becomes a mixture of two models.
+NBM_CONSENSUS_ANCHOR  = 1.0
+
+# V5.31: paper tag prefix. Bumped V530_ → V531_ because the bracket-selection
+# math changed. Rows written under a different prefix are a different
+# population and must not be pooled with these.
+PAPER_TAG_PREFIX      = 'V531'
 
 WINDOW_SCHEDULE = {
     (14,  0): [('ET', 'EDGE')],
@@ -228,6 +298,10 @@ GFS_CITY_WEIGHT = {
 # V5.29.B per-city sigma recalibration from observed 28-day data (Jun 17 2026).
 # Capped at 3.5F to prevent single-day data feed failures (e.g. OKC's 22F
 # outlier) from over-inflating. Re-run quarterly or after structural changes.
+#
+# V5.31 NOTE: sigma only affects the FALLBACK path (sigma_bracket_prob), used
+# when NBM is unavailable or returns None for a bracket. It was tested as a
+# candidate explanation for the ladder offset and ruled out — no correlation.
 BASE_SIGMA = {
     'Boston': 3.5,        # was 1.9 — observed σ 3.66 (capped)
     'Oklahoma City': 3.5, # was 2.5 — observed σ 4.35 (capped, outlier-inflated)
@@ -400,7 +474,15 @@ def sb_count_paper_bets_today(city, strategy_tag):
 # ── V5.28.1: Kalshi market snapshot logger ───────────────────────────────────
 def snapshot_kalshi_market(city, kalshi_markets, window_tz, window_label,
                            model_top_bracket, utc_now):
-    """Snapshot the full Kalshi ladder for one city to kalshi_snapshots table."""
+    """Snapshot the full Kalshi ladder for one city to kalshi_snapshots table.
+
+    V5.31 NOTE: this table is what made the ladder-offset diagnosis possible.
+    model_top_bracket joined to settlements.consensus is how we found the
+    chosen bracket sitting 1-2F below the model's own forecast, and joined to
+    settlements.actual is how we found the market winning disagreements
+    762-171. Keep writing it. Two snapshots per city-day (EDGE and CONVICTION)
+    is thin for intraday questions but sufficient for this one.
+    """
     if not kalshi_markets:
         return 0
     try:
@@ -497,6 +579,14 @@ def _trimmed_mean(errors):
     Trimmed mean keeps outlier robustness (a +12F sensor-spike style error is
     still dropped, where a plain mean would blow the correction up to +1.6)
     without throwing away the persistent drift the median was compressing.
+
+    VERIFIED WORKING 2026-08-29 on 9 settled days per city under V5.30.0:
+    residuals now run +1.23 (Las Vegas) to -0.69 (New York), 11 positive and
+    7 negative, mean ~+0.18F. The one-directional bias is gone.
+
+    SIGN CONVENTION: errors are actual MINUS consensus. A POSITIVE value means
+    settlement came in WARMER than the model predicted — the model runs COLD.
+    Misreading this cost a wrong call on 2026-08-24.
     """
     if not errors:
         return 0.0
@@ -770,6 +860,15 @@ def fetch_gfs_ensemble(city):
 
 # ── NBM percentile fetch ──────────────────────────────────────────────────────
 def fetch_nbm_percentiles(city):
+    """NBM run-to-run spread, expressed as percentiles of the daily max.
+
+    V5.31 NOTE: these values are fetched live and never persisted. There is no
+    NBM column in settlements and no nbm table, so NBM p50 has never been
+    scored against actual. That is why "NBM runs cold" remains an inference
+    from the ladder offset rather than a measurement. If this question comes
+    up again, storing p50 alongside consensus in the settlements upsert would
+    settle it in about ten days.
+    """
     station = WETHR_STATIONS.get(city)
     if not station:
         return None
@@ -864,6 +963,10 @@ def compute_consensus(fc, cur, noaa, city, obs_high=None):
     estimate; the measurement can only raise the result from below, never
     become the base that adjustments stack on. Returns a flag-free value —
     main() re-clamps after bias for the same reason.
+
+    V5.31 NOTE: the value this function returns is now what ANCHORS the
+    bracket ladder, not merely what gets logged. Every adjustment here
+    reaches bet selection.
     """
     mode = CITY_PREDICTION_MODE.get(city, 'full_blend')
     obs_locked = False
@@ -963,7 +1066,31 @@ def sigma_bracket_prob(mu, lo, hi, sigma, obs_high=None):
         return normal_cdf(hi + 0.5, mu, sigma) - normal_cdf(lo - 0.5, mu, sigma)
 
 
-def nbm_bracket_prob(nbm, lo, hi, obs_high=None):
+def nbm_bracket_prob(nbm, lo, hi, obs_high=None, anchor=None):
+    """Bracket probability from the NBM percentile distribution.
+
+    V5.31: `anchor` (consensus) optionally re-centers the distribution.
+
+    Before V5.31 the ladder was placed entirely by NBM percentiles, and
+    consensus only entered when this function returned None for an individual
+    bracket. That meant every forecasting improvement — the NWS/GFS blend, the
+    per-city warm offsets, the bias correction, the V5.30 trimmed mean —
+    affected a number that was logged and stored but never reached bet
+    selection. Measured across 72 days and 20 cities: the chosen bracket
+    midpoint sat 1-2F BELOW the model's own consensus in 18 of 20 cities, and
+    the market beat the model 762-171 on disagreements.
+
+    With NBM_CONSENSUS_ANCHOR = 1.0 the percentile spread — and therefore the
+    uncertainty structure — still comes from NBM, but every point is shifted
+    so that p50 lands exactly on consensus. Set the constant to 0.0 to restore
+    V5.30 behavior exactly.
+
+    The asymmetric tail extrapolation below is UNCHANGED from V5.30: the lower
+    tail ramps over a fixed 5F while the upper ramps over (p90 - p75). That is
+    a real asymmetry and it affects tail brackets, but it is not what produced
+    the center offset, and it is left alone deliberately — one variable at a
+    time.
+    """
     if not nbm:
         return None
     cdf_points = []
@@ -974,6 +1101,16 @@ def nbm_bracket_prob(nbm, lo, hi, obs_high=None):
     if len(cdf_points) < 2:
         return None
     cdf_points.sort(key=lambda x: x[0])
+
+    # V5.31: shift the whole distribution so its median lands on consensus.
+    if anchor is not None and NBM_CONSENSUS_ANCHOR > 0:
+        p50 = nbm.get('p50')
+        if p50 is not None:
+            try:
+                shift = (float(anchor) - float(p50)) * NBM_CONSENSUS_ANCHOR
+                cdf_points = [(t + shift, p) for t, p in cdf_points]
+            except Exception:
+                pass
 
     def cdf(t):
         if t <= cdf_points[0][0]:
@@ -1008,7 +1145,9 @@ def bracket_probs(consensus, ladder_text, city, nbm, obs_high=None, forecast=Non
     if used_nbm:
         sigma = choose_sigma(city, obs_high=obs_high, forecast=forecast)
         for label, lo, hi in parse_ladder(ladder_text):
-            p = nbm_bracket_prob(nbm, lo, hi, obs_high=obs_high)
+            # V5.31: consensus is now the ANCHOR for the NBM distribution, not
+            # merely a fallback when NBM has no answer for this bracket.
+            p = nbm_bracket_prob(nbm, lo, hi, obs_high=obs_high, anchor=consensus)
             if p is None:
                 p = sigma_bracket_prob(consensus, lo, hi, sigma, obs_high)
             rows.append((label, max(0.0, min(1.0, p))))
@@ -1663,7 +1802,12 @@ def evaluate_city_for_paper_bet(city, weather_data, consensus, bias_correction,
 
 
 def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
-    """V5.29.A Σp gate + V5.28 NO-bet block, both carried forward unchanged."""
+    """V5.29.A Σp gate + V5.28 NO-bet block, both carried forward unchanged.
+
+    V5.31: strategy tags use PAPER_TAG_PREFIX (now 'V531'). Rows written under
+    the old 'V530' prefix were produced by a different bracket-selection model
+    and must be analyzed separately, never pooled with these.
+    """
     cities = TZ_CITIES.get(tz_key, [])
     today = get_eastern_date()
     logged = []
@@ -1723,7 +1867,7 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
         if yes_qualifies and trust_yes is not None:
             for threshold in TRUST_THRESHOLDS:
                 if trust_yes >= threshold:
-                    tag = f'V530_PAPER_YES_{window_label}_T{threshold}'
+                    tag = f'{PAPER_TAG_PREFIX}_PAPER_YES_{window_label}_T{threshold}'
                     if sb_count_paper_bets_today(city, tag) > 0:
                         continue
                     sp_str = f' | Σp {sigma_p:.3f}' if sigma_p is not None else ''
@@ -1741,7 +1885,7 @@ def log_paper_bets_for_window(tz_key, window_label, weather_results, run_iso):
         if no_qualifies and trust_no is not None:
             for threshold in TRUST_THRESHOLDS:
                 if trust_no >= threshold:
-                    tag = f'V530_PAPER_NO_{window_label}_T{threshold}'
+                    tag = f'{PAPER_TAG_PREFIX}_PAPER_NO_{window_label}_T{threshold}'
                     if sb_count_paper_bets_today(city, tag) > 0:
                         continue
                     bust_note = ' [BUSTED]' if busted else ''
@@ -1771,9 +1915,9 @@ def main():
     now_et = datetime.now(pytz.timezone('America/New_York'))
     utc_now = datetime.utcnow()
 
-    print(f'\n=== V5.30.0 Weather Fetch Run ===')
+    print(f'\n=== V5.31.0 Weather Fetch Run ===')
     print(f'Date: {today} | ET: {now_et.strftime("%I:%M %p ET")} | UTC: {utc_now.strftime("%H:%M")}')
-    print(f'Cities: {len(CITIES)}\n')
+    print(f'Cities: {len(CITIES)} | NBM anchor: {NBM_CONSENSUS_ANCHOR} | Paper tag: {PAPER_TAG_PREFIX}_\n')
 
     firing_windows = is_window_time(utc_now)
     if firing_windows:
@@ -1861,6 +2005,12 @@ def main():
                           f'(adj={adjustment:+.1f}F)')
                     consensus = new_consensus
 
+            # V5.31: log the anchor shift so the effect is visible in run output.
+            if nbm and nbm.get('p50') is not None and NBM_CONSENSUS_ANCHOR > 0:
+                _shift = round((consensus - float(nbm['p50'])) * NBM_CONSENSUS_ANCHOR, 1)
+                print(f'    🎯 V5.31 NBM anchor: p50={nbm["p50"]}F → consensus={consensus}F '
+                      f'(shift {_shift:+.1f}F, weight {NBM_CONSENSUS_ANCHOR})')
+
             ok = sb_upsert(
                 city=city, consensus=consensus, forecast=nws_fc,
                 ensemble_mean=ensemble_mean, source_gap=source_gap,
@@ -1894,7 +2044,7 @@ def main():
         print(f'Failed: {", ".join(save_fail)}')
 
     if firing_windows and _TRUST_AVAILABLE:
-        print(f'\n=== Paper-Bet Validator (V5.30.0) ===')
+        print(f'\n=== Paper-Bet Validator (V5.31.0) ===')
         run_iso = datetime.now(pytz.timezone('America/New_York')).isoformat()
         all_logged = []
         for tz_key, window_label in firing_windows:
