@@ -1,4 +1,4 @@
-# Kalshi High Temperature Model - V5.30.0
+# Kalshi High Temperature Model - V5.31.0
 # V5.27 BUILD GOALS — bet frequency reduction (research-validated):
 #   After 43 live bets resulted in -$75.02 / -21.5% ROI / 27.9% win rate,
 #   public Kalshi weather strategies (gopher-lab/kalshi-go and
@@ -32,6 +32,34 @@
 #   - apply_prob_floor() now normalizes the ladder to sum to 1.0 (busted
 #     brackets excluded and left at zero). Previously the ladder could sum to
 #     ~14%, making every downstream edge number meaningless.
+#
+# V5.31.0 — NBM CONSENSUS ANCHOR (2026-08-29):
+#   The ladder was built ENTIRELY from NBM percentiles. consensus was passed
+#   into bracket_probs_nbm but only used when nbm_bracket_prob returned None
+#   for an individual bracket. Net effect: every forecasting improvement —
+#   the NWS/GFS blend, the per-city warm offsets, the bias correction, the
+#   V5.30 trimmed mean — moved a number that was logged and displayed but
+#   NEVER reached bet selection. NBM alone picked the bracket.
+#
+#   Measured over kalshi_snapshots joined to settlements (72 days, 20 cities):
+#     - The chosen bracket midpoint sat BELOW the model's own consensus in
+#       18 of 20 cities (LA -2.34F, DC -1.93F, Atlanta -1.89F, Denver -1.76F).
+#     - Consensus itself was well calibrated: after the V5.30 trimmed mean,
+#       actual-minus-consensus ran +1.23 to -0.69 with a mean near +0.18.
+#     - The market's own favorite ran -0.44F vs actual — near unbiased.
+#     - When model and market disagreed, the market won 762 to 171 (81.7%).
+#
+#   Fix: nbm_bracket_prob now accepts an `anchor` and shifts the whole
+#   percentile distribution so its p50 lands on consensus. NBM still supplies
+#   the SHAPE (spread / uncertainty structure); consensus supplies the CENTER.
+#   Controlled by NBM_CONSENSUS_ANCHOR:
+#     1.0 = fully centered on consensus   (V5.31 default)
+#     0.5 = halfway blend
+#     0.0 = exact V5.30 behavior          (rollback, no logic change needed)
+#
+#   This changes every bet the model makes. It starts a fresh validation
+#   window on deploy. Confirm the mechanism worked by re-running the
+#   bracket-midpoint-minus-consensus query — it should go to ~0.
 #
 # All V5.22 - V5.26.2 forecasting/data/scoring infrastructure preserved exactly.
 # Only the bet-selection / surfacing layer is gated.
@@ -67,7 +95,7 @@ def _check_app_password():
     .mph-login-badge { display: inline-block; padding: 0.2rem 0.7rem; background: rgba(0, 255, 136, 0.12); border: 1px solid rgba(0, 255, 136, 0.4); border-radius: 999px; color: #00ff88; font-size: 0.75rem; font-weight: 600; letter-spacing: 0.05em; margin-left: 0.5rem; }
     </style>
     <div class="mph-login-wrap">
-      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.30.0</span></div>
+      <div class="mph-login-title">🌡️ MPH Weather Model <span class="mph-login-badge">V5.31.0</span></div>
       <div class="mph-login-sub">Private — enter access password to continue</div>
     </div>
     """, unsafe_allow_html=True)
@@ -147,7 +175,15 @@ PAPER_BET_STAKE_AUTO = 10.0
 CONSENSUS_TOP_N = 2
 ONE_CITY_PER_DAY = False
 
-HEADERS = {'User-Agent': 'kalshi-temp-model/5.30.0', 'Accept': 'application/geo+json, application/json, text/html'}
+# V5.31: how much the NBM ladder is re-centered on consensus.
+#   1.0 = fully centered on consensus (NBM supplies shape only)   [default]
+#   0.5 = halfway blend
+#   0.0 = original V5.30 behavior (NBM owns placement entirely)   [rollback]
+# See the V5.31.0 note in the file header for the measurement that motivated
+# this. Changing this value is the entire rollback procedure — no logic edits.
+NBM_CONSENSUS_ANCHOR = 1.0
+
+HEADERS = {'User-Agent': 'kalshi-temp-model/5.31.0', 'Accept': 'application/geo+json, application/json, text/html'}
 try:
     WETHR_API_KEY = st.secrets['wethr']['api_key']
 except Exception:
@@ -525,6 +561,11 @@ def _trimmed_mean(errors):
     one bracket low. Trimmed mean keeps outlier robustness (the +4.2 and
     -3.2 style misses still get dropped) without throwing away the
     persistent drift that the median was compressing away.
+
+    VERIFIED WORKING (2026-08-29). Re-measured on 9 settled days per city
+    under V5.30.0: actual-minus-consensus now runs +1.23 (Las Vegas) to
+    -0.69 (New York), 11 cities positive and 7 negative, mean near +0.18.
+    The one-directional bias is gone. Consensus is calibrated.
     """
     if not errors:
         return 0.0
@@ -745,7 +786,30 @@ def fetch_nbm_percentiles(lat, lon):
         }
     except Exception: return None
 
-def nbm_bracket_prob(nbm_percentiles, lo, hi, obs_high=None):
+def nbm_bracket_prob(nbm_percentiles, lo, hi, obs_high=None, anchor=None):
+    """Bracket probability from the NBM percentile distribution.
+
+    V5.31: `anchor` (consensus) optionally re-centers the distribution.
+
+    Previously the ladder was placed entirely by NBM percentiles, and
+    consensus only entered when this function returned None for an individual
+    bracket. That meant every forecasting improvement — the NWS/GFS blend, the
+    per-city warm offsets, the bias correction, the V5.30 trimmed mean —
+    affected a number that was logged and displayed but never reached bet
+    selection. Measured effect across 72 days and 20 cities: the chosen
+    bracket midpoint sat 1-2F BELOW the model's own consensus in 18 of 20
+    cities, and the market beat the model 762-171 on disagreements.
+
+    With NBM_CONSENSUS_ANCHOR = 1.0 the percentile spread (shape, and
+    therefore the uncertainty structure) still comes from NBM, but every
+    point is shifted so that p50 lands exactly on consensus. Set the constant
+    to 0.0 to restore V5.30 behavior exactly.
+
+    Note the asymmetric tail extrapolation below is unchanged from V5.30:
+    the lower tail ramps over a fixed 5F while the upper ramps over
+    (p90 - p75). That affects tail brackets only, not the center, and is left
+    alone deliberately — one variable at a time.
+    """
     if not nbm_percentiles: return None
     cdf_points = []
     pct_map = {'p10': 0.10, 'p25': 0.25, 'p50': 0.50, 'p75': 0.75, 'p90': 0.90}
@@ -753,6 +817,17 @@ def nbm_bracket_prob(nbm_percentiles, lo, hi, obs_high=None):
         if key in nbm_percentiles: cdf_points.append((nbm_percentiles[key], prob))
     if len(cdf_points) < 2: return None
     cdf_points.sort(key=lambda x: x[0])
+
+    # V5.31: shift the whole distribution so its median lands on consensus.
+    if anchor is not None and NBM_CONSENSUS_ANCHOR > 0:
+        p50 = nbm_percentiles.get('p50')
+        if p50 is not None:
+            try:
+                shift = (float(anchor) - float(p50)) * NBM_CONSENSUS_ANCHOR
+                cdf_points = [(t + shift, p) for t, p in cdf_points]
+            except Exception:
+                pass
+
     def cdf(t):
         if t <= cdf_points[0][0]: return max(0.0, cdf_points[0][1] * (t - (cdf_points[0][0] - 5)) / 5)
         if t >= cdf_points[-1][0]:
@@ -778,7 +853,10 @@ def bracket_probs_nbm(consensus, ladder_text, city, nbm_percentiles, obs_high=No
     if nbm_percentiles and len(nbm_percentiles) >= 2:
         rows = []
         for label, lo, hi in parse_ladder(ladder_text):
-            p = nbm_bracket_prob(nbm_percentiles, lo, hi, obs_high=obs_high)
+            # V5.31: consensus is now the anchor for the NBM distribution, not
+            # just a fallback when NBM has no answer for this bracket.
+            p = nbm_bracket_prob(nbm_percentiles, lo, hi, obs_high=obs_high,
+                                 anchor=consensus)
             if p is None:
                 sigma = choose_sigma(city, obs_high=obs_high, forecast=forecast)
                 p = _sigma_bracket_prob(consensus, lo, hi, sigma, obs_high)
@@ -2001,11 +2079,18 @@ with st.sidebar:
     st.markdown('**Kelly fraction:** 15% (conservative)')
     st.markdown('**Max per trade:** min(5% bankroll, $100)')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚦 V5.30.0 Three Gates</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mph-section-header">🚦 V5.31.0 Three Gates</div>', unsafe_allow_html=True)
     st.markdown(f'**Gate 1 — Consensus:** Model pick must equal market #1 or #2 by yes-ask')
     st.markdown(f'**Gate 2 — Price floor:** Entry ≥{PRICE_FLOOR_CENTS}c on side bought')
     st.markdown('**Gate 3 — One bet/city:** Best side (YES or NO) per city only — no spreading')
     st.caption('Research basis: gopher-lab/kalshi-go + Oalkhadra. Brackets <30c = ~0% win rate. 2-of-3 consensus = 82% win rate. Skip ~50% of days.')
+    st.markdown('---')
+    st.markdown('<div class="mph-section-header">🎯 V5.31 NBM Anchor</div>', unsafe_allow_html=True)
+    st.markdown(f'**NBM_CONSENSUS_ANCHOR = {NBM_CONSENSUS_ANCHOR}**')
+    st.caption('NBM supplies the distribution SHAPE; consensus supplies the '
+               'CENTER. Before V5.31 the ladder was placed entirely by NBM and '
+               'the chosen bracket sat 1-2F below the model\'s own consensus in '
+               '18 of 20 cities. Set to 0.0 to revert exactly to V5.30.')
     st.markdown('---')
     st.markdown('<div class="mph-section-header">📊 Signal Key</div>', unsafe_allow_html=True)
     st.markdown('🟢 BET · 🟡 SKIP · 🔴 AVOID · ⚪ No price')
@@ -2013,7 +2098,7 @@ with st.sidebar:
     st.markdown('---')
     st.markdown('<div class="mph-section-header">🎯 Trust Columns</div>', unsafe_allow_html=True)
     st.markdown('**Trust 💎** — Edge trust (0-100)')
-    st.markdown('**Trust 🎯** — Accuracy trust ← V5.30.0 tie-breaker')
+    st.markdown('**Trust 🎯** — Accuracy trust ← V5.31.0 tie-breaker')
     st.markdown('---')
     st.markdown('<div class="mph-section-header">🔵 Ensemble</div>', unsafe_allow_html=True)
     st.markdown('🔵 HIGH · 🟡 MED · ⚪ LOW')
@@ -2021,15 +2106,15 @@ with st.sidebar:
     st.markdown('<div class="mph-section-header">🔬 MAE Guide</div>', unsafe_allow_html=True)
     st.markdown('✅ <2.5F · 🟡 2.5-4F · 🔴 >4F')
     st.markdown('---')
-    st.markdown('<div class="mph-section-header">🚦 V5.30.0</div>', unsafe_allow_html=True)
-    st.markdown('Bet frequency reduction.')
-    st.markdown('- Three research-validated gates')
-    st.markdown('- Banner shows ALL qualifying picks (ranked by Trust 🎯)')
-    st.markdown('- Per-city detail with Gate Status')
-    st.markdown('- ~50% of days expected to be skips')
-    st.markdown('- All forecasting infra unchanged')
+    st.markdown('<div class="mph-section-header">🚦 V5.31.0</div>', unsafe_allow_html=True)
+    st.markdown('NBM ladder now anchored on consensus.')
+    st.markdown('- Consensus finally reaches bet selection')
+    st.markdown('- NBM still supplies uncertainty shape')
+    st.markdown('- Three research-validated gates unchanged')
+    st.markdown('- Fresh validation window starts on deploy')
     st.markdown('---')
-    st.caption('V5.30.0 reduces bets — does not change predictions.')
+    st.caption('V5.31.0 changes WHICH bracket is picked. Re-run the '
+               'bracket-midpoint-minus-consensus query after ~10 settled days.')
     st.markdown('---')
     st.markdown('<div class="mph-section-header">🔧 Aug 18 Fixes</div>', unsafe_allow_html=True)
     st.caption('Obs high now clamps consensus from below (max) instead of '
@@ -2048,7 +2133,7 @@ st.markdown(f"""
         <div>
             <div class="mph-hero-title">
                 🌡️ MPH Weather Model
-                <span class="mph-version-badge">V5.30.0</span>
+                <span class="mph-version-badge">V5.31.0</span>
             </div>
             <div class="mph-hero-sub">
                 <span class="mph-live-dot"></span>
@@ -2143,14 +2228,14 @@ components.html('<script>setTimeout(function(){window.location.reload();}, 60000
 
 
 # ── V5.27 Cross-City Evaluation ───────────────────────────────────────────────
-with st.spinner('Running V5.30.0 three-gate evaluation across all cities...'):
+with st.spinner('Running V5.31.0 three-gate evaluation across all cities...'):
     v527_eval = evaluate_all_cities_v527(saved_ladders, bankroll=bankroll)
 
 best_overall = v527_eval['best_overall']
 qualifying_picks = v527_eval['qualifying_picks']
 rejected_cities = v527_eval['rejected']
 
-st.markdown('<div class="mph-section-header">🚦 V5.30.0 — Today\'s Qualifying Bets</div>', unsafe_allow_html=True)
+st.markdown('<div class="mph-section-header">🚦 V5.31.0 — Today\'s Qualifying Bets</div>', unsafe_allow_html=True)
 
 if not qualifying_picks:
     n_evaluated = len(qualifying_picks) + len(rejected_cities)
@@ -2200,8 +2285,8 @@ else:
 
 # Audit panel
 if rejected_cities or len(qualifying_picks) > 1:
-    with st.expander(f'📋 V5.30.0 Gate Audit ({len(qualifying_picks)} passing · {len(rejected_cities)} rejected)', expanded=False):
-        st.caption('Diagnostic visibility into why each city was selected or skipped. Verify the gate is firing correctly during the 2-week validation window.')
+    with st.expander(f'📋 V5.31.0 Gate Audit ({len(qualifying_picks)} passing · {len(rejected_cities)} rejected)', expanded=False):
+        st.caption('Diagnostic visibility into why each city was selected or skipped. Verify the gate is firing correctly during the validation window.')
         if qualifying_picks:
             st.markdown('**Cities that passed all three gates:**')
             ranked_for_audit = sorted(qualifying_picks.items(),
@@ -2243,7 +2328,7 @@ if rejected_cities or len(qualifying_picks) > 1:
                         'price': _pick['price'], 'amount': PAPER_BET_STAKE_AUTO,
                         'result': 'Pending', 'profit': 0.0, 'payout': 0.0,
                         'actual': None, 'strategy_tag': 'AUTO_GATED_V2',
-                
+
                     }
                     if sb_insert_bet(_row):
                         _logged_now.append(f'{_c} {_pick["label"]} {_pick["side"]} @ {_pick["price"]}c')
@@ -2252,7 +2337,7 @@ if rejected_cities or len(qualifying_picks) > 1:
                 else:
                     st.caption('Nothing new to log (already logged today).')
 
-with st.expander('🔬 V5.30.0 Diagnostic Dashboard — Trust the Model?', expanded=False):
+with st.expander('🔬 V5.31.0 Diagnostic Dashboard — Trust the Model?', expanded=False):
     st.caption('This panel measures whether the model deserves your trust today. '
                'It does NOT change any predictions — it tells you when predictions are likely reliable.')
 
@@ -2445,8 +2530,8 @@ def get_phase_label(tz_key, et_hour):
     if et_hhmm < bet_start: return '⏳ EARLY', '#94a3b8'
     return '', '#64748b'
 
-st.markdown('<div class="mph-section-header">🎯 Best Bets By Timezone Window (V5.30.0 Gated)</div>', unsafe_allow_html=True)
-st.caption('Only V5.30.0-qualifying picks shown. Cities not listed did not pass all three gates — see V5.30.0 Gate Audit above.')
+st.markdown('<div class="mph-section-header">🎯 Best Bets By Timezone Window (V5.31.0 Gated)</div>', unsafe_allow_html=True)
+st.caption('Only V5.31.0-qualifying picks shown. Cities not listed did not pass all three gates — see V5.31.0 Gate Audit above.')
 
 _et_hour_now = get_et_hour()
 
@@ -2506,7 +2591,7 @@ for tz_key, tz_info in TIMEZONE_GROUPS.items():
     <div style="color:#00b4d8; font-size:11px; margin-bottom:8px; font-family:'JetBrains Mono',monospace;">🌡️ Peak heat: {peak_heat_str}</div>
     <div style="color:#64748b; font-size:11px; margin-bottom:10px; font-family:'JetBrains Mono',monospace;">{city_list_str}</div>
     <div>
-        <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:6px;">V5.30.0 Qualifying Picks</div>
+        <div style="color:#94a3b8; font-size:10px; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:6px;">V5.31.0 Qualifying Picks</div>
         {picks_html}
     </div>
 </div>
@@ -2780,6 +2865,13 @@ with col4:
 if nbm_percentiles:
     nbm_p50 = nbm_percentiles.get('p50', nbm_percentiles.get('p25', '—'))
     st.success(f'✅ NBM active — p10:{nbm_percentiles.get("p10","—")}F | p50:{nbm_p50}F | p90:{nbm_percentiles.get("p90","—")}F | bracket probs from real percentile distribution')
+    if NBM_CONSENSUS_ANCHOR > 0:
+        try:
+            _shift_preview = round((float(consensus) - float(nbm_p50)) * NBM_CONSENSUS_ANCHOR, 1)
+            st.caption(f'🎯 V5.31 anchor: NBM distribution shifted {_shift_preview:+.1f}F so p50 lands on consensus '
+                       f'(anchor weight {NBM_CONSENSUS_ANCHOR}). NBM supplies shape, consensus supplies center.')
+        except Exception:
+            st.caption(f'🎯 V5.31 anchor active (weight {NBM_CONSENSUS_ANCHOR}) — NBM shifted so p50 lands on consensus.')
 else:
     st.caption('📊 NBM unavailable — sigma/normal fallback active')
 
@@ -2878,7 +2970,8 @@ if forecast is not None:
     prob_rows = apply_prob_floor(prob_rows, consensus, ladder_text)
 
     if used_nbm:
-        st.caption('Probabilities derived from NBM percentile distribution (real probabilistic forecast)')
+        st.caption('Probabilities derived from NBM percentile distribution, re-centered on consensus '
+                   f'(V5.31 anchor {NBM_CONSENSUS_ANCHOR})')
     else:
         st.caption(f'Probabilities derived from sigma/normal model (σ={sigma_val:.2f}F) — NBM unavailable')
 
@@ -3019,19 +3112,19 @@ if forecast is not None:
     import pandas as pd
     st.markdown('<div class="mph-section-header">📈 YES Signals</div>', unsafe_allow_html=True)
     st.dataframe(pd.DataFrame(yes_rows), use_container_width=True, hide_index=True)
-    st.caption('🚦 = passes all three V5.30.0 gates · 🚫 = blocked by Gate 1 (not model+market consensus)')
+    st.caption('🚦 = passes all three V5.31.0 gates · 🚫 = blocked by Gate 1 (not model+market consensus)')
 
-    # ── V5.30.0 Per-City Gate Status ──
+    # ── V5.31.0 Per-City Gate Status ──
     city_pick = qualifying_picks.get(city)
     if city_pick:
         side_color = '#00ff88' if city_pick['side'] == 'YES' else '#00b4d8'
         st.success(
-            f'✅ V5.30.0 GATE STATUS: PASS — {city_pick["label"]} {city_pick["side"]} @ {city_pick["price"]}c · '
+            f'✅ V5.31.0 GATE STATUS: PASS — {city_pick["label"]} {city_pick["side"]} @ {city_pick["price"]}c · '
             f'+{city_pick["edge"]}c · Kelly ${city_pick["kelly"]} · Trust 🎯 {city_pick["trust_accuracy"]} · {city_pick["gate_reason"]}'
         )
     else:
         rejected_reason = rejected_cities.get(city, 'Did not pass three-gate filter')
-        st.warning(f'⏸️ V5.30.0 GATE STATUS: REJECTED — {rejected_reason}')
+        st.warning(f'⏸️ V5.31.0 GATE STATUS: REJECTED — {rejected_reason}')
 
 
 # ── Per-City Quality Score Panel ──
@@ -3260,4 +3353,4 @@ if bet_log_unlocked:
                                 st.error('Delete failed.')
 
 st.markdown('---')
-st.caption('🌡️ MPH Weather Model V5.30.0 — Three research-validated gates active · Aug 18 consensus-floor + ladder-normalization fixes')
+st.caption('🌡️ MPH Weather Model V5.31.0 — NBM ladder anchored on consensus · Three research-validated gates active · Aug 18 consensus-floor + ladder-normalization fixes')
