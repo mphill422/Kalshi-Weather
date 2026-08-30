@@ -1,6 +1,6 @@
 # MPH Weather Model — Punchlist / State of Things
 
-_Last updated: 2026-08-29. Live model: **V5.31.0** (deployed tonight). Bankroll still paper._
+_Last updated: 2026-08-30. Live model: **V5.31.1**. Bankroll still paper._
 
 This is the durable record. My (Claude's) memory carries summarized facts across
 chats but is not guaranteed complete — THIS FILE is the source of truth.
@@ -9,15 +9,52 @@ chats but is not guaranteed complete — THIS FILE is the source of truth.
 
 ## CURRENT STATE
 
-- **Highs model: V5.31.0** in `streamlit_app.py` + `fetch_weather.py`. 18 cities.
+- **Highs model: V5.31.1.** `streamlit_app.py` is at V5.31.0; `fetch_weather.py`
+  is at V5.31.1 (adds `nbm_p50` storage — measurement only, no ladder math, so
+  the two files still pick identical brackets). 18 cities.
 - **Active auto tag:** `AUTO_GATED_V2`, ≥60¢ price floor.
 - **Research paper tags: `V531_PAPER_YES_{EDGE,CONVICTION}_{T75,T80}`** — bumped
-  from V530_ tonight because bracket selection changed. **Never pool V530_ and
-  V531_ rows.** The V530_ rows are the pre-change baseline.
+  from V530_ because bracket selection changed. **Never pool V530_ and V531_
+  rows.** The V530_ rows are the pre-change baseline.
 - **No real-money bet since May.**
 - **Two independent tracks are now further along than the automated model:**
   the manual research (schedule below, backed by 25 days of Kalshi's own
   settled data) and the lows infrastructure.
+
+---
+
+## ⏱️ CHECKPOINTS — read this before waiting on anything
+
+The failure pattern to break: wait out a full validation window, discover a
+defect at the end, fix it, start the clock over. That has now happened four
+times since May. **Every checkpoint below fires WELL BEFORE 50 settled bets and
+each one can independently say "stop, this is wrong."** They are not milestones
+on the way to the answer — they are early aborts.
+
+| when | check | what failure looks like | if it fails |
+|---|---|---|---|
+| **Next firing window** (14:00 / 15:30 / 16:30 / 18:30 UTC) | Actions log for `🎯 V5.31 NBM anchor:` lines | shifts scattered around zero instead of clustering positive | the "NBM runs cold" premise is wrong. Do NOT wait 7 weeks. Lower `NBM_CONSENSUS_ANCHOR` or reconsider the whole diagnosis. |
+| **~1 week** | re-run bracket_mid − consensus | still near −1.48, hasn't moved toward 0 | the anchor is not reaching bet selection — a plumbing bug, not a modelling question. Find it before collecting more rows. |
+| **~10 days** | `nbm_p50` vs actual (query below) | `nbm_err` near zero while `consensus_err` is worse | anchoring toward consensus is pulling toward the WEAKER estimate. Lower the anchor or revert to 0.0. |
+| **~2 weeks** | `V531_` row count and price distribution | far fewer picks than V530_, or all clustered ≥90¢ | Gate 1 or the price floor is now rejecting everything. A model that never bets cannot be validated. |
+| **3–7 weeks** | 50 settled `V531_` bets, per-tag | — | only this answers whether it HELPED. |
+
+The 10-day query:
+
+```sql
+select city,
+       count(*) as n,
+       round(avg(actual::numeric - nbm_p50::numeric), 2)     as nbm_err,
+       round(avg(actual::numeric - consensus::numeric), 2)   as consensus_err
+from settlements
+where actual is not null and nbm_p50 is not null
+group by city order by nbm_err desc;
+```
+
+Positive `nbm_err` = NBM ran cold = V5.31 was right.
+
+**Meanwhile the manual track runs independently and needs no model validation.**
+Waiting on the model is not a reason to do nothing for seven weeks.
 
 ---
 
@@ -76,28 +113,37 @@ lands on consensus. **NBM supplies the SHAPE, consensus supplies the CENTER.**
 app and cron pick different brackets. Set to 0.0 to revert exactly to V5.30 —
 that is the entire rollback procedure.
 
-### ⚠️ The honest caveat
+### ⚠️ The honest caveat — now being measured (V5.31.1)
 
 We measured that the bracket sits below consensus, and that consensus is
-calibrated. We **never measured NBM p50 against actual** — NBM percentiles are
-fetched live and never stored, so there is no history to check. "NBM runs cold"
-is an INFERENCE from the offset, not an observation. If NBM is right and
-consensus is wrong on the days that matter, this makes things worse.
+calibrated. We **never measured NBM p50 against actual** — NBM percentiles were
+fetched live and thrown away, so there was no history to check. "NBM runs cold"
+was an INFERENCE from the offset, not an observation. If NBM is right and
+consensus is wrong on the days that matter, this change makes things worse.
 
-`fetch_nbm_percentiles()` now carries a note: storing p50 alongside consensus in
-the settlements upsert would settle this in about ten days. Worth doing.
+**V5.31.1 (2026-08-30) closes that hole.** `settlements.nbm_p50` now stores the
+value, so the premise becomes checkable in ~10 days instead of remaining an
+assumption underneath a change that affects every bet. See CHECKPOINTS.
 
-### What to check, and when
+Implementation notes:
+- `ALTER TABLE public.settlements ADD COLUMN IF NOT EXISTS nbm_p50 NUMERIC(6,2);`
+- Storage only. Nothing reads the column — no ladder math touched, so
+  `streamlit_app.py` at V5.31.0 and `fetch_weather.py` at V5.31.1 still pick
+  identical brackets. **The validation window is NOT reset by this.**
+- NBM is fetched only during firing windows, so `nbm_p50` is NULL on other runs.
+  ~5 readings per city-day, which is plenty.
+- On an existing row `nbm_p50` is only overwritten when non-null, so a later
+  non-window run cannot blank out a p50 an earlier window run stored. This was a
+  real bug risk, not a theoretical one — `sb_upsert` runs on every pass.
 
-1. **Next firing window** — Actions log prints
-   `🎯 V5.31 NBM anchor: p50=91.0F → consensus=92.4F (shift +1.4F, weight 1.0)`
-   per city. If shifts cluster positive, NBM was running cold and the diagnosis
-   holds. If scattered around zero, the diagnosis was wrong — find that out
-   immediately, not in a month.
-2. **~1 week** — re-run bracket_mid − consensus. Should move −1.48 → ~0.
-   That confirms the MECHANISM.
-3. **3–7 weeks** — 50 settled `V531_` bets. That is the only thing that answers
-   whether it HELPED. At 1–3 picks/day there is no shortcut.
+### Aside: "didn't NBM already fail?"
+
+NBM was tried and dropped in the **MANUAL research** — as a standalone forecast
+read against the market. **That says little about its use here.** In the model
+NBM supplies the SHAPE of a probability distribution across brackets, and as of
+V5.31 it no longer sets the center at all. Different question. But it does raise
+the value of the `nbm_p50` measurement: if NBM's central estimate was poor in
+manual work, we want to know whether it is poor here too.
 
 ---
 
@@ -184,13 +230,62 @@ own favorite once the outcome is nearly locked.
 
 **Log the TOP BRACKET only, at three passes:**
 
-| Pass | Band | Basis |
-|---|---|---|
-| **10:30–11:00 AM ET** | 60–69¢ | +16.93 / +10.80 |
-| **12:00 PM ET** | 60–69¢ | +12.18 |
-| **4:00 PM ET** | 70–79¢ (60–69 also OK) | +6.36 / +4.38 |
+| Pass | Band |
+|---|---|
+| **10:30–11:00 AM ET** | **58–69¢** |
+| **12:00 PM ET** | **58–69¢** |
+| **4:00 PM ET** | **58–79¢** |
 
-### The finding that matters: the BAND, not the minute
+All prices are **ASK**, not mid. You pay the ask. An earlier sweep done on mid
+overstated the 55–59 band by 1–2 points and produced numbers that did not
+reproduce — if two analyses of this data ever disagree, check which price they
+used first.
+
+### ⚠️ THE FLOOR IS 58, NOT 60 — corrected 2026-08-30
+
+Splitting the 50s revealed the earlier "55–59 doesn't work" conclusion was
+averaging two different populations. 10am–1pm ET, ask price:
+
+| band | n | win% | avg ask | P&L |
+|---|---|---|---|---|
+| 55–57 | 246 | 53.7% | 56.0¢ | **−2.38** |
+| **58–59** | **174** | **64.9%** | **58.5¢** | **+6.44** |
+| **60–64** | **392** | **68.6%** | **61.9¢** | **+6.69** |
+
+**58–59 behaves like 60–64, not like 55–57.** +6.44 vs +6.69 — statistically
+indistinguishable, on samples of 174 and 392. Meanwhile 55–57 is clearly
+negative on 246 observations, so this is not a thin-cell artifact.
+
+Confirmed independently at 4pm ET: 55–57 −2.09, everything ≥58 positive. **The
+58 line holds at both times of day**, which makes it far more credible than a
+single cut would be.
+
+Moving the floor from 60 to 58 adds roughly 30% more opportunities with no
+measurable loss of edge.
+
+### The ceiling is ~69 in the morning, ~79 in the afternoon
+
+Checked whether the ceiling is soft the way the floor was. 10:00–12:30 ET:
+
+| band | n | win% | P&L |
+|---|---|---|---|
+| **58–69** | **597** | **72.9%** | **+10.16** |
+| 70 | 31 | 71.0% | +0.97 |
+| 71–72 | 45 | 80.0% | +8.62 |
+| 73–79 | 117 | 73.5% | −2.20 |
+| 80+ | 57 | 84.2% | −2.60 |
+
+**Do not extend the morning ceiling.** 71–72 looks good but sits between +0.97
+and −2.20 on cells of 31–45. Adjacent cent-wide bands swinging break-even →
++8.62 → negative is what happens when 250 observations get sliced into pieces of
+30. Contrast the 58 finding, which had a clean shape on 174/392/246. **58–69 is
+the largest cell in the table at n=597 and the answer.**
+
+**The morning/afternoon asymmetry is real:** in the morning the 70s are dead or
+noisy; at 4pm the 70s are the BEST band (+7.33, n=260). A 74¢ favorite at 10:30
+is priced on a forecast; at 4pm it is priced on a high that has already happened.
+
+### The other finding: the BAND, not the minute
 
 60–69¢ was positive at **10 of 11 hours** and at **all twelve 15-minute slices**
 tested between 10am and 1pm:
@@ -205,10 +300,10 @@ beats 12:45 because of the cost-of-certainty curve" did NOT survive — the same
 four-point decline inside the noon hour does not appear inside the 10am or 11am
 hours. Average across all twelve is ~+10¢. **Pick a time that fits the day.**
 
-### The CEILING does the work, not the floor
+### A BAND, never an open-ended floor
 
-Open-ended floors are all bad because they drag in the 80+ tier, which wins
-85–96% and pays nothing at 87–94¢:
+Open-ended floors all fail because they drag in the 80+ tier, which wins 85–96%
+and pays nothing at 87–94¢:
 
 | floor | negative at |
 |---|---|
@@ -216,13 +311,7 @@ Open-ended floors are all bad because they drag in the 80+ tier, which wins
 | 55c+ | 6 of 11 hours |
 | 60c+ | 7 of 11 hours |
 
-The **band** 60–69 was positive at 10 of 11. **Screen 60–69, not "60 and over."**
-
-### 55–59 does not hold up
-
-Across 9:00–11:30 ET: +6.89, +2.91, −1.02, −0.14, +8.27, +0.84. Three near zero,
-one negative, flips sign. Average ~+2.9 against 60–69's ~+8.3. **Skip it.**
-(Logging those rows anyway to build your own sample is defensible — costs a line.)
+**Screen 58–69, not "58 and over."** The ceiling matters as much as the floor.
 
 ### The afternoon trend — the most convincing pattern found
 
@@ -233,10 +322,17 @@ one negative, flips sign. Average ~+2.9 against 60–69's ~+8.3. **Skip it.**
 | 4pm | +4.38 | +6.36 | 80.6% |
 | 5pm | +7.17 | **+10.41** | 84.6% |
 
-**Win rate climbs 66.7% → 84.6% while the price stays flat near 74¢.** That is
-the market failing to reprice as certainty increases — a cleaner structural
-signal than anything in the morning cells. 5pm is best; 4pm gives up ~4¢ for a
-workable hour; 3pm is where it gets thin.
+**Win rate climbs 66.7% → 84.6% while the price stays flat near 74¢.** The market
+fails to reprice as certainty increases — a cleaner structural signal than
+anything in the morning cells, because it is a consistent trend across eight
+cells rather than one good number.
+
+5pm is best; **4pm gives up ~4¢ for a workable hour**; 3pm is where it thins out.
+
+At 4pm the full band breakdown: 55–57 −2.09 (n=54), 58–59 +21.40 (n=50),
+60–69 +6.48 (n=242), 70–79 +7.33 (n=260). **Discount that 58–59 number** — 80%
+win at 58.6¢ is out of line with both neighbours and is what 50 observations
+produce by chance. "58–59 works," not "58–59 is triple the others."
 
 ### Per-city (12:45 ET, 60c+, before the ceiling was established)
 
@@ -361,21 +457,16 @@ The market is nearly unbiased (avg −0.44). **This is what V5.31 addresses.**
 
 ## HOUSEKEEPING
 
-- **⚠️ RLS DISABLED on `kalshi_settlements` and `kalshi_candles`** (Supabase
-  Security Advisor, 2 errors). Those tables predate the pattern used everywhere
-  else. Fix:
-  ```sql
-  ALTER TABLE public.kalshi_settlements ENABLE ROW LEVEL SECURITY;
-  CREATE POLICY "Allow all access" ON public.kalshi_settlements
-    FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);
-  ALTER TABLE public.kalshi_candles ENABLE ROW LEVEL SECURITY;
-  CREATE POLICY "Allow all access" ON public.kalshi_candles
-    FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);
-  ```
-  Note this satisfies the linter without actually securing anything — a
-  `USING (true)` policy is permissive by design, and tightening it would break
-  the scripts, which use the anon key. Real hardening is a separate item.
+- ✅ **RLS enabled on `kalshi_settlements` and `kalshi_candles`** (2026-08-30).
+  The permissive policies already existed; only RLS itself was off, so the two
+  ALTERs were sufficient. **This secures nothing** — a `USING (true)` policy is
+  permissive by design, and tightening it would break the scripts, which use the
+  anon key. It clears the Security Advisor errors and matches how every other
+  table is configured. Real hardening remains a separate, unstarted item.
 - Three `dfs_*` Security Definer View errors are from the DFS project, unrelated.
+- **Neither of the above touches the model.** `kalshi_candles` and
+  `kalshi_settlements` are research tables; nothing in `streamlit_app.py` or
+  `fetch_weather.py` reads them.
 - `kalshi_survey.py` (series discovery scanner) has moved into this repo. It
   scans a category for series with 5+ settled events in 30 days. Defaults to
   `CATEGORY=Economics`.
@@ -406,7 +497,15 @@ The market is nearly unbiased (avg −0.44). **This is what V5.31 addresses.**
   flag its source provides.
 - **Do not read ordering out of thin cells.** Twelve 15-minute cells of ~80
   correlated observations produced a scatter, and an earlier reading of it as a
-  trend did not survive more data.
+  trend did not survive more data. Same trap caught the 71–72 cell.
+- **Always use ASK, never mid.** You pay the ask. Mid overstates every result by
+  1–2 points. This caused two analyses of the same data to disagree on 55–59.
+- **A band that comes out near zero may be two populations averaged together.**
+  "55–59 doesn't work" was really 55–57 losing and 58–59 working. Before killing
+  a band, split it.
+- **Check every checkpoint on schedule.** The recurring failure is waiting out a
+  full window, finding a defect at the end, and restarting the clock. Four times
+  since May.
 - Real-money config when go-live: $5 flat/bet, YES-only, conviction tier
   preferred, skip Phoenix (bracket-width problem), max 3–5 bets/day.
 
@@ -414,18 +513,20 @@ The market is nearly unbiased (avg −0.44). **This is what V5.31 addresses.**
 
 ## NEXT
 
+**Done 2026-08-30:** RLS fix · `nbm_p50` column + V5.31.1 · lows backfill
+(`kalshi_lows_candles` 425,915 rows / `kalshi_lows_settlements` 3,702) · the 58
+floor correction.
+
 **Immediate:**
-- RLS fix (2 statements).
-- Fee calculation on the lows +1.32 — does it survive Kalshi's per-contract fee?
-- Check the V5.31 anchor lines in the next Actions run.
+- **Fee calculation on the lows +1.32** — does it survive Kalshi's per-contract
+  fee? If not, that closes lows for now and saves building further on it.
+- Start logging the manual schedule (58–69 morning, 58–79 at 4pm). **This does
+  not depend on the model and can begin immediately.**
 
-**~1 week:** re-run bracket_mid − consensus, expect movement toward zero.
-
-**3–7 weeks:** 50 settled `V531_` bets.
+**Timed:** see CHECKPOINTS at the top. Next firing window → ~1 week → ~10 days →
+~2 weeks → 3–7 weeks, each an independent abort point.
 
 **Queued, not started:**
-- Store NBM p50 in the settlements upsert — would let us verify the "NBM runs
-  cold" inference directly in ~10 days instead of leaving it as an assumption.
 - Gate volume audit (needs market hours at the Mac; has slipped repeatedly).
 - SPREAD skip filter — manual-grid evidence strong (spread ≤1° → ~88% bracket
   accuracy; >2° → ~25%).
