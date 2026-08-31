@@ -1,6 +1,26 @@
 name: Kalshi Survey
 on:
   workflow_dispatch:
+    inputs:
+      category:
+        description: 'Kalshi category to scan'
+        required: true
+        default: 'Financials'
+        type: choice
+        options:
+          - Financials
+          - Crypto
+          - Economics
+          - Climate and Weather
+          - Companies
+          - Politics
+          - Sports
+          - Health
+          - World
+      min_events:
+        description: 'Minimum settled events in 30 days'
+        required: false
+        default: '20'
 jobs:
   survey:
     runs-on: ubuntu-latest
@@ -14,5 +34,6 @@ jobs:
       - env:
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
-          CATEGORY: "Economics"
+          CATEGORY: ${{ inputs.category }}
+          MIN_EVENTS: ${{ inputs.min_events }}
         run: python kalshi_survey.py
