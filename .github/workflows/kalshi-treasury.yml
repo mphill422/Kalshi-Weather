@@ -1,0 +1,27 @@
+name: Kalshi Treasury Backfill
+on:
+  workflow_dispatch:
+    inputs:
+      days_back:
+        description: 'Days of history to pull'
+        required: false
+        default: '30'
+jobs:
+  treasury:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests cryptography
+      - name: Treasury candles + settlements
+        env:
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DAYS_BACK: ${{ inputs.days_back }}
+          CATEGORY: "Financials"
+        run: python kalshi_treasury_backfill.py
