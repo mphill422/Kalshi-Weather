@@ -1,0 +1,29 @@
+name: Favorites
+on:
+  schedule:
+    # Cron is UTC and does NOT follow DST, so each ET window is scheduled twice:
+    # once for EDT (UTC-4, Mar-Nov) and once for EST (UTC-5, Nov-Mar). The
+    # script itself checks Eastern local time through pytz and only fires when
+    # the window is genuinely open, so the off-season entry is a harmless no-op.
+    - cron: '30 14 * * *'   # 10:30 ET (EDT)
+    - cron: '30 15 * * *'   # 10:30 ET (EST)
+    - cron: '0 16 * * *'    # 12:00 ET (EDT)
+    - cron: '0 17 * * *'    # 12:00 ET (EST)
+    - cron: '0 20 * * *'    # 16:00 ET (EDT)
+    - cron: '0 21 * * *'    # 16:00 ET (EST)
+    - cron: '0 13 * * *'    # settlement sweep, morning ET
+  workflow_dispatch:
+jobs:
+  favorites:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests pytz
+      - env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python fetch_favorites.py
