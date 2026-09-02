@@ -40,6 +40,12 @@ summer days. Backtests on a fixed window are exactly how the last four models
 looked good before losing money. Run it on paper, per-tag, and judge it on
 settled rows.
 
+⚠️ SET THE KILL LINE BEFORE THE DATA ARRIVES. The 10:30 cell (+18.45) is the
+most extreme number in the set and rests on the fewest rows (n=93). If forward
+results come in materially lower there, that is regression toward the mean and
+was the expected outcome, not a surprise. Decide now what win rate over what
+sample retires MORNING, so the threshold is not chosen after seeing the result.
+
 BAND DEFINITIONS — where the numbers came from
 -----------------------------------------------
 FLOOR = 58, not 60, and not 55. Measured 10am-1pm ET, ask price:
@@ -90,6 +96,32 @@ probably WHY the afternoon certainty curve exists. Winter highs are driven by
 frontal timing. The bands, the hours, and the per-city ordering may all move.
 Re-run the band analysis each season rather than treating 58-79 as permanent.
 
+THE LATCH — why the window is one-sided, not ±10 minutes
+---------------------------------------------------------
+GitHub Actions scheduled runs do not start on time. On shared runners they
+start LATE — commonly 5-20 minutes, occasionally more — and never early. A
+symmetric ±10 minute tolerance therefore discards the entire late half of a
+distribution that is entirely late, and does so silently: the run succeeds, logs
+"no window active", and nothing is recorded.
+
+So the check is one-sided: fire if ET time is at or after the window target and
+within WINDOW_LATCH_MIN of it. Negative deltas (early) never fire, which also
+means the off-season DST twin cron declines cleanly on its own.
+
+The cost of a latch is drift. A 16:00 bet placed at 16:24 is not the same bet —
+the afternoon certainty curve moves fast, and price at entry is the whole
+strategy. Two guards:
+  1. minutes_late is stored on every row. If drift is routine, it is visible
+     in the data rather than inferred, and the band analysis can be re-cut
+     against actual entry time.
+  2. a window that already has rows for today is skipped entirely, so a retry
+     cron cannot append later-priced entries alongside on-time ones.
+Guard 2 has one hole: if a window fires on time and NOTHING qualified (all
+cities out of band), there are no rows, and a retry 12 minutes later will run
+and may log at the later price. This is rare and self-limiting at a 25-minute
+latch, but it is a known way for a few late entries to enter the sample.
+minutes_late is what makes those findable.
+
 CITIES
 ------
 No forecast means no per-city calibration, which means no reason to restrict the
@@ -112,6 +144,19 @@ we are scoring a contract, not a temperature, so any bracket-boundary or
 rounding disagreement between our arithmetic and Kalshi's settlement is removed
 entirely. The weather model's CLI-based settlement stays as it is; that file
 answers a different question.
+
+FEES
+----
+`profit` remains GROSS, exactly as before, so every number already in the table
+stays comparable. `fee_dollars` and `net_profit` are stored alongside it.
+
+FEE_CENTS = 3.6 is backed out from a SINGLE Kalshi ticket. One observation is
+not a fee schedule. Kalshi's fee is a function of price, so a flat cent figure
+is an approximation that will be least accurate at the ends of the band —
+exactly where the afternoon numbers live. Confirm against a second settled
+ticket at a different price before treating any net figure as decided. The
+afternoon band nets ~+3.7 on this assumption, which is thin enough that a
+half-cent error changes the conclusion.
 
 CREATE THE TABLE ONCE (Supabase SQL editor):
 
@@ -141,13 +186,14 @@ CREATE THE TABLE ONCE (Supabase SQL editor):
   CREATE INDEX IF NOT EXISTS idx_fav_date ON public.favorites_bets (date);
   CREATE INDEX IF NOT EXISTS idx_fav_tag ON public.favorites_bets (strategy_tag);
 
-The UNIQUE (date, city, window_label) is what makes a double workflow run safe.
+RUN THIS ONCE MORE for the new columns (safe on an existing table):
 
-⚠️ FEES ARE NOT MODELLED. Every P&L number in this file and in the table is
-gross. Kalshi charges per contract and it is not trivial at these prices. Before
-any of this becomes a real-money decision, compute the fee on a 5-contract
-$5 ticket at 63c and subtract it from the +14 morning estimate. That calculation
-has not been done.
+  ALTER TABLE public.favorites_bets
+    ADD COLUMN IF NOT EXISTS minutes_late INTEGER,
+    ADD COLUMN IF NOT EXISTS fee_dollars  NUMERIC(8,4),
+    ADD COLUMN IF NOT EXISTS net_profit   NUMERIC(10,4);
+
+The UNIQUE (date, city, window_label) is what makes a double workflow run safe.
 
 Secrets: SUPABASE_URL, and SUPABASE_SERVICE_KEY or SUPABASE_KEY.
 No Kalshi credentials needed — the markets endpoint is public.
@@ -172,6 +218,10 @@ ET = pytz.timezone("America/New_York")
 STAKE = 5.0
 TAG_PREFIX = "FAV_V1"
 
+# Per-contract fee, backed out from ONE Kalshi ticket. See FEES in the docstring.
+# Applied to net_profit only; `profit` stays gross.
+FEE_CENTS = 3.6
+
 # Windows in EASTERN LOCAL TIME. pytz resolves DST, so these stay correct in
 # November when ET moves from UTC-4 to UTC-5.
 #   (hour, minute, label, band_low_cents, band_high_cents_exclusive)
@@ -180,7 +230,10 @@ WINDOWS = [
     (12,  0, "MIDDAY",    58, 70),
     (16,  0, "AFTERNOON", 58, 80),
 ]
-WINDOW_TOLERANCE_MIN = 10
+
+# One-sided latch, in minutes AFTER the window target. Runner queue delay is
+# always late, never early, so an early delta must never fire. See THE LATCH.
+WINDOW_LATCH_MIN = 25
 
 SERIES = {
     "New York":       "KXHIGHNY",
@@ -231,6 +284,27 @@ def insert_bet(row):
     except Exception as e:
         print(f"    insert failed: {type(e).__name__}: {str(e)[:120]}")
         return False
+
+
+def window_already_logged(date_str, label):
+    """True if this (date, window) already has rows.
+
+    Fails OPEN on any error: if we cannot tell, we proceed and let the UNIQUE
+    constraint do the work. That is the safer default — a missed window loses a
+    day of sample, a duplicate insert is simply ignored by the constraint.
+    """
+    try:
+        r = requests.get(
+            sb_url("favorites_bets"),
+            headers=sb_headers(),
+            params={"date": f"eq.{date_str}", "window_label": f"eq.{label}",
+                    "select": "id", "limit": "1"},
+            timeout=15)
+        if r.status_code == 200:
+            return len(r.json()) > 0
+    except Exception:
+        pass
+    return False
 
 
 def fetch_pending():
@@ -325,11 +399,31 @@ def top_bracket(markets):
     return m, a, sigma_p, len(priced)
 
 
+def fee_for(amount, price_cents):
+    """Estimated round-trip fee in dollars on a stake at a given ask.
+
+    contracts = stake / (price in dollars). Flat per-contract approximation —
+    see FEES. Returns 0.0 on a nonsense price rather than raising.
+    """
+    try:
+        p = float(price_cents)
+        if p <= 0:
+            return 0.0
+        contracts = float(amount) * 100.0 / p
+        return round(contracts * (FEE_CENTS / 100.0), 4)
+    except Exception:
+        return 0.0
+
+
 # ── Logging pass ─────────────────────────────────────────────────────────────
-def run_window(label, band_lo, band_hi, now_et):
+def run_window(label, band_lo, band_hi, now_et, minutes_late):
     today = now_et.strftime("%Y-%m-%d")
     tag = f"{TAG_PREFIX}_{label}"
-    print(f"\n=== {label} window | band {band_lo}-{band_hi - 1}c | {today} ===")
+    print(f"\n=== {label} window | band {band_lo}-{band_hi - 1}c | {today} "
+          f"| {minutes_late} min after target ===")
+    if minutes_late >= 10:
+        print(f"  ⚠️ entry drift: {minutes_late} min late. Price at entry is the "
+              f"strategy; check minutes_late across the sample.")
 
     logged, skipped_band, skipped_nomarket = [], 0, 0
 
@@ -371,6 +465,8 @@ def run_window(label, band_lo, band_hi, now_et):
             "amount": STAKE,
             "result": "Pending",
             "placed_at": now_et.isoformat(),
+            "minutes_late": minutes_late,
+            "fee_dollars": fee_for(STAKE, ask),
         }
         if insert_bet(row):
             logged.append(f"{city} {bracket} @ {ask}c")
@@ -381,6 +477,9 @@ def run_window(label, band_lo, band_hi, now_et):
         time.sleep(0.25)
 
     print(f"\n  logged {len(logged)} | out of band {skipped_band} | no ladder {skipped_nomarket}")
+    if not logged:
+        print("  (no rows written — a retry cron may fire this window again; "
+              "any such entry will carry a larger minutes_late)")
     return logged
 
 
@@ -405,6 +504,7 @@ def settle():
         return
 
     won = lost = 0
+    gross = net = 0.0
     for et_ticker, bets in by_event.items():
         if not et_ticker:
             continue
@@ -422,9 +522,21 @@ def settle():
             else:
                 profit = round(-amount, 2)
                 lost += 1
+
+            fee = b.get("fee_dollars")
+            if fee is None:
+                fee = fee_for(amount, price)
+            fee = float(fee)
+            net_profit = round(profit - fee, 4)
+
+            gross += profit
+            net += net_profit
+
             update_bet(b["id"], {
                 "result": "Won" if res == "yes" else "Lost",
                 "profit": profit,
+                "fee_dollars": fee,
+                "net_profit": net_profit,
                 "settled_at": dt.datetime.now(ET).isoformat(),
             })
         time.sleep(0.25)
@@ -432,6 +544,8 @@ def settle():
     n = won + lost
     if n:
         print(f"  settled {n}: {won} won, {lost} lost ({100.0*won/n:.1f}%)")
+        print(f"  gross ${gross:+.2f} | net ${net:+.2f} "
+              f"(fee est. {FEE_CENTS}c/contract, one-ticket basis)")
     else:
         print("  no results available yet")
 
@@ -440,24 +554,39 @@ def settle():
 def main():
     now_et = dt.datetime.now(ET)
     print(f"FAV V1 | {now_et:%Y-%m-%d %H:%M} ET | {len(SERIES)} cities")
-    print("no forecast — buying the market's own favorite, in band\n")
+    print("no forecast — buying the market's own favorite, in band")
+    print(f"latch: fires 0 to +{WINDOW_LATCH_MIN} min after target, never early\n")
 
+    today = now_et.strftime("%Y-%m-%d")
     fired = False
+
     for hh, mm, label, lo, hi in WINDOWS:
         target = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        delta_min = abs((now_et - target).total_seconds()) / 60.0
-        if delta_min <= WINDOW_TOLERANCE_MIN:
-            run_window(label, lo, hi, now_et)
+        delta_min = (now_et - target).total_seconds() / 60.0
+
+        # One-sided: early never fires. This is also what makes the off-season
+        # DST twin cron decline cleanly.
+        if not (0 <= delta_min <= WINDOW_LATCH_MIN):
+            continue
+
+        if window_already_logged(today, label):
+            print(f"({label} already has rows for {today} — skipping, "
+                  f"this run is a retry that arrived after a successful one)")
             fired = True
+            continue
+
+        run_window(label, lo, hi, now_et, int(round(delta_min)))
+        fired = True
 
     if not fired:
-        nearest = min(
-            WINDOWS,
-            key=lambda w: abs((now_et - now_et.replace(
-                hour=w[0], minute=w[1], second=0, microsecond=0)).total_seconds()))
-        print(f"(no window active — nearest is {nearest[2]} "
-              f"at {nearest[0]:02d}:{nearest[1]:02d} ET, "
-              f"tolerance ±{WINDOW_TOLERANCE_MIN} min)")
+        def mins_until(w):
+            t = now_et.replace(hour=w[0], minute=w[1], second=0, microsecond=0)
+            d = (t - now_et).total_seconds() / 60.0
+            return d if d >= 0 else d + 1440.0
+        nxt = min(WINDOWS, key=mins_until)
+        print(f"(no window active — next is {nxt[2]} at "
+              f"{nxt[0]:02d}:{nxt[1]:02d} ET, in {mins_until(nxt):.0f} min; "
+              f"latch is 0 to +{WINDOW_LATCH_MIN} min after target)")
 
     settle()
 
@@ -465,8 +594,10 @@ def main():
     print("  select strategy_tag, count(*) n,")
     print("         sum((result='Won')::int) wins,")
     print("         round(100.0*avg((result='Won')::int),1) win_pct,")
-    print("         round(sum(profit),2) total_profit,")
-    print("         round(avg(yes_ask_cents),1) avg_ask")
+    print("         round(sum(profit),2) gross_profit,")
+    print("         round(sum(net_profit),2) net_profit,")
+    print("         round(avg(yes_ask_cents),1) avg_ask,")
+    print("         round(avg(minutes_late),1) avg_min_late")
     print("  from favorites_bets where result<>'Pending'")
     print("  group by strategy_tag order by strategy_tag;")
 
