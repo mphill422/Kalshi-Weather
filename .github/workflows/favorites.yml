@@ -5,13 +5,32 @@ on:
     # once for EDT (UTC-4, Mar-Nov) and once for EST (UTC-5, Nov-Mar). The
     # script itself checks Eastern local time through pytz and only fires when
     # the window is genuinely open, so the off-season entry is a harmless no-op.
+    #
+    # Each window also has a +12 and +24 minute retry. GitHub Actions scheduled
+    # runs start LATE on shared runners (commonly 5-20 min, occasionally more),
+    # never early. The retries mean a delayed run still lands. Double-firing is
+    # safe: the script skips a window that already has rows for today, and
+    # UNIQUE (date, city, window_label) is the backstop.
     - cron: '30 14 * * *'   # 10:30 ET (EDT)
+    - cron: '42 14 * * *'   # 10:30 ET (EDT) retry +12
+    - cron: '54 14 * * *'   # 10:30 ET (EDT) retry +24
     - cron: '30 15 * * *'   # 10:30 ET (EST)
+    - cron: '42 15 * * *'   # 10:30 ET (EST) retry +12
+    - cron: '54 15 * * *'   # 10:30 ET (EST) retry +24
     - cron: '0 16 * * *'    # 12:00 ET (EDT)
+    - cron: '12 16 * * *'   # 12:00 ET (EDT) retry +12
+    - cron: '24 16 * * *'   # 12:00 ET (EDT) retry +24
     - cron: '0 17 * * *'    # 12:00 ET (EST)
+    - cron: '12 17 * * *'   # 12:00 ET (EST) retry +12
+    - cron: '24 17 * * *'   # 12:00 ET (EST) retry +24
     - cron: '0 20 * * *'    # 16:00 ET (EDT)
+    - cron: '12 20 * * *'   # 16:00 ET (EDT) retry +12
+    - cron: '24 20 * * *'   # 16:00 ET (EDT) retry +24
     - cron: '0 21 * * *'    # 16:00 ET (EST)
-    - cron: '0 13 * * *'    # settlement sweep, morning ET
+    - cron: '12 21 * * *'   # 16:00 ET (EST) retry +12
+    - cron: '24 21 * * *'   # 16:00 ET (EST) retry +24
+    - cron: '0 13 * * *'    # settlement sweep, 09:00 ET (EDT)
+    - cron: '0 14 * * *'    # settlement sweep, 09:00 ET (EST)
   workflow_dispatch:
 jobs:
   favorites:
