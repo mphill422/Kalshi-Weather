@@ -1,6 +1,7 @@
 # MPH Weather Model — Punchlist / State of Things
 
-_Last updated: 2026-08-30. Live model: **V5.31.1**. Bankroll still paper._
+_Last updated: 2026-09-02. Live model: **V5.31.1**. New: **FAV V1** (paper).
+Bankroll still paper._
 
 This is the durable record. My (Claude's) memory carries summarized facts across
 chats but is not guaranteed complete — THIS FILE is the source of truth.
@@ -12,14 +13,47 @@ chats but is not guaranteed complete — THIS FILE is the source of truth.
 - **Highs model: V5.31.1.** `streamlit_app.py` is at V5.31.0; `fetch_weather.py`
   is at V5.31.1 (adds `nbm_p50` storage — measurement only, no ladder math, so
   the two files still pick identical brackets). 18 cities.
+- **FAV V1: deployed 2026-09-01, paper.** `fetch_favorites.py` + `favorites.yml`.
+  Buys the market's own favorite, in band, at three ET windows. **No forecast.**
+  This is the OPPOSITE bet from the weather model — see FAV V1 below.
 - **Active auto tag:** `AUTO_GATED_V2`, ≥60¢ price floor.
 - **Research paper tags: `V531_PAPER_YES_{EDGE,CONVICTION}_{T75,T80}`** — bumped
   from V530_ because bracket selection changed. **Never pool V530_ and V531_
   rows.** The V530_ rows are the pre-change baseline.
+- **FAV tags: `FAV_V1_{MORNING,MIDDAY,AFTERNOON}`.** Separate population from
+  everything above. Never pool with V531_.
 - **No real-money bet since May.**
-- **Two independent tracks are now further along than the automated model:**
-  the manual research (schedule below, backed by 25 days of Kalshi's own
-  settled data) and the lows infrastructure.
+- **Fees are now measured, not assumed** (2026-09-01). This closed lows and
+  treasuries in one afternoon. See FEES.
+
+---
+
+## 💸 FEES — measured, and it closed two lines of work
+
+**~3.6¢ per contract, backed out from a real Kalshi ticket** (2026-09-01).
+
+Applying it to bands that were previously reported gross:
+
+| band | gross | net (est.) | verdict |
+|---|---|---|---|
+| highs morning 58–69 | ~+14 | **~+10.4** | survives comfortably |
+| highs afternoon 58–79 | ~+7.3 | **~+3.7** | survives, thin |
+| lows 60–69 | +1.32 | **negative** | **CLOSED** |
+| treasuries 58–69 | +4.15 | **does not clear** | **CLOSED** |
+
+**⚠️ This is ONE observation.** Kalshi's fee is a function of price, so a flat
+cent figure is an approximation and is least accurate at the ends of a band —
+which is exactly where the afternoon numbers live. At ~+3.7 net, a half-cent
+error changes the afternoon conclusion. **Confirm against a second settled
+ticket at a different price point before treating any net figure as decided.**
+The lows and treasuries closures are safe either way — both were closed by
+margins larger than any plausible fee error.
+
+FAV V1 now stores `fee_dollars` and `net_profit` per row. `profit` stays GROSS
+so historical rows remain comparable.
+
+**The general lesson:** every P&L number produced before 2026-09-01 in this file
+is GROSS. A band under ~+4 gross should be assumed dead until netted.
 
 ---
 
@@ -39,6 +73,23 @@ on the way to the answer — they are early aborts.
 | **~2 weeks** | `V531_` row count and price distribution | far fewer picks than V530_, or all clustered ≥90¢ | Gate 1 or the price floor is now rejecting everything. A model that never bets cannot be validated. |
 | **3–7 weeks** | 50 settled `V531_` bets, per-tag | — | only this answers whether it HELPED. |
 
+### FAV V1 checkpoints (independent clock)
+
+| when | check | what failure looks like | if it fails |
+|---|---|---|---|
+| **first scheduled day** | Actions, event=`schedule`, all three windows | any window logs "no window active" | latch or cron problem, not strategy. Fix before counting days. |
+| **~3 days** | `avg(minutes_late)` per tag | afternoon routinely ≥15 | entry drift. Move the cron target earlier — do NOT widen the latch. |
+| **~1 week** | rows per window per day | far below ~10–15 | band is rejecting nearly everything; check ask parsing, not the thesis. |
+| **50 settled per tag** | win% and `net_profit` | see kill line below | only this decides. |
+
+**⚠️ SET THE KILL LINE NOW, BEFORE THE DATA ARRIVES.** The 10:30 backtest cell
+(+18.45, n=93) is the most extreme number in the whole dataset and rests on the
+fewest rows. If forward MORNING results come in at, say, 70–73% instead of
+81.7%, that is **regression toward the mean and the expected outcome**, not a
+surprise and not a reason to keep waiting for it to recover. Write the retirement
+threshold into this file before 50 rows land, or it will be chosen after seeing
+the result.
+
 The 10-day query:
 
 ```sql
@@ -53,8 +104,118 @@ group by city order by nbm_err desc;
 
 Positive `nbm_err` = NBM ran cold = V5.31 was right.
 
-**Meanwhile the manual track runs independently and needs no model validation.**
-Waiting on the model is not a reason to do nothing for seven weeks.
+**Meanwhile the manual track and FAV V1 run independently and need no model
+validation.** Waiting on the model is not a reason to do nothing for seven weeks.
+
+---
+
+## 🎯 FAV V1 — buying the market's favorite (deployed 2026-09-01, paper)
+
+Files: `fetch_favorites.py`, `.github/workflows/favorites.yml`,
+table `public.favorites_bets`.
+
+**Does no forecasting.** Pulls the Kalshi ladder, takes the highest-priced
+bracket, logs it if the ask is in band, settles next day against **Kalshi's own
+`result` field** (not Iowa CLI — we are scoring a contract, not a temperature).
+
+Backtest basis, `kalshi_candles`, 25 days (Aug 2–26), 19 US cities, top bracket
+by ASK:
+
+| window | band | n | win% | avg ask | gross | net (3.6¢) |
+|---|---|---|---|---|---|---|
+| 10:30 ET | 58–69 | 93 | 81.7% | 63.3¢ | +18.45 | ~+15 |
+| 12:00 ET | 58–69 | ~90 | ~73% | ~63¢ | +10 to +12 | ~+7 |
+| 16:00 ET | 58–79 | 260 | 81.5% | 74.2¢ | +7.33 | ~+3.7 |
+
+**Why this exists:** the weather model's entire purpose is to DISAGREE with the
+market, and disagreement loses 762–171. This strategy requires no forecast and
+measured positive on the same data. **They are opposite bets, not the same
+strategy at different polish levels.**
+
+⚠️ **NOT VALIDATED FORWARD.** 25 summer days, fixed window. That is exactly what
+the last four models looked like before losing money.
+
+### Cities
+
+20. No forecast means no per-city calibration, so Seattle and San Francisco are
+fine here despite being dropped from the weather model in V5.30 — this strategy
+never forecasts them. Excluded: San Diego (`KXHIGHTSAN`, the 11.8%/90.4¢
+anomaly), Trenton, Newark (~150 candle rows total), all internationals.
+
+### ⏰ THE LATCH — fixed 2026-09-02
+
+**Original defect:** window check used `abs(delta) <= 10`. **GitHub Actions
+scheduled runs start LATE on shared runners — commonly 5–20 min, occasionally
+more — and never early.** A symmetric tolerance discards the entire late half of
+a distribution that is entirely late, and does so *silently*: the run succeeds,
+prints "no window active", and nothing is recorded.
+
+**Fix:** one-sided latch, `0 <= delta <= 25` minutes after target. Early never
+fires — which is also what makes the off-season DST twin cron decline cleanly on
+its own.
+
+Also added:
+- **Retry crons at +12 and +24 min** on every window, both DST seasons (20 cron
+  entries total). Simulated all 20 against the latch in EDT and EST: each window
+  fires exactly 3× and every twin declines. No collisions, no gaps.
+- **Skip a window that already has rows for today**, so a retry cannot append
+  later-priced entries alongside on-time ones. Fails OPEN on a Supabase error —
+  `UNIQUE (date, city, window_label)` is the backstop.
+- **`minutes_late` stored on every row.** Drift becomes measurable rather than
+  inferred. A 16:00 bet placed at 16:24 is not the 16:00 bet; the afternoon
+  certainty curve moves fast and price at entry IS the strategy.
+- Settlement sweep got its missing DST twin (`0 13` + `0 14`).
+
+**Known hole:** if a window fires on time and NOTHING qualifies (all cities out
+of band), no rows exist, so a retry 12 min later will run and may log at the
+later price. Rare, capped at 25 min, and `minutes_late` makes those rows
+findable. Closing it properly needs a run-log table — not worth it unless it
+shows up in the data.
+
+### ⚠️ Non-issue that cost an afternoon (2026-09-02)
+
+Runs #4/#5/#6 at 14:47 / 15:05 / 15:32 ET logged "no window active" and looked
+like a broken schedule. **They were `workflow_dispatch` — manual test runs at
+times when no window was open. The script was correct.** The crons were correct
+too: `30 14`/`0 16`/`0 20` UTC are exactly 10:30/12:00/16:00 EDT.
+
+**Filter Actions by `event = schedule` before diagnosing a cron.** Manual runs
+in the same list read as scheduled failures.
+
+### Band definitions live in the script docstring
+
+The floor/ceiling derivation is duplicated in `fetch_favorites.py` so the file
+is self-explaining if this punchlist is ever out of reach. If the two disagree,
+**this file wins** and the script comment is stale.
+
+### Setup SQL (idempotent)
+
+```sql
+ALTER TABLE public.favorites_bets
+  ADD COLUMN IF NOT EXISTS minutes_late INTEGER,
+  ADD COLUMN IF NOT EXISTS fee_dollars  NUMERIC(8,4),
+  ADD COLUMN IF NOT EXISTS net_profit   NUMERIC(10,4);
+```
+
+---
+
+## 🧪 FILTER HYPOTHESES — four tested, all flat (2026-09-01)
+
+Tested against the highs favorite band. All came back with no usable separation:
+
+| hypothesis | result |
+|---|---|
+| bracket gap (favorite vs 2nd) | flat |
+| bid-ask spread | flat |
+| momentum (price change into the window) | flat |
+| **volume** | **monotonic, but n=20 in the decisive cell** |
+
+**Volume is UNDERPOWERED, not disproven.** A monotonic shape is the right
+signature, and 20 observations is not enough to act on OR to dismiss. Re-test
+when FAV V1 has accumulated forward rows with volume attached — it is the only
+one of the four worth revisiting.
+
+The other three are closed. Do not re-run them on the same 25 days.
 
 ---
 
@@ -191,6 +352,9 @@ never reaches. Coverage runs 12:00–21:00 UTC (8am–5pm ET).
   Kalshi also lists international markets (Paris, Geneva, Hong Kong, Mumbai,
   Tokyo, Seoul, São Paulo, Singapore, Sydney, Beijing, Shanghai) — those appear
   in the highs tables and should be excluded too.
+  **Note:** `TSFO` is excluded from *this research table*, but San Francisco IS
+  in the FAV V1 live roster — the exclusion was a candle-data quality issue, not
+  a judgment about the market.
 - **LADDER LABEL FORMAT — resolved 2026-08-27.**
   `B{n}.5` = the range `{n}-{n+1}` (B85.5 = "85-86").
   `T{n}` = a tail market (T85 = "84 or below", T92 = "93 or above").
@@ -224,6 +388,11 @@ efficient market. P&L hovers near zero. **Two exceptions: 20:00 UTC (+2.15¢) an
 21:00 UTC (+1.59¢)** — 4pm and 5pm ET, where the market slightly underprices its
 own favorite once the outcome is nearly locked.
 
+**Note the tension with FAV V1:** this all-hours-all-prices cut is near zero,
+while the *banded* cut is strongly positive. That is the point — the band is
+doing the work, not the hour. But it also means FAV V1's edge is entirely a
+band effect, and if the band moves seasonally the whole strategy moves with it.
+
 ---
 
 ## 📋 MANUAL RESEARCH — SCHEDULE, now evidence-backed
@@ -235,6 +404,10 @@ own favorite once the outcome is nearly locked.
 | **10:30–11:00 AM ET** | **58–69¢** |
 | **12:00 PM ET** | **58–69¢** |
 | **4:00 PM ET** | **58–79¢** |
+
+**FAV V1 now automates exactly this.** The manual pass is a cross-check on the
+script, not a separate strategy — if the two disagree on what the favorite was
+at a given minute, that is a bug worth chasing.
 
 All prices are **ASK**, not mid. You pay the ask. An earlier sweep done on mid
 overstated the 55–59 band by 1–2 points and produced numbers that did not
@@ -262,6 +435,10 @@ single cut would be.
 
 Moving the floor from 60 to 58 adds roughly 30% more opportunities with no
 measurable loss of edge.
+
+⚠️ **Net of fees, the 58–59 cell is the most fragile part of the band.** +6.44
+gross → ~+3 net on the morning cut. It stays in, but it is the first thing to
+re-examine if FAV V1 underperforms.
 
 ### The ceiling is ~69 in the morning, ~79 in the afternoon
 
@@ -300,6 +477,11 @@ beats 12:45 because of the cost-of-certainty curve" did NOT survive — the same
 four-point decline inside the noon hour does not appear inside the 10am or 11am
 hours. Average across all twelve is ~+10¢. **Pick a time that fits the day.**
 
+**This is also why the FAV V1 latch is tolerable.** If the ordering inside a
+90-minute morning span is noise, a 25-minute entry delay is not a different bet
+in the morning. **The afternoon is different** — there the curve is a real trend
+(66.7% → 84.6%), so afternoon drift genuinely matters. Hence `minutes_late`.
+
 ### A BAND, never an open-ended floor
 
 Open-ended floors all fail because they drag in the 80+ tier, which wins 85–96%
@@ -329,6 +511,14 @@ cells rather than one good number.
 
 5pm is best; **4pm gives up ~4¢ for a workable hour**; 3pm is where it thins out.
 
+⚠️ **Net of fees this trend gets much less comfortable.** 4pm +6.36 gross →
+~+2.7 net; 3pm goes to roughly break-even. **5pm at +10.41 gross (~+6.8 net) is
+the only afternoon cell with real margin.** Worth revisiting whether 17:00 ET is
+schedulable, since the current 16:00 window is giving up most of the edge to buy
+an hour that no longer matters now that the script is automated. **This is a
+change to FAV V1 and must NOT be made during its validation window** — log it
+here and decide at 50 settled AFTERNOON rows.
+
 At 4pm the full band breakdown: 55–57 −2.09 (n=54), 58–59 +21.40 (n=50),
 60–69 +6.48 (n=242), 70–79 +7.33 (n=260). **Discount that 58–59 number** — 80%
 win at 58.6¢ is out of line with both neighbours and is what 50 observations
@@ -345,13 +535,20 @@ city — nowhere near the discipline bar.** Do not build an allowlist on this ye
 
 ---
 
-## 🌙 LOWS — backfilled, and the answer is weak
+## 🌙 LOWS — CLOSED ON FEES (2026-09-01)
 
 `kalshi_lows_candles`: **425,915 rows, 24 cities, 25 days (Aug 4–28)**, window
 04:00–16:00 UTC.
 `kalshi_lows_settlements`: **3,702 rows, 617 settled yes** — exactly 3702÷6, every
 ladder resolved one bracket, zero warnings. Clean, and both tables have UNIQUE
 constraints.
+
+**VERDICT: the only positive band (+1.32 gross) goes NEGATIVE at ~3.6¢/contract.
+Lows are closed.** No further building. V5.30 lows model is shelved, not
+scheduled. Infrastructure stays in place — it cost nothing to keep and the
+seasonal question is still open.
+
+Everything below is retained as the record of why.
 
 Window derived from data: across 1,077 settled CLI rows, `low_time_utc` puts
 75% in hours 09–13 UTC and 90% in 04–13. 04:00–16:00 captures ~95%.
@@ -367,26 +564,24 @@ Winner's price: 47.4¢ at 04:00 → **56.9 → 63.6 → 70.0 → 78.2 across 09:
 Negative at 12 of 13 hours. Only 05:00 UTC is positive (+1.80, n=278), flanked by
 −4.92 and −1.10. Win rates run 37.8–48.2% while asks run 40–54¢.
 
-### Only 60–69 pays, and barely
+### Only 60–69 pays, and barely — then not at all
 
-| band | n | win% | avg ask | P&L |
+| band | n | win% | avg ask | P&L (gross) |
 |---|---|---|---|---|
 | <50 | 1738 | 17.1% | 21.6¢ | −4.49 |
 | 50–59 | 386 | 46.4% | 54.5¢ | −8.17 |
-| **60–69** | **362** | **65.5%** | **64.2¢** | **+1.32** |
+| **60–69** | **362** | **65.5%** | **64.2¢** | **+1.32 → negative net** |
 | 70+ | 1331 | 79.9% | 87.7¢ | −7.72 |
 
 **Same band as highs — a real convergence, suggesting something structural about
-how Kalshi prices mid-confidence weather outcomes.** But +1.32 against the highs'
-+8 to +17 in the same band.
+how Kalshi prices mid-confidence weather outcomes.** That observation survives
+even though the trade does not.
 
 Hour-by-hour inside that band swings −11.18 to +11.23 on cells of 21–45. Not
 actionable.
 
-**→ Lows do not currently justify a 3–5am alarm.** +1.32 before fees may not
-survive Kalshi's per-contract fee — **that calculation is the next thing to do
-before building anything else on lows.** Keep `lows_snapshots` collecting; 25
-summer days is a narrow window and the seasonal picture may differ.
+**Re-open only if:** a winter re-run shows a materially different band, OR the
+fee figure turns out to be well below 3.6¢. Neither is worth chasing now.
 
 ### Lows market mechanics (confirmed by direct observation)
 
@@ -415,6 +610,21 @@ Austin $7,819 — far above the ~$300 depth that killed NowCast.
   Timing spread and diurnal range are inversely related.
 - ~10% of `low_time_utc` values are hour-boundary artifacts, **concentrated in
   Austin (34%) and San Antonio (31%)**. Exclude those two from timing analysis.
+
+---
+
+## 🏦 TREASURIES — CLOSED ON FEES (2026-09-01)
+
+A band exists in the same place as everywhere else: **58–69, +4.15 gross.**
+**Does not clear ~3.6¢/contract.** Closed.
+
+Earlier probe also closed: the monotonicity check on treasury yield candles
+returned empty — ladders are internally coherent wherever they are tradeable, so
+there is no structural mispricing to exploit.
+
+**Two closures on the same day for the same reason is the finding.** A gross
+edge in the +1 to +4 range is not an edge; it is the fee. Before spending time
+on any new surface, estimate net first.
 
 ---
 
@@ -457,6 +667,12 @@ The market is nearly unbiased (avg −0.44). **This is what V5.31 addresses.**
 
 ## HOUSEKEEPING
 
+- **Supabase usage:** flagged "EXCEEDING USAGE LIMITS" around 2026-09-01,
+  checked 2026-09-02 and reported clear. **Re-check Settings → Usage if writes
+  start failing silently** — a row-limit breach during a validation window
+  corrupts the sample without erroring. Dropping `kalshi_treasury_candles` and
+  `kalshi_lows_candles` frees ~550k rows and both questions are now closed, so
+  that is available if headroom is ever needed. Not urgent.
 - ✅ **RLS enabled on `kalshi_settlements` and `kalshi_candles`** (2026-08-30).
   The permissive policies already existed; only RLS itself was off, so the two
   ALTERs were sufficient. **This secures nothing** — a `USING (true)` policy is
@@ -470,8 +686,11 @@ The market is nearly unbiased (avg −0.44). **This is what V5.31 addresses.**
 - `kalshi_survey.py` (series discovery scanner) has moved into this repo. It
   scans a category for series with 5+ settled events in 30 days. Defaults to
   `CATEGORY=Economics`.
-- New workflow `kalshi-lows.yml`. **Workflows only register in
+- New workflows `kalshi-lows.yml`, `favorites.yml`. **Workflows only register in
   `.github/workflows/` — a yml in the repo root is invisible to Actions.**
+- **When diagnosing any workflow, filter Actions by `event = schedule` first.**
+  Manual `workflow_dispatch` test runs sit in the same list and read as
+  scheduled failures. Cost an afternoon on 2026-09-02.
 - Health Monitor: SF/Seattle stranded rows deleted Aug 24, alert should be quiet.
 - Intraday collector lost the 15:00 UTC hour on Aug 26 to a GitHub Actions
   **startup failure** (their infrastructure, job never started). Check for gaps
@@ -484,25 +703,38 @@ The market is nearly unbiased (avg −0.44). **This is what V5.31 addresses.**
 
 - No model logic changes during a validation window.
 - No change without 50+ settled bets or a 4+ occurrence repeated pattern.
+- **Net, not gross.** Every P&L number produced before 2026-09-01 is gross.
+  ~3.6¢/contract. A band under ~+4 gross is dead until proven otherwise.
+  **Estimate net BEFORE building, not after** — lows and treasuries both got
+  built out before anyone did the arithmetic.
+- **One fee observation is not a fee schedule.** Confirm 3.6¢ at a second price
+  point before any real-money decision rests on it.
 - Win rate ≠ profit. **Proof: `CONV/AGREE/70+` hits 75.4% and LOSES 2.09¢,
   because it pays 77.5¢ to do it.** Same for the 80+ band generally — 96.1% at
   94.4¢ pays +1.70.
-- **Never pool strategy tags.** V530_ and V531_ are different models.
+- **Never pool strategy tags.** V530_, V531_, and FAV_V1_ are different models.
 - **Never reconstruct a file from memory** — work from the current paste.
 - **Check the sign convention before interpreting any bias number.**
 - **Distinguish three populations:** the MARKET's top bracket, the MODEL's pick,
   and the manual research. Conflating them produces opposite conclusions.
 - **Validation thresholds are counts, not dates.**
+- **Write the kill line before the data arrives.** A threshold chosen after
+  seeing forward results is not a threshold.
 - **A cross-check is not optional.** The Denver 32°F row passed every quality
   flag its source provides.
 - **Do not read ordering out of thin cells.** Twelve 15-minute cells of ~80
   correlated observations produced a scatter, and an earlier reading of it as a
-  trend did not survive more data. Same trap caught the 71–72 cell.
+  trend did not survive more data. Same trap caught the 71–72 cell, and the
+  volume filter's n=20 decisive cell.
+- **Underpowered ≠ disproven.** Volume was monotonic on 20 observations. That is
+  neither a result nor a refutation — it is a re-test.
 - **Always use ASK, never mid.** You pay the ask. Mid overstates every result by
   1–2 points. This caused two analyses of the same data to disagree on 55–59.
 - **A band that comes out near zero may be two populations averaged together.**
   "55–59 doesn't work" was really 55–57 losing and 58–59 working. Before killing
   a band, split it.
+- **Scheduled jobs start late, never early.** Any time-window check must be
+  one-sided. A symmetric tolerance silently discards the whole late half.
 - **Check every checkpoint on schedule.** The recurring failure is waiting out a
   full window, finding a defect at the end, and restarting the clock. Four times
   since May.
@@ -517,28 +749,49 @@ The market is nearly unbiased (avg −0.44). **This is what V5.31 addresses.**
 (`kalshi_lows_candles` 425,915 rows / `kalshi_lows_settlements` 3,702) · the 58
 floor correction.
 
-**Immediate:**
-- **Fee calculation on the lows +1.32** — does it survive Kalshi's per-contract
-  fee? If not, that closes lows for now and saves building further on it.
-- Start logging the manual schedule (58–69 morning, 58–79 at 4pm). **This does
-  not depend on the model and can begin immediately.**
+**Done 2026-09-01:** fee measured (~3.6¢) · lows CLOSED · treasuries CLOSED ·
+four filter hypotheses tested (three closed, volume underpowered) · FAV V1 built
+and deployed to paper.
 
-**Timed:** see CHECKPOINTS at the top. Next firing window → ~1 week → ~10 days →
-~2 weeks → 3–7 weeks, each an independent abort point.
+**Done 2026-09-02:** FAV V1 latch fix (one-sided, +25 min) · retry crons ·
+`minutes_late` / `fee_dollars` / `net_profit` columns · confirmed the "broken
+workflow" was manual dispatch runs, not a defect.
+
+**Immediate:**
+- **Confirm the fee at a second price point.** Everything net now rests on one
+  ticket, and the afternoon band at ~+3.7 is inside the error bar.
+- **Write the FAV V1 kill line into this file** before 50 rows accumulate.
+- Watch the first scheduled FAV V1 day end to end — all three windows, `event =
+  schedule`.
+
+**Timed:** see CHECKPOINTS at the top. Model: next firing window → ~1 week →
+~10 days → ~2 weeks → 3–7 weeks. FAV V1: first scheduled day → ~3 days →
+~1 week → 50 settled per tag. Each an independent abort point.
 
 **Queued, not started:**
+- **17:00 ET window for FAV V1** — 5pm is the only afternoon cell with real net
+  margin (~+6.8 vs ~+2.7 at 4pm). **Do not change during validation.** Decide at
+  50 settled AFTERNOON rows.
+- **Re-test volume as a filter** once FAV V1 has forward rows. Only one of the
+  four hypotheses worth revisiting.
 - Gate volume audit (needs market hours at the Mac; has slipped repeatedly).
 - SPREAD skip filter — manual-grid evidence strong (spread ≤1° → ~88% bracket
   accuracy; >2° → ~25%).
 - Basket / cluster trade — targets the 45-69¢ dead zone. See prior punchlist
   versions for the full spec; combined cost is a CEILING (<~0.90), fees are the
-  gotcha, afternoon-only, paper tag `V529_PAPER_BASKET_YES`.
+  gotcha, afternoon-only, paper tag `V529_PAPER_BASKET_YES`. **Re-estimate net
+  before starting** — this one is explicitly fee-sensitive.
 - Later-window snapshot collection — `kalshi_snapshots` stops at Conviction, so
   the afternoon near-certainty play is unmeasurable from it. `kalshi_candles`
-  now covers this for research, but the live model still cannot see those hours.
+  now covers this for research, and FAV V1 now covers it live.
+- Hurricane / tropical and extreme-temperature max-of-N markets — new surfaces
+  for the existing band finding, not new categories. **Estimate net first.**
+- IP protection: proprietary logic → Supabase Edge Functions, or self-host
+  ($5–12/mo). Rotate Wethr/Odds/Supabase keys; audit commits for leaked secrets.
 
 **Dead / do not relitigate:**
-ECMWF integration · §2 lows obs-history reconstruction ·
+**Lows (fees)** · **Treasuries (fees)** · **bracket-gap, spread, and momentum
+filters** · ECMWF integration · §2 lows obs-history reconstruction ·
 `observations.php mode='wethr_low'` (does not exist) · timing-gated lows model ·
 betting a low the day before (not possible) · Wethr obs in the intraday
 collector · NowCast.trade · early-entry timing 3–5 days out · app-based weather
