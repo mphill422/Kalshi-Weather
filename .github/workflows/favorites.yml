@@ -1,37 +1,33 @@
 name: Favorites
+
+# Scheduling is handled by cron-job.org, NOT by GitHub.
+#
+# GitHub's scheduled workflows were delayed by ~3 hours on this repo (observed
+# 2026-09-03: crons set for 20:00 UTC fired at 23:02). That is far beyond the
+# 5-20 minute queue delay the script's latch was built to absorb, so no latch
+# width can fix it. Every scheduled run since deployment landed outside its
+# window and logged nothing.
+#
+# cron-job.org fires within ~1 second of target and POSTs to this workflow's
+# dispatch endpoint:
+#   https://api.github.com/repos/mphill422/Kalshi-Weather/actions/workflows/favorites.yml/dispatches
+#
+# Three jobs, all in America/New_York so DST is handled upstream:
+#   Favorites Morning    10:30
+#   Favorites Midday     12:00
+#   Favorites Afternoon  16:00
+#
+# Do NOT re-add an `on: schedule:` block here. It will fire hours late, the
+# script's one-sided latch will correctly decline it, and the run list fills
+# with declines that read as failures. That has already cost two debugging
+# sessions.
+#
+# The script still checks Eastern local time through pytz and only fires inside
+# a window, so a stray manual dispatch remains a harmless no-op.
+
 on:
-  schedule:
-    # Cron is UTC and does NOT follow DST, so each ET window is scheduled twice:
-    # once for EDT (UTC-4, Mar-Nov) and once for EST (UTC-5, Nov-Mar). The
-    # script itself checks Eastern local time through pytz and only fires when
-    # the window is genuinely open, so the off-season entry is a harmless no-op.
-    #
-    # Each window also has a +12 and +24 minute retry. GitHub Actions scheduled
-    # runs start LATE on shared runners (commonly 5-20 min, occasionally more),
-    # never early. The retries mean a delayed run still lands. Double-firing is
-    # safe: the script skips a window that already has rows for today, and
-    # UNIQUE (date, city, window_label) is the backstop.
-    - cron: '30 14 * * *'   # 10:30 ET (EDT)
-    - cron: '42 14 * * *'   # 10:30 ET (EDT) retry +12
-    - cron: '54 14 * * *'   # 10:30 ET (EDT) retry +24
-    - cron: '30 15 * * *'   # 10:30 ET (EST)
-    - cron: '42 15 * * *'   # 10:30 ET (EST) retry +12
-    - cron: '54 15 * * *'   # 10:30 ET (EST) retry +24
-    - cron: '0 16 * * *'    # 12:00 ET (EDT)
-    - cron: '12 16 * * *'   # 12:00 ET (EDT) retry +12
-    - cron: '24 16 * * *'   # 12:00 ET (EDT) retry +24
-    - cron: '0 17 * * *'    # 12:00 ET (EST)
-    - cron: '12 17 * * *'   # 12:00 ET (EST) retry +12
-    - cron: '24 17 * * *'   # 12:00 ET (EST) retry +24
-    - cron: '0 20 * * *'    # 16:00 ET (EDT)
-    - cron: '12 20 * * *'   # 16:00 ET (EDT) retry +12
-    - cron: '24 20 * * *'   # 16:00 ET (EDT) retry +24
-    - cron: '0 21 * * *'    # 16:00 ET (EST)
-    - cron: '12 21 * * *'   # 16:00 ET (EST) retry +12
-    - cron: '24 21 * * *'   # 16:00 ET (EST) retry +24
-    - cron: '0 13 * * *'    # settlement sweep, 09:00 ET (EDT)
-    - cron: '0 14 * * *'    # settlement sweep, 09:00 ET (EST)
   workflow_dispatch:
+
 jobs:
   favorites:
     runs-on: ubuntu-latest
