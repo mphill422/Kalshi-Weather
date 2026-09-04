@@ -1,7 +1,14 @@
 # MPH Weather Model — Punchlist / State of Things
 
-_Last updated: 2026-09-02. Live model: **V5.31.1**. New: **FAV V1** (paper).
+_Last updated: 2026-09-03. Live model: **V5.31.1**. New: **FAV V1** (paper).
 Bankroll still paper._
+
+**2026-09-03 headline: V5.31's premise is CONFIRMED and the model still loses.**
+NBM runs 1.85°F cold with 2.80 MAE against consensus's 0.82 — consensus is 3.4×
+more accurate, so anchoring toward it is correct. The anchor is reaching bet
+selection (bracket offset moved −0.62 → −0.25). The bracket is well centred on
+actual (+0.33). And all four V531 tags are negative. **The forecast is not the
+problem and has not been for some time. The losses are in bet selection.**
 
 This is the durable record. My (Claude's) memory carries summarized facts across
 chats but is not guaranteed complete — THIS FILE is the source of truth.
@@ -109,6 +116,126 @@ validation.** Waiting on the model is not a reason to do nothing for seven weeks
 
 ---
 
+## ✅ V5.31 VALIDATION — three checkpoints cleared early (2026-09-03)
+
+All three fired ahead of schedule because the data arrived faster than expected.
+**Two passed, one produced an uncomfortable result.**
+
+### 1. `nbm_p50` vs actual — PREMISE CONFIRMED (n=54, 18 cities, 3 days each)
+
+| | pooled |
+|---|---|
+| `nbm_err` (actual − nbm_p50) | **+1.85** |
+| `consensus_err` (actual − consensus) | −0.28 |
+| `nbm_mae` | **2.80** |
+| `consensus_mae` | **0.82** |
+
+**NBM ran cold in 16 of 18 cities. Consensus beat it on MAE in 17 of 18.**
+Consensus is 3.4× more accurate. The V5.31 inference — "NBM runs cold, so
+re-centre it on consensus" — was correct, and anchoring pulls toward the BETTER
+estimate, not the worse one.
+
+**→ `NBM_CONSENSUS_ANCHOR` stays at 1.0. Do not lower it. Do not revisit.**
+
+Worst NBM cities: Minneapolis +5.83 (consensus MAE 0.03), Vegas +4.03, Austin
++3.73, Chicago +3.60. Only NY (−2.30) and Philadelphia (−1.50) ran warm.
+
+⚠️ n=3 per city. The direction (16/18, 17/18) is not chance; the magnitudes will
+move. Re-run at ~10 days as originally scoped.
+
+⚠️ **Five cities show `consensus_mae` of exactly 0.00** (Chicago, OKC, Dallas,
+Boston, and near-zero Minneapolis). A forecast hitting the integer high three
+times running in five cities is worth one look — confirm `consensus` is not
+being backfilled or overwritten after settlement in `sb_upsert`. Denver (1.27)
+and DC (2.27) argue the column is clean, but the zeros should be checked before
+this table is cited again.
+
+### 2. Bracket midpoint — THE ANCHOR IS REACHING BET SELECTION
+
+`bets ⋈ settlements`, V530 vs V531, same join, same window:
+
+| tag | n | mid − consensus | mid − actual | consensus − actual |
+|---|---|---|---|---|
+| V530 CONVICTION T75 | 34 | −0.62 | −0.47 | +0.15 |
+| V530 EDGE T75 | 39 | −0.41 | **−0.09** | +0.32 |
+| **V531 CONVICTION T75** | 39 | **−0.25** | **+0.33** | +0.39 |
+| **V531 EDGE T75** | 47 | **−0.37** | −0.24 | +0.35 |
+
+CONVICTION's offset shrank ~60% (−0.62 → −0.25). **This is a real code path, not
+a plumbing bug** — that question is closed.
+
+But note `mid − actual`: **V530 EDGE was already the best-centred cell in the
+table at −0.09**, and V531 moved it to −0.24. CONVICTION improved in magnitude
+(−0.47 → +0.33) but flipped sign, so it now overshoots warm.
+
+⚠️ The −1.48 figure in the V5.31 section below was measured on
+`kalshi_snapshots` over 72 days. This query is a different join on 5 days. **The
+V530-vs-V531 comparison within this table is apples to apples; the −1.48 is
+not.** Do not read −0.25 as "improved from −1.48."
+
+### 3. Settled P&L — ALL FOUR TAGS NEGATIVE (2026-08-30 → 09-03)
+
+| tag | n | settled | win% | avg price | break-even | profit |
+|---|---|---|---|---|---|---|
+| CONVICTION T75 | 46 | 37 | 54.1 | 59.6 | ~63 | **−11.77** |
+| CONVICTION T80 | 45 | 36 | 52.8 | 59.7 | ~63 | **−13.85** |
+| EDGE T75 | 57 | 46 | 50.0 | 54.2 | ~58 | **−12.33** |
+| EDGE T80 | 57 | 46 | 50.0 | 54.2 | ~58 | **−12.33** |
+
+Short of break-even by 4–6 points on every tag. Gross — fees make it worse.
+
+**Checkpoint 4 (price distribution) PASSES:** avg price 54–60¢, not clustered at
+90¢. The model is betting at reasonable prices and losing, which is a more
+informative failure than not betting at all.
+
+⚠️ **EDGE_T75 and EDGE_T80 are byte-identical** — same n, settled, wins, profit,
+and every price-tier cell. Two different thresholds producing identical output
+across 57 bets is not coincidence. **Either T80 never binds or both tags are
+written from one code path.** If so there are three tags here, not four, and the
+duplicate has been read as independent confirmation. **Check before the next
+analysis.**
+
+### What this adds up to
+
+Consensus MAE 0.82. Bracket sits on consensus. Bracket centred on actual within
+a third of a degree. **And the tags lose money.** A model forecasting this well
+and still losing is not telling you to forecast better. Same message as 762–171.
+
+---
+
+## 🔍 PRICE-TIER SPLIT — hypothesis, NOT a change (2026-09-03)
+
+V531 settled bets by price tier. The shape is monotonic and identical across all
+four tags:
+
+| tier | pooled n | win% range | pooled profit |
+|---|---|---|---|
+| <50 | 70 | 34.8–41.7 | **≈ −14** |
+| 50–57 | 18 | 25.0–40.0 | **≈ −20** |
+| 58–69 | 35 | 40.0–45.5 | **≈ −33** |
+| 70–79 | 22 | 75.0–85.7 | ≈ +8.5 |
+| 80+ | 20 | 100.0 | ≈ +8.0 |
+
+**The model loses below 70¢ and wins above it.**
+
+**Do not add a 70¢ floor yet.** The losing half rests on ~90 bets and is worth
+taking seriously. The winning half is 42 bets across five cells of n=4–7, and
+every 80+ cell reads 100% — the tier this punchlist already retired (96.1% at
+94.4¢ pays +1.70; 80+ was negative throughout the FAV research). Six wins at 88¢
+is a small profit and near-zero information.
+
+⚠️ **This CONTRADICTS the FAV finding, and that is expected.** FAV has 58–69 as
+the best band; V531 has it as the worst. Different populations: FAV buys the
+MARKET's favourite, V531 buys the MODEL's pick. A model pick at 63¢ is usually a
+disagreement with the market — the 762–171 trade. **Never reconcile these two
+tables; they are answering different questions.**
+
+**Re-run this cut at 50 settled per tag, then again at 100.** If sub-70 stays
+negative and the 70+ cells fill in above break-even on real samples, the floor
+is earned. Until then it is a hypothesis with a threshold.
+
+---
+
 ## 🎯 FAV V1 — buying the market's favorite (deployed 2026-09-01, paper)
 
 Files: `fetch_favorites.py`, `.github/workflows/favorites.yml`,
@@ -172,6 +299,58 @@ later price. Rare, capped at 25 min, and `minutes_late` makes those rows
 findable. Closing it properly needs a run-log table — not worth it unless it
 shows up in the data.
 
+### 🚨 THE ACTUAL CAUSE — GitHub's scheduler, not the latch (2026-09-03)
+
+**`favorites_bets` was empty across ALL dates since deployment.** Ticker format
+verified correct (`kxhighny-26sep02` etc., checked against three live Kalshi
+URLs including both the T-prefix and no-T patterns). Table schema correct.
+Workflow on `main`, enabled, crons firing.
+
+**GitHub delayed every scheduled run by ~3 hours.** Crons set for 20:00 UTC
+fired at 23:02, 23:14, 23:19 — the +12/+24 retry spacing preserved exactly,
+three hours late. The script's own pytz clock printed `19:02 ET`, so this is not
+a display artifact. **No scheduled run has ever landed inside a window.**
+
+This is far beyond the 5–20 minute queue delay the one-sided latch was built to
+absorb. **No latch width fixes it** — a 3-hour latch would buy at 7 PM, which is
+not the strategy.
+
+**→ Scheduling moved to cron-job.org (2026-09-03).** Three jobs POST to the
+workflow dispatch endpoint:
+
+```
+https://api.github.com/repos/mphill422/Kalshi-Weather/actions/workflows/favorites.yml/dispatches
+```
+
+| job | time | timezone |
+|---|---|---|
+| Favorites Morning | 10:30 | America/New_York |
+| Favorites Midday | 12:00 | America/New_York |
+| Favorites Afternoon | 16:00 | America/New_York |
+
+Headers `Accept: application/vnd.github+json`, `Authorization: Bearer {PAT}`,
+`X-Github-Api-Version: 2022-11-28`. POST, body `{"ref":"main"}`, notify after 1
+failure. Test run returned **204**.
+
+**Job timezone is America/New_York, so DST is handled upstream — no EST/EDT
+twins needed.** This differs from the six older cron-job.org jobs, which are
+UTC.
+
+**`favorites.yml` now has `workflow_dispatch` ONLY.** The `on: schedule:` block
+was removed. **Do not re-add it** — GitHub's delayed crons fire at random hours,
+the latch correctly declines them, and the run list fills with declines that
+read as failures. That has now cost two debugging sessions.
+
+The settlement sweep cron went with it. `settle()` runs at the end of every
+invocation, so the 10:30 window settles the prior day.
+
+**The one-sided latch stays.** It is still correct for ordinary queue delay and
+it is what makes a stray manual dispatch a safe no-op.
+
+**General lesson: GitHub Actions `schedule` is not suitable for anything
+time-critical.** Use cron-job.org → `workflow_dispatch` for any window-sensitive
+job. The existing weather-model crons already work this way.
+
 ### ⚠️ Non-issue that cost an afternoon (2026-09-02)
 
 Runs #4/#5/#6 at 14:47 / 15:05 / 15:32 ET logged "no window active" and looked
@@ -196,6 +375,69 @@ ALTER TABLE public.favorites_bets
   ADD COLUMN IF NOT EXISTS fee_dollars  NUMERIC(8,4),
   ADD COLUMN IF NOT EXISTS net_profit   NUMERIC(10,4);
 ```
+
+---
+
+## 🛑 TIER-3 EXTENSION — investigated and CLOSED (2026-09-03)
+
+**Question:** San Antonio, Austin, New Orleans, NY and Boston "win almost every
+day" — should they be bought above the 69¢ morning ceiling?
+
+**Answer: no.** The 70–74¢ slice across all 19 cities is **n=90, ~44% win rate
+against a ~75.5% break-even, roughly −27¢/contract net.**
+
+### How the investigation went wrong before it went right
+
+The first cut looked excellent: San Antonio +16.76, Austin +2.07, and the 70–74
+half-split held in both halves for both cities. **That cut tested three cities
+chosen by eye on the same 25 days that produced the observation — circular.**
+
+Scanning all 19 cities instead put it in context:
+
+| series | n | win% | pl_net | h1 | h2 |
+|---|---|---|---|---|---|
+| San Antonio | 14 | 92.9 | +16.76 | +10.11 | +23.40 |
+| Austin | 9 | 77.8 | +2.07 | −0.60 | +4.20 |
+| **Miami** | 9 | 33.3 | **−41.82** | −41.93 | −41.60 |
+| Las Vegas | 8 | 100.0 | +24.65 | +24.40 | +25.07 |
+| **Houston** | 8 | 50.0 | **−26.23** | −43.27 | −16.00 |
+| Phoenix | 6 | 50.0 | −24.77 | **+25.40** | **−49.85** |
+
+The four cells with n≥8 split two up, two down, and the losers lose about as
+hard as the winners win. **That is a coin flip sorted afterward.**
+
+### Why the half-split test was not enough
+
+**Miami is −41.9 in BOTH halves on n=9** — passing the same consistency test San
+Antonio passes, pointing the opposite way. Half-split rules out time-period
+luck; it does NOT rule out city-selection luck, and it does not distinguish a
+real effect from stable noise. Phoenix sign-flips (+25.40 → −49.85), which is
+what the test is actually good at catching.
+
+### The tell
+
+If reliability genuinely beat price, it should persist upward. It reverses:
+NY tier 4 is −11.35 / −29.20, Boston tier 5 is −19.40 / −15.10, New Orleans
+tier 4 is −12.10. **Tier 3 looking good is a handful of lucky small cells
+sitting between a real effect below it and a real cost above it.**
+
+### NY and Boston specifically
+
+n=2 and n=1 in the 70–74 slice. **There is no answer to give.** They rarely
+price there — the market resolves them fast and skips the middle (NY on 9/2 went
+82 → 91 → 97). Atlanta is 0/2 in the same slice and means nothing either.
+
+### The pattern to recognise
+
+Each successive cut was smaller than the last: 19 cities → 3 cities → one price
+slice → two cities that rarely qualify. **An edge retreating into ever-thinner
+cells as you look harder is what a non-existent edge looks like when you search
+for it.** The 58–69 band survived the same scrutiny; that is the difference.
+
+**If traded anyway:** San Antonio / Austin / Vegas only, ask 70–74 only, $5 flat,
+tag `FAV_V1_TIER3_DESERT`, **kill line below 76% at n=30.** Never pooled with
+`FAV_V1_*`. Do NOT size up — "for sure cities" priced at 75–85¢ is exactly the
+`CONV/AGREE/70+` failure mode (75.4% win, −2.09¢).
 
 ---
 
@@ -524,6 +766,36 @@ At 4pm the full band breakdown: 55–57 −2.09 (n=54), 58–59 +21.40 (n=50),
 win at 58.6¢ is out of line with both neighbours and is what 50 observations
 produce by chance. "58–59 works," not "58–59 is triple the others."
 
+### 📓 FORWARD MANUAL RESULTS — first two days (paper, off-record)
+
+Hand-scored from the Daily Capture Grid while FAV V1 was still logging nothing.
+**Settled column is evening observation, not CLI final** — several sat within 1°
+of a bracket edge, so these are directional only.
+
+| date | 10:30 | 12:00 | 4:00 | day |
+|---|---|---|---|---|
+| 9/2 | 3/7 | 3/4 | 2/5 | 8/16, −12.1¢ |
+| 9/3 | 1/5 | 1/3 | **9/11** | 11/19, −12.8¢ |
+| **total** | **4/12** | **4/7** | **11/16** | **19/35** |
+
+**Morning 5/16, afternoon 11/16.** The backtest had morning as the STRONGEST
+window (+18.45 at 10:30, the headline number for the whole strategy) and
+afternoon as the weakest (+7.33).
+
+**This is the regression the checkpoints predicted**, arriving early and in the
+expected direction. It is also 16 morning bets across two consecutive days in
+one synoptic pattern — heavily correlated, not 16 independent draws. **Not a
+verdict. Do not retire MORNING on this.**
+
+**Write the MORNING kill line down before the sample grows:** suggested below
+65% at n=50, which is well under the 73% backtest and leaves room to be merely
+disappointing rather than broken.
+
+Both days show the same warm-drift signature: losses settled ABOVE the chosen
+bracket (9/2 Chicago 96 vs 94–95, Dallas 100 vs 98–99, Phoenix 104 vs 102–103;
+9/3 Miami, Vegas, LA all settled at the later bracket the market moved to).
+**Note it, do not act on it.**
+
 ### Per-city (12:45 ET, 60c+, before the ceiling was established)
 
 Positive: San Antonio +25.47, Austin +22.79, LAX +18.38, OKC +17.43, Vegas
@@ -691,6 +963,13 @@ The market is nearly unbiased (avg −0.44). **This is what V5.31 addresses.**
 - **When diagnosing any workflow, filter Actions by `event = schedule` first.**
   Manual `workflow_dispatch` test runs sit in the same list and read as
   scheduled failures. Cost an afternoon on 2026-09-02.
+- **GitHub Actions `schedule` delayed runs by ~3 hours on this repo** (observed
+  2026-09-03). Any window-sensitive workflow must be driven by cron-job.org via
+  `workflow_dispatch`. See FAV V1 above.
+- **The GitHub PAT used by all nine cron-job.org jobs was exposed in a
+  screenshot on 2026-09-03** and was not rotated. It carries repo write and
+  workflow-dispatch rights. Rotating means generating a new token and pasting it
+  into nine jobs. Logged here as a known open item, not a recommendation.
 - Health Monitor: SF/Seattle stranded rows deleted Aug 24, alert should be quiet.
 - Intraday collector lost the 15:00 UTC hour on Aug 26 to a GitHub Actions
   **startup failure** (their infrastructure, job never started). Check for gaps
@@ -728,6 +1007,22 @@ The market is nearly unbiased (avg −0.44). **This is what V5.31 addresses.**
   volume filter's n=20 decisive cell.
 - **Underpowered ≠ disproven.** Volume was monotonic on 20 observations. That is
   neither a result nor a refutation — it is a re-test.
+- **Never test a subset chosen by eye on the data that made you notice it.**
+  San Antonio / Austin / New Orleans looked strong until all 19 cities were
+  scanned and the slice turned out to lose 27¢ pooled. Scan the full roster
+  FIRST, then look at what the query surfaced.
+- **Half-split agreement is not sufficient evidence.** Miami is −41.9 in both
+  halves on n=9. The test catches time-period luck and stable noise looks
+  identical to a real effect. It does not rule out selection.
+- **An edge that retreats into thinner cells as you look harder is not an
+  edge.** 19 cities → 3 cities → one price slice → two cities that rarely
+  qualify. Recognise the shape.
+- **A confirmed mechanism is not a profitable one.** V5.31's premise was proven
+  correct on 54 rows and all four tags still lose. Forecast accuracy and
+  betting profitability are independent — measure both, never infer one.
+- **Two tables disagreeing may be two populations.** FAV has 58–69 as the best
+  band; V531 has it as the worst. MARKET's favourite vs MODEL's pick. Do not
+  reconcile them.
 - **Always use ASK, never mid.** You pay the ask. Mid overstates every result by
   1–2 points. This caused two analyses of the same data to disagree on 55–59.
 - **A band that comes out near zero may be two populations averaged together.**
@@ -757,18 +1052,34 @@ and deployed to paper.
 `minutes_late` / `fee_dollars` / `net_profit` columns · confirmed the "broken
 workflow" was manual dispatch runs, not a defect.
 
+**Done 2026-09-03:** root-caused the empty `favorites_bets` to GitHub's
+scheduler delaying runs ~3 hours · migrated FAV V1 scheduling to cron-job.org
+(3 jobs, America/New_York, 204 confirmed) · stripped `on: schedule:` from
+`favorites.yml` · ticker format verified against live Kalshi URLs · tier-3
+extension investigated across all 19 cities and CLOSED · V5.31 premise CONFIRMED
+via `nbm_p50` · bracket-midpoint drift confirmed the anchor reaches bet
+selection · price-tier split logged as a hypothesis.
+
 **Immediate:**
-- **Confirm the fee at a second price point.** Everything net now rests on one
+- **Check `favorites_bets` after 10:30 ET on 09-04.** First cron-job.org
+  dispatch. Rows + low `minutes_late` closes the whole deployment saga.
+- **Investigate EDGE_T75 vs EDGE_T80 being byte-identical.** Possible duplicate
+  tag being read as independent confirmation.
+- **Check the five `consensus_mae = 0.00` cities** for backfill contamination
+  before the `nbm_p50` table is cited again.
+- **Confirm the fee at a second price point.** Everything net rests on one
   ticket, and the afternoon band at ~+3.7 is inside the error bar.
-- **Write the FAV V1 kill line into this file** before 50 rows accumulate.
-- Watch the first scheduled FAV V1 day end to end — all three windows, `event =
-  schedule`.
+- **Write the MORNING kill line down** (FAV V1 and manual both) before the
+  sample grows past the point where the threshold can be chosen honestly.
 
 **Timed:** see CHECKPOINTS at the top. Model: next firing window → ~1 week →
 ~10 days → ~2 weeks → 3–7 weeks. FAV V1: first scheduled day → ~3 days →
 ~1 week → 50 settled per tag. Each an independent abort point.
 
 **Queued, not started:**
+- **Re-run the V531 price-tier split at 50 and 100 settled per tag.** If sub-70
+  stays negative and 70+ fills in above break-even on real samples, a 70¢ floor
+  is earned. One-line gate change, not a modelling project. **Not before then.**
 - **17:00 ET window for FAV V1** — 5pm is the only afternoon cell with real net
   margin (~+6.8 vs ~+2.7 at 4pm). **Do not change during validation.** Decide at
   50 settled AFTERNOON rows.
@@ -791,7 +1102,9 @@ workflow" was manual dispatch runs, not a defect.
 
 **Dead / do not relitigate:**
 **Lows (fees)** · **Treasuries (fees)** · **bracket-gap, spread, and momentum
-filters** · ECMWF integration · §2 lows obs-history reconstruction ·
+filters** · **tier-3 / 70–79 ceiling extension (−27¢ pooled across 19 cities)** ·
+**lowering `NBM_CONSENSUS_ANCHOR` below 1.0 (premise confirmed on 54 rows)** ·
+**GitHub Actions `schedule` for any window-sensitive job** · ECMWF integration · §2 lows obs-history reconstruction ·
 `observations.php mode='wethr_low'` (does not exist) · timing-gated lows model ·
 betting a low the day before (not possible) · Wethr obs in the intraday
 collector · NowCast.trade · early-entry timing 3–5 days out · app-based weather
