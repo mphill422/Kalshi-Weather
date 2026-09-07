@@ -1,7 +1,12 @@
 # MPH Weather Model — Punchlist / State of Things
 
-_Last updated: 2026-09-03. Live model: **V5.31.1**. New: **FAV V1** (paper).
-Bankroll still paper._
+_Last updated: 2026-09-07. Live model: **V5.31.1**. **FAV V1.1** live and
+PROFITABLE (paper). Bankroll still paper._
+
+**2026-09-07 headline: FAV V1 is working and the weather model is not.**
+FAV V1 is **35/47 (74.5%), +$22.51 net** on real forward bets across three days,
+all three windows positive. It uses no forecast. Meanwhile all four V531 tags
+are negative despite consensus running at 0.82°F MAE.
 
 **2026-09-03 headline: V5.31's premise is CONFIRMED and the model still loses.**
 NBM runs 1.85°F cold with 2.80 MAE against consensus's 0.82 — consensus is 3.4×
@@ -9,6 +14,49 @@ more accurate, so anchoring toward it is correct. The anchor is reaching bet
 selection (bracket offset moved −0.62 → −0.25). The bracket is well centred on
 actual (+0.33). And all four V531 tags are negative. **The forecast is not the
 problem and has not been for some time. The losses are in bet selection.**
+
+---
+
+## 🚨 THE LADDER RECONSTRUCTION BUG — invalidates earlier numbers (2026-09-04)
+
+**Every "top bracket" figure produced before 2026-09-04 was measured on partial
+ladders.** `kalshi_candles` only has a row for a bracket in a given minute if
+that bracket TRADED in that minute. Austin's ladder has 6 brackets; at 14:30 UTC
+the observed count ranged from **1 to 6, median ~3**.
+
+So `ts_utc::time >= '14:30' and < '14:31'` never returned "the ladder at 10:30
+ET". It returned whichever brackets happened to print in that one minute, then
+took the max ask among those. On a day where the real 65¢ favorite did not trade
+at 14:30 but a 10¢ longshot did, the query called the longshot the favorite.
+
+**This is not a rounding issue. It biases toward days when the favorite was
+actively trading, which is not a random sample of days.**
+
+Found because a hand-logged Austin 8/31 entry (99–100 at 65¢) had no
+corresponding row — the query showed one bracket at 10¢.
+
+### The fix
+
+For each bracket, carry forward the **last observed ask at or before** the
+target minute, within a 90-minute staleness cap. That reconstructs the ladder as
+the app displays it. Guards: same-day only, and `brackets_seen` reported so thin
+ladders are visible.
+
+Coverage after the fix:
+
+| window | city-days | avg brackets | thin (≤2) | avg quote age |
+|---|---|---|---|---|
+| MORNING | 626 | 5.98 | 0 | 1.2 min |
+| MIDDAY | 626 | 5.97 | 0 | 0.7 min |
+| AFTERNOON | 626 | 5.96 | 0 | 3.7 min |
+
+**~4× more data than every number produced before this.** Quotes are fresh, not
+stale carry-forward.
+
+⚠️ A carried-forward ask is a STANDING QUOTE, not a fill. Same caution the
+punchlist already records about volume=0 at capture.
+
+**Any query written against an exact-minute filter is wrong. Re-run it.**
 
 This is the durable record. My (Claude's) memory carries summarized facts across
 chats but is not guaranteed complete — THIS FILE is the source of truth.
@@ -113,6 +161,120 @@ Positive `nbm_err` = NBM ran cold = V5.31 was right.
 
 **Meanwhile the manual track and FAV V1 run independently and need no model
 validation.** Waiting on the model is not a reason to do nothing for seven weeks.
+
+---
+
+## 📊 CORRECTED BAND NUMBERS — supersede everything earlier (2026-09-04)
+
+Reconstructed ladders, 626 city-days per window, split August vs the held-out
+September block (Aug 27 – Sep 3, backfilled 2026-09-04).
+
+| window | band | Aug n | Aug win% | Aug net | Sep n | Sep win% | Sep net |
+|---|---|---|---|---|---|---|---|
+| **MORNING** | 58–69 | 133 | **77.4** | **+10.87** | 35 | **74.3** | **+8.14** |
+| MIDDAY | 58–69 | 144 | 70.1 | +4.16 | 46 | 50.0 | **−16.27** |
+| AFTERNOON | 58–79 | ~174 | ~72 | ~+1 | 72 | ~68 | ~−3.5 |
+
+**MORNING replicated out-of-sample.** 74.3% on data it was never fitted to,
+against a 66.1% break-even, on 168 total bets. That is the single strongest
+result in the project.
+
+The naive numbers it replaces were 86.4% / +19.72 for September morning — the
+deflation to 74.3% is exactly the selection bias the ladder fix removes. **The
+true morning number is ~75%, not ~85%.**
+
+⚠️ The 80+ tier collapsed in September: 46.2% at 92¢, −50 net, in both morning
+and midday. Small cells but violent, and consistent with September being less
+predictable than August generally.
+
+---
+
+## 💰 FAV V1 FORWARD RESULTS — real, and positive (2026-09-04 → 09-06)
+
+| window | n | wins | win% | avg ask | gross | net |
+|---|---|---|---|---|---|---|
+| AFTERNOON | 14 | 12 | 85.7 | 69.7 | 16.44 | **+12.80** |
+| MIDDAY | 21 | 15 | 71.4 | 62.6 | 14.93 | **+8.88** |
+| MORNING | 12 | 8 | 66.7 | 62.3 | 4.31 | **+0.83** |
+| **TOTAL** | **47** | **35** | **74.5** | | | **+$22.51** |
+
+74.5% is dead on the corrected out-of-sample figure of 74.3%.
+
+⚠️ **The window ordering INVERTS the backtest.** Afternoon was the worst window
+in the corrected September cut (−3.5) and is the best forward (+12.80). Morning
+was the best (+8.14) and is now the weakest (+0.83). 47 bets over three days is
+far too thin to act on, and the windows are correlated (same city-days).
+
+**Do not cut a window on this.** It is recorded because it is the only real
+money either way, and because it is the reason the agreement filter was NOT
+built as a gate — see below.
+
+### Verified working (2026-09-04)
+
+First scheduled run after the cron-job.org migration: **8 cities, minutes_late
+0 on both min and max, avg ask 61.5.** All 8 cities, brackets, and prices
+matched the hand-logged Daily Capture Grid within 1¢ — including San Antonio's
+tail bracket ("94 or below"), which is where a parsing bug would hide.
+
+**The script reads the ladder correctly. Hand cross-checking can stop.**
+
+---
+
+## 🏷️ FAV V1.1 — CONSENSUS AGREEMENT TAG (deployed 2026-09-07)
+
+### The head-to-head that motivated it
+
+Reconstructed ladders, 33 days, market's favorite vs the bracket the weather
+model's CONSENSUS falls into. Same city-days, same prices, strict containment.
+
+| window | FAVORITE (all) | AGREE | DISAGREE |
+|---|---|---|---|
+| MORNING | n=165 76.4% **+9.83** | n=51 80.4% **+14.69** | n=114 74.6% +7.65 |
+| MIDDAY | n=186 65.1% **−1.02** | n=50 80.0% **+13.56** | n=136 59.6% −6.38 |
+| AFTERNOON | n=234 71.4% **−0.73** | n=71 77.5% **+5.32** | n=163 68.7% −3.37 |
+
+**Midday and afternoon are NEGATIVE unfiltered and POSITIVE filtered.** That is
+not an improvement, that is the difference between a losing window and a working
+one. The DISAGREE rows are where the losses sit.
+
+Structural detail: AGREE and CONSENSUS-alone are nearly the same set (51 vs 52
+in the morning). Consensus almost never picks an in-band bracket that isn't
+already the favorite. **So this is not "the forecast finds different bets" — it
+is "the forecast vouches for some of the market's favorites and not others."**
+
+### Why it is a TAG and not a GATE
+
+Filtering would discard ~69% of volume on the strength of a 33-day backtest
+**that the 47 bets of forward data directly contradict** — forward has all three
+windows positive unfiltered.
+
+So every in-band bet is still taken. Each row now carries
+`agrees_with_consensus` and `consensus_f`. In ~50 more settled bets per group
+the forward data answers it with real money, at zero opportunity cost.
+
+**This also means NO strip-down of V5.31 is needed.** The answer was never a
+2,091-line rewrite — it is a few lines in `fetch_favorites.py`.
+
+### Implementation notes
+
+- **Strict containment (`CONSENSUS_TOLERANCE_F = 0.0`).** `fetch_weather.py`
+  uses `tolerance=1.0` for its own gate. The backtest above was measured
+  strict; using the looser test would match more often and break comparability.
+- **`None` is not `False`.** Missing consensus or unparseable label writes NULL.
+  Counting an unknown as a disagreement would poison the comparison.
+- **Fails open everywhere.** No consensus, bad HTTP, weather model didn't run →
+  the bet still logs and settles, only the tag is lost.
+- **Timing is tight in the morning.** `fetch_weather.py` ET EDGE fires 14:00 UTC
+  and consensus rows land 14:01–14:09. FAV V1 MORNING is 14:30. **~22 minutes
+  of margin.** If the model runs late, morning rows go untagged.
+- **18 cities, not 20.** Seattle and SF are not in `settlements` (dropped in
+  V5.30), so they will ALWAYS carry NULL tags. Expected, not a bug.
+
+```sql
+ALTER TABLE public.favorites_bets
+  ADD COLUMN IF NOT EXISTS consensus_f           NUMERIC(6,2),
+  ADD COLUMN IF NOT EXISTS agrees_with_consensus BOOLEAN;
+```
 
 ---
 
@@ -438,6 +600,124 @@ for it.** The 58–69 band survived the same scrutiny; that is the difference.
 tag `FAV_V1_TIER3_DESERT`, **kill line below 76% at n=30.** Never pooled with
 `FAV_V1_*`. Do NOT size up — "for sure cities" priced at 75–85¢ is exactly the
 `CONV/AGREE/70+` failure mode (75.4% win, −2.09¢).
+
+---
+
+## 🛑 NO BETS — CLOSED on a very large sample (2026-09-06)
+
+`kalshi_snapshots ⋈ settlements`, every bracket rank, every NO price band.
+**Every cell with n>100 is negative.** Rank 1 in 58–69: −7.85 on n=311. Rank 3
+at 80+: −3.46 on n=2,491. Rank 4 at 80+: −3.64 on n=2,073.
+
+**The reason is arithmetic, not judgment.** At ranks 4–12 in the 80+ band the
+break-even required reads **100.2, 101.5, 102.4** — above 100%. Those contracts
+price at 96–99¢, so after the 3.6¢ fee they cannot break even at ANY win rate.
+That accounts for most of the NO ladder by volume.
+
+Buying NO means buying near-certainty at near-certainty prices, and the fee eats
+the entire remaining margin. The V5.28 block on NO-at-top-bracket was right;
+this extends it to **every rank and every band.**
+
+Consistent with the favorite-longshot literature: high-priced YES favorites
+being +EV is the mirror statement of NO being −EV.
+
+**Do not revisit.**
+
+---
+
+## 🛑 BRACKET-CHANGE SIGNAL — tested and CLOSED (2026-09-03)
+
+**Hypothesis:** a bracket that CHANGED in the last two hours is the market
+absorbing information, so its new favorite should be unusually reliable.
+Observed on two manual grids where every city that moved settled at the new
+bracket.
+
+In-band (58–79), CHANGED beat HELD at all four times tested with near-identical
+prices — 14:00 was +7.84 vs −7.62.
+
+**It died on two controls:**
+
+1. **Half-split.** 14:00 CHANGED was **−3.50 first half, +15.53 second half**
+   (n=21, n=31). Sign flip. Same at 15:00: −6.07 then +7.92.
+2. **All-price control REVERSED it.** CHANGED wins *less* often than HELD at
+   every time (48.5% vs 58.0% at 14:00). It only looked better on P&L because
+   it is priced ~15¢ cheaper. There is no information effect — a changed
+   bracket is simply a less settled, cheaper contract.
+
+The real explanation: **the second half was easier for everything.** HELD
+improved second-half too, at three of four times. CHANGED picked up more of that
+lift because its cells are smaller.
+
+### And the HELD half died too
+
+HELD was negative in all 16 in-band cells and looked like an exclusion filter.
+Extending to 16:00 and 17:00 — hours where the band is strongly positive — shows
+it tracks time of day, not anything structural:
+
+| time | HELD pooled |
+|---|---|
+| 14:00 | −7.62 |
+| 15:00 | −6.87 |
+| 16:00 | −1.03 |
+| 17:00 | +6.43 ⚠️ |
+
+**17:00 pooled is the only positive HELD cell and its halves are 97.3% then
+61.1%** (+24.40 then −12.04, n=37 and n=36). A 36-point swing between adjacent
+halves. Reading the pooled row alone would have concluded HELD works late.
+
+16:00 is −1.01 / −1.05 — the most STABLE cell in the table, and it says
+break-even. **HELD is the afternoon certainty curve with a different label.**
+
+---
+
+## 🛑 PERSISTENT UNCERTAINTY — tested and CLOSED (2026-09-07)
+
+**Hypothesis:** cities that sit in the 40s and 50s all day (SF, Seattle) are
+volatile in a way that might be exploitable.
+
+Classified every city-day by its own price trajectory across the three windows.
+No cities named going in — the roster falls out of the query.
+
+| trajectory | n | win% | ask 10:30 | ask 16:00 | net @4pm |
+|---|---|---|---|---|---|
+| NEVER_IN_BAND | 75 | 45.3 | 46.9 | 47.8 | **−6.11** |
+| ROSE_INTO_BAND | 301 | 76.4 | 48.7 | 79.0 | −6.19 |
+| BAND_ALL_DAY | 187 | 85.0 | 69.1 | 82.6 | −1.15 |
+| MIXED | 63 | 65.1 | 62.6 | 55.9 | +5.54 |
+
+**NEVER_IN_BAND loses exactly like the rest of the sub-58 tier.** Persistent
+cheapness is correctly priced. **The 58¢ floor holds. Question closed.**
+
+Note the other three rows are negative because this scores at the **4pm price**
+(79–83¢) — the 80+ tier that pays nothing. BAND_ALL_DAY wins 85% and still loses
+because it costs 82.6¢.
+
+### The per-city result IS real, but it is not tradeable
+
+| city | never-in-band % |
+|---|---|
+| Seattle | **59.4** |
+| San Francisco | **46.9** |
+| Denver | **42.9** |
+| Phoenix | 18.8 |
+| *everyone else* | ≤16, nine cities ≤6 |
+
+A genuine break, not a gradient — two marine-influenced west coast cities plus
+Denver's upslope problem. Physically coherent and it came out of the query
+rather than from a list.
+
+**But it means those cities RARELY PRODUCE A BET, not that they win.** Seattle
+gives a band opportunity on ~11 of 32 days. That is why SF and Seattle have n=3
+in the in-band history.
+
+Opposite extreme: **San Antonio 22/33 and Austin 17/33 band-all-day, 0%
+never-in-band** — the most confidently priced cities in the set. That is why
+they feel "automatic" and why they rarely land in the band cheap.
+
+⚠️ **EXCLUDE `KXHIGHTSDF` (Louisville).** 7 city-days, 98¢ average at both
+windows, 14.3% win rate — the same broken signature as San Diego. It is not in
+the FAV V1 roster but it IS in `kalshi_candles`, and it was silently included in
+every query written before 2026-09-07. Add it alongside TSAN/TTTN/TEWR.
 
 ---
 
@@ -937,6 +1217,141 @@ The market is nearly unbiased (avg −0.44). **This is what V5.31 addresses.**
 
 ---
 
+## 📡 SETTLEMENT STATIONS — authoritative, from weather.com/kalshi
+
+Kalshi's own page, sourced from The Weather Company.
+
+| City | Code | Station | City | Code | Station |
+|---|---|---|---|---|---|
+| Atlanta | ATL | KATL | Miami | MIA | KMIA |
+| Austin | AUS | KAUS | Minneapolis | MSP | KMSP |
+| Boston | BOS | KBOS | New Orleans | MSY | KMSY |
+| Washington DC | DCA | KDCA | New York | NYC | KNYC |
+| Denver | DEN | KDEN | Oklahoma City | OKC | KOKC |
+| Dallas | DFW | KDFW | Philadelphia | PHL | KPHL |
+| **Houston** | **HOU** | **KHOU** | Phoenix | PHX | KPHX |
+| Las Vegas | LAS | KLAS | San Antonio | SAT | KSAT |
+| Los Angeles | LAX | KLAX | Seattle | SEA | KSEA |
+| **Chicago** | **MDW** | **KMDW** | San Francisco | SFO | KSFO |
+
+⚠️ **Chicago is MIDWAY and Houston is HOBBY.** O'Hare (ORD) and Bush (IAH) are
+SEPARATE Kalshi markets and run several degrees apart — on 2026-09-06 the list
+showed HOU 93 and IAH 92. Verified correct in `fetch_weather.py`.
+
+---
+
+## 🌡️ OBSERVATION SOURCES — two corrections that cost real money
+
+### 1. ASOS reports 12–13 times an hour, NOT hourly
+
+**This was wrong in earlier guidance and it cost a bet.** The :51 METAR is the
+hourly SUMMARY; the station transmits roughly every 5 minutes. The NWS WRH Time
+Series Viewer proves it and its own docs state it:
+`weather.gov/wrh/timeseries?site=ksat`.
+
+### 2. The 5-minute obs carry TENTHS. The rounding is a DISPLAY choice.
+
+Raw METAR: `KNYC 052051Z AUTO ... 24/14 A2986 RMK AO2 SLP100 T02440144 55004`.
+The `T02440144` group is **24.4°C = 75.9°F**. `24/14` is the rounded version
+everyone shows.
+
+**What happened on 2026-09-06:** San Antonio displayed "97" for roughly ninety
+minutes, then printed 99 with no warning. The bracket flipped and a 58¢ entry
+that had reached 97¢ settled a loser. The temperature was never flat — it was
+climbing through 96.5 → 97.4, and every one of those readings displays as "97".
+
+**The move was visible in the data the entire time and invisible on the screen.**
+
+### What does NOT help
+
+- **SPECIs** fire on ceiling/visibility/wind, **not temperature drift.** Seven
+  SPECIs appeared overnight on 9/6 and none between 8:51am and 2:51pm on a
+  warming afternoon.
+- **IEM 1-minute ASOS** is an ARCHIVE, delayed 18–36 hours. Useless intraday.
+- **DSM** (`forecast.weather.gov/product.php?...product=DSM`) is issued once
+  after midnight and summarizes the COMPLETED day. Good as a settlement
+  cross-check, useless for a live decision.
+- **Wunderground** showed high cloud cover for San Antonio on 9/6 when KSAT's
+  own sky readings were CLR through FEW075 all afternoon. Second-hand source,
+  possibly a different station or a forecast. **The METAR is what settles.**
+
+### The fix — `fetch_obs_live.py` (WRITTEN, NOT YET DEPLOYED)
+
+Synoptic Data API (formerly MesoWest) serves realtime 5-minute ASOS with
+decimals, all 20 stations in ONE call:
+
+```
+https://api.synopticdata.com/v2/stations/timeseries
+  ?stid=KATL,KAUS,...&vars=air_temp&recent=1440&units=english&qc=on&token=...
+```
+
+Reports current temp to 0.1°F with TRUE obs age, running max since local
+midnight, a 30-minute trend, and a `near_edge` flag when the max is within 0.5°F
+of the next whole degree — the exact state San Antonio was in for its last hour.
+
+**Stateless by design:** recomputes the daily max from the raw 24h array every
+run rather than incrementing a stored value. A missed run cannot corrupt it and
+a bad reading cannot poison it permanently. Cheap defence against the Denver
+24.0-vs-CLI-56.0 class of bug.
+
+⚠️ **Free tier is the "Open Access program" — NON-COMMERCIAL.** Trading is
+arguably commercial. Read the terms before this becomes load-bearing.
+
+⚠️ Pre-QC preliminary data. **Kalshi settles on CLI, not this feed.** Use it to
+SEE the day, never to score it.
+
+**Needs: token, `SYNOPTIC_TOKEN` secret, the table SQL, one cron-job.org entry
+at `*/5 9-21 * * *` America/New_York.**
+
+---
+
+## 🔬 GOOGLE WEATHERNEXT 3 — researched, not started
+
+Released Aug 2026, Google DeepMind. Third-party verified by Brightband's
+Operational WeatherBench: **lowest global 2m-temperature error on 26 of 30 days
+in August**, station-level temp up to 30% better than WeatherNext 2 and up to
+40% better than ECMWF's ensemble at short lead times.
+
+Three features map unusually well:
+- **0.05° (~5 km) station-trained 2m temperature** — trained on physical ground
+  stations, which is exactly what Kalshi settles on
+- **Hourly initialization**, 24 inits/day, 48h horizon on interim runs
+- **64-member ensemble** (vs GFS ensemble's 31)
+
+### ⚠️ But the bottleneck is not forecast quality
+
+Consensus is at **0.82°F MAE** and the model still loses. Naked consensus beat
+`model_top_bracket` by 19 points. **A better forecast feeding the same machinery
+gets a better number and the same result.**
+
+The only version worth doing is **substitution**: WeatherNext replaces NBM as
+the ladder SHAPE source. NBM measured 2.80 MAE and 1.85° cold — the weakest link.
+That adds no layers.
+
+### Access paths, easiest first
+
+1. **Google Weather API (Maps Platform)** — productized, enhanced with
+   WeatherNext 3, **refreshed every 15–30 min**, normal API key, no BigQuery.
+   Likely the best fit and not yet priced.
+2. **Open-Meteo Ensemble API** — `open-meteo.com/en/docs/google-weathernext-api`.
+   Free, no key, and the existing GFS integration already uses Open-Meteo. BUT
+   it is **WeatherNext 2 at 0.25° (~28 km), 6-hourly steps, 00 and 12 UTC runs
+   only, cloud cover DERIVED not predicted.** The coarse version.
+3. **BigQuery** — subscribe via Analytics Hub, then query
+   `[project].[dataset].weathernext_2_0_0_mean`. Spatial joins with
+   `ST_INTERSECTS` on a global grid; **check the byte estimate before running.**
+   Needs a GCP project with billing — currently starting from zero.
+4. GCS Zarr — cheaper at volume, needs xarray, will not run in an Edge Function.
+
+Repos: `github.com/google-deepmind/weathernext`,
+`github.com/gena/next25-weather` (working BigQuery + Earth Engine examples).
+
+Historical forecasts cover 2026 (2024/2025 backfilling), so it can be backtested
+against existing settlements **now** rather than shadow-logged for 30 days.
+⚠️ Confirm they are genuine reforecasts, not hindcasts, before believing the MAE.
+
+---
+
 ## HOUSEKEEPING
 
 - **Supabase usage:** flagged "EXCEEDING USAGE LIMITS" around 2026-09-01,
@@ -960,6 +1375,23 @@ The market is nearly unbiased (avg −0.44). **This is what V5.31 addresses.**
   `CATEGORY=Economics`.
 - New workflows `kalshi-lows.yml`, `favorites.yml`. **Workflows only register in
   `.github/workflows/` — a yml in the repo root is invisible to Actions.**
+- **`kalshi_candles` extended to 2026-09-03** (backfill re-run 2026-09-04,
+  `DAYS_BACK=25`). Now **~1,035,000 rows**, 24 cities, Aug 2 – Sep 3. The 409
+  duplicate-key errors in the log are expected and harmless — the header sends
+  `resolution=merge-duplicates` but there is a UNIQUE constraint on
+  `(market_ticker, ts_utc)`, so overlapping rows are rejected individually while
+  new ones land. Sep 3 came back thin (18 cities) because it ran mid-settlement.
+- **`kalshi_backfill.py` date offset:** `event_date = strike_date − 1 day`. The
+  `event_date` column is NOT the strike date. Every query uses it consistently
+  so nothing breaks, but the two are not interchangeable.
+- **Candle `bracket_label` is `B94.5` / `T85` format** (`mt.split("-")[-1]`),
+  NOT the human "94-95" strings in `kalshi_snapshots`. Two tables, two formats.
+  A parser written for one will silently return nothing on the other.
+- **Intraday Atmospherics is probably redundant.** Its purpose was intraday
+  price behaviour, and `kalshi_candles` now covers 12:00–21:00 UTC at minute
+  resolution — a superset during trading hours. Before disabling: check whether
+  it covers 21:00–12:00 UTC (candles do not, and the overnight decay curve was
+  about those hours), and whether anything reads its table.
 - **When diagnosing any workflow, filter Actions by `event = schedule` first.**
   Manual `workflow_dispatch` test runs sit in the same list and read as
   scheduled failures. Cost an afternoon on 2026-09-02.
@@ -1023,6 +1455,23 @@ The market is nearly unbiased (avg −0.44). **This is what V5.31 addresses.**
 - **Two tables disagreeing may be two populations.** FAV has 58–69 as the best
   band; V531 has it as the worst. MARKET's favourite vs MODEL's pick. Do not
   reconcile them.
+- **Check that a query returns the OBJECT you think it does.** The exact-minute
+  ladder filter looked correct for weeks and was returning partial ladders the
+  entire time. Verify completeness before verifying results.
+- **An all-price control can REVERSE a banded result.** The bracket-change
+  signal beat HELD in band and lost to it at all prices — the in-band version
+  was reading a 15¢ price difference, not an information effect. Run the
+  unfiltered version of any banded finding.
+- **A pooled row can hide a sign flip.** HELD at 17:00 read +6.43 pooled and was
+  97.3% then 61.1% across halves. Always split before believing a pooled cell.
+- **Six hypotheses have now died on controls in one week:** tier-3 cities,
+  bracket-change, HELD, trust-score inversion, city lock-in timing, persistent
+  uncertainty. The two that SURVIVED — the 58–69 band and the consensus
+  agreement split — both came from large samples and both were tested against
+  data they were not derived from. That is the difference.
+- **When the strategy is working, do not add to it.** FAV V1 is +$22.51 on 47
+  bets and takes no forecast, no city filter, and no timing signal. Every idea
+  that died this week was an attempt to add something to it.
 - **Always use ASK, never mid.** You pay the ask. Mid overstates every result by
   1–2 points. This caused two analyses of the same data to disagree on 55–59.
 - **A band that comes out near zero may be two populations averaged together.**
@@ -1060,26 +1509,55 @@ extension investigated across all 19 cities and CLOSED · V5.31 premise CONFIRME
 via `nbm_p50` · bracket-midpoint drift confirmed the anchor reaches bet
 selection · price-tier split logged as a hypothesis.
 
+**Done 2026-09-04:** cron-job.org migration VERIFIED (8 cities, 0 min late, all
+matched the hand grid) · candle backfill extended to Sep 3 (~1.035M rows) ·
+**ladder reconstruction bug found and fixed** · corrected band numbers ·
+morning band replicated out-of-sample at 74.3%.
+
+**Done 2026-09-06:** NO bets CLOSED on n>2,000 cells · bracket-change signal
+CLOSED (failed half-split, reversed under all-price control) · HELD filter
+CLOSED (tracks time of day) · settlement station list confirmed from Kalshi ·
+ASOS 5-minute + decimal finding · `fetch_obs_live.py` written.
+
+**Done 2026-09-07:** head-to-head across all three windows · **FAV V1.1
+deployed** with consensus agreement tagging · persistent uncertainty CLOSED ·
+per-city trajectory result (Seattle/SF/Denver rarely qualify) · SDF excluded ·
+WeatherNext 3 access paths researched.
+
 **Immediate:**
-- **Check `favorites_bets` after 10:30 ET on 09-04.** First cron-job.org
-  dispatch. Rows + low `minutes_late` closes the whole deployment saga.
+- **Check the AFTERNOON run on 09-07** — first live consensus read. Log should
+  show `✓ cons 94.5` / `✗ cons 96.2` per city. A warning line means the read
+  failed and every row got a NULL tag.
+- **Deploy `fetch_obs_live.py`.** Needs a Synoptic token, the secret, the table
+  SQL, one cron-job.org entry. Addresses the failure that cost money twice.
 - **Investigate EDGE_T75 vs EDGE_T80 being byte-identical.** Possible duplicate
   tag being read as independent confirmation.
 - **Check the five `consensus_mae = 0.00` cities** for backfill contamination
   before the `nbm_p50` table is cited again.
 - **Confirm the fee at a second price point.** Everything net rests on one
   ticket, and the afternoon band at ~+3.7 is inside the error bar.
-- **Write the MORNING kill line down** (FAV V1 and manual both) before the
-  sample grows past the point where the threshold can be chosen honestly.
+- **Write the kill lines down** — FAV V1 per window, and the agreement threshold
+  — before the samples grow past the point where they can be chosen honestly.
 
 **Timed:** see CHECKPOINTS at the top. Model: next firing window → ~1 week →
 ~10 days → ~2 weeks → 3–7 weeks. FAV V1: first scheduled day → ~3 days →
 ~1 week → 50 settled per tag. Each an independent abort point.
 
 **Queued, not started:**
+- **Read the agreement split at ~50 settled per group.** The query is printed at
+  the end of every FAV V1.1 run. If AGREE holds its edge forward, flip the tag
+  to a gate — one line. If not, the backtest was the artifact.
+- **WeatherNext 3 as an NBM REPLACEMENT** (not an addition). Price the Maps
+  Platform Weather API first; it is the productized 15–30 min refresh path and
+  needs no GCP project. Backtest against existing settlements rather than
+  shadow-logging.
 - **Re-run the V531 price-tier split at 50 and 100 settled per tag.** If sub-70
   stays negative and 70+ fills in above break-even on real samples, a 70¢ floor
   is earned. One-line gate change, not a modelling project. **Not before then.**
+- **V5.31 STRIP-DOWN — now probably unnecessary.** The head-to-head showed the
+  useful part of consensus is a filter on FAV V1, which is now built. A stripped
+  V5.31 would be a worse copy of a strategy already running. Revisit only if the
+  agreement tag fails forward.
 - **17:00 ET window for FAV V1** — 5pm is the only afternoon cell with real net
   margin (~+6.8 vs ~+2.7 at 4pm). **Do not change during validation.** Decide at
   50 settled AFTERNOON rows.
@@ -1101,6 +1579,15 @@ selection · price-tier split logged as a hypothesis.
   ($5–12/mo). Rotate Wethr/Odds/Supabase keys; audit commits for leaked secrets.
 
 **Dead / do not relitigate:**
+**NO bets, every rank and band (break-even >100% after fees above ~96¢)** ·
+**bracket-change signal (failed half-split, reversed under all-price control)** ·
+**HELD as an exclusion filter (tracks time of day)** ·
+**persistent-uncertainty / "volatile cities" (NEVER_IN_BAND −6.11)** ·
+**per-city filtering of any kind (failed three separate tests)** ·
+**exact-minute ladder filters on `kalshi_candles`** ·
+**IEM 1-minute ASOS for intraday (18–36h archive delay)** ·
+**DSM for intraday (once daily, post-midnight)** ·
+**Wunderground as an observation source** ·
 **Lows (fees)** · **Treasuries (fees)** · **bracket-gap, spread, and momentum
 filters** · **tier-3 / 70–79 ceiling extension (−27¢ pooled across 19 cities)** ·
 **lowering `NBM_CONSENSUS_ANCHOR` below 1.0 (premise confirmed on 54 rows)** ·
