@@ -1,0 +1,42 @@
+name: Obs Live
+
+# Scheduling is handled by cron-job.org, NOT GitHub.
+#
+# GitHub delayed this repo's scheduled runs by ~3 hours on 2026-09-03. For a
+# job whose entire purpose is freshness, that is disqualifying.
+#
+# cron-job.org job:
+#   URL     https://api.github.com/repos/mphill422/Kalshi-Weather/actions/workflows/obs_live.yml/dispatches
+#   Method  POST
+#   Body    {"ref":"main"}
+#   Headers Accept: application/vnd.github+json
+#           Authorization: Bearer {PAT}
+#           X-Github-Api-Version: 2022-11-28
+#   Time zone  America/New_York
+#   Schedule   */5 9-21 * * *   (every 5 min, 9am-9pm ET)
+#
+# That window covers all four US timezones through their afternoon peaks:
+# 9am ET is 6am PT, 9pm ET is 6pm PT.
+#
+# ⚠️ Do NOT add an `on: schedule:` block. GitHub's delayed crons will fire at
+# random hours and clutter the run list with what look like failures. That has
+# already cost two debugging sessions on this repo.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  obs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - env:
+          SYNOPTIC_TOKEN: ${{ secrets.SYNOPTIC_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python fetch_obs_live.py
