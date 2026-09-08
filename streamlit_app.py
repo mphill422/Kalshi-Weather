@@ -2817,20 +2817,8 @@ else:
 
         # The comparison that matters: does the model's obs_high agree with the
         # station's own running max? A gap here is the 79.0-on-a-78-day bug.
-        if _max is not None and obs_high_today is not None:
-            _gap = round(obs_high_today - _max, 1)
-            if abs(_gap) >= 1.0:
-                st.warning(
-                    f'⚠️ Source disagreement: model obs high reads '
-                    f'{obs_high_today}F, station running max reads {_max:.1f}F '
-                    f'({_gap:+.1f}F). The station is what Kalshi settles on. '
-                    f'Verify before trusting the model\'s obs floor.')
-            else:
-                st.caption(f'✅ Model obs high {obs_high_today}F agrees with '
-                           f'station max {_max:.1f}F ({_gap:+.1f}F).')
-        elif _max is not None and obs_high_today is None:
-            st.caption(f'Model has no obs high today; station running max is '
-                       f'{_max:.1f}F.')
+        
+            
 
         # Bracket proximity, stated in values the station can actually send.
         if _max is not None and _nxt is not None:
