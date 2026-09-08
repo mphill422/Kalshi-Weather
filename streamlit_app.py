@@ -2693,7 +2693,190 @@ with st.expander('Edit Brackets', expanded=False):
 
 ladder_text = saved_ladders[city]
 st.caption('Current ladder: ' + ladder_text)
+# ============================================================================
+# LIVE OBS PANEL — paste this block into streamlit_app.py
+# ============================================================================
+#
+# WHERE IT GOES
+# Find this line (it is right after the Kalshi ladder section, ~line 1490):
+#
+#     st.caption('Current ladder: ' + ladder_text)
+#
+# Paste everything below it, BEFORE this line:
+#
+#     st.markdown('<div class="mph-section-header">🌤️ Live Weather</div>', unsafe_allow_html=True)
+#
+# WHY IT IS AN INSERT AND NOT A FULL-FILE REPLACEMENT
+# The file is 2,091 lines and works. Regenerating it to add a read-only panel
+# risks introducing an error in code that is currently fine. This block touches
+# nothing that already exists — it defines two new functions and renders one
+# new section. Delete the block to remove it entirely.
+#
+# WHAT IT DOES NOT DO
+# It does NOT change the OBS HIGH TODAY metric, compute_consensus(), or any
+# bet selection. It is a second opinion sitting next to the existing panels so
+# the two sources can be compared for a few days before anything is swapped.
+#
+# WHY IT EXISTS
+# On 2026-09-06 the Wethr panel showed "0s old" next to an observation that was
+# 48 minutes stale — "0s" meant the FETCH was fresh, not the reading. The same
+# week Wethr reported an obs high of 79.0F on a day the actual high was 78,
+# which eliminated "78 or below" from the model. obs_live is read from the
+# station Kalshi actually settles on, every 5 minutes, with the true age of the
+# observation rather than the age of the fetch.
+#
+# ⚠️ THE FEED TRANSMITS WHOLE DEGREES CELSIUS. Verified against both the NWS
+# API and Synoptic independently — the 5-minute ASOS values are integers in C,
+# and the Fahrenheit decimals are a unit-conversion artifact. Near a hot
+# afternoon the ONLY possible readings are:
+#
+#     35C = 95.0F   36C = 96.8F   37C = 98.6F   38C = 100.4F
+#
+# There is nothing between 96.8 and 98.6. The step is 1.8F. That is why the
+# column is NEXT (the next value the station can actually send) rather than
+# "distance to the next whole degree" — 97.0F is not a value KSAT can produce.
+#
+# A few stations (Boston, Minneapolis) do report native Fahrenheit tenths, so
+# their values will not sit on the Celsius grid. That is real, not a bug.
+# ============================================================================
 
+
+@st.cache_data(ttl=60)
+def _sb_fetch_obs_live_cached():
+    """Today's obs_live rows, all cities. 60s cache — the poller writes every
+    5 minutes, so a fresher cache would only add load without adding data."""
+    try:
+        r = requests.get(
+            sb_url('obs_live'),
+            headers=get_sb_headers(),
+            params={'local_date': 'eq.' + get_eastern_date(),
+                    'order': 'city.asc', 'limit': '50'},
+            timeout=10,
+        )
+        return r.json() if r.status_code == 200 else []
+    except Exception:
+        return []
+
+
+def sb_fetch_obs_live():
+    return _sb_fetch_obs_live_cached()
+
+
+# ── LIVE OBS (station truth) ────────────────────────────────────────────────
+st.markdown('<div class="mph-section-header">📡 Live Obs — Settlement Station</div>',
+            unsafe_allow_html=True)
+
+_obs_rows = sb_fetch_obs_live()
+
+if not _obs_rows:
+    st.caption('No obs_live rows for today yet. The poller runs every 5 minutes '
+               '9am–9pm ET via cron-job.org → obs_live.yml. If this stays empty '
+               'during those hours, check the Obs Live workflow.')
+else:
+    _obs_by_city = {r.get('city'): r for r in _obs_rows}
+    _this = _obs_by_city.get(city)
+
+    if _this:
+        _age = _this.get('obs_age_min')
+        _max = _this.get('day_max_f')
+        _nxt = _this.get('next_step_f')
+        _now = _this.get('temp_f')
+        _trend = _this.get('trend_30min')
+        _n = _this.get('n_obs_today')
+
+        # Age is the whole point of this panel — colour it honestly.
+        if _age is None:
+            _age_color, _age_str = '#64748b', '—'
+        elif _age <= 10:
+            _age_color, _age_str = '#00ff88', f'{_age:.0f}m ago'
+        elif _age <= 20:
+            _age_color, _age_str = '#f59e0b', f'{_age:.0f}m ago'
+        else:
+            _age_color, _age_str = '#ef4444', f'{_age:.0f}m ago ⚠️ STALE'
+
+        o1, o2, o3, o4 = st.columns(4)
+        with o1:
+            st.metric('Station Now', f'{_now:.1f} F' if _now is not None else '—')
+            st.markdown(
+                f'<div style="color:{_age_color};font-size:11px;'
+                f'font-family:\'JetBrains Mono\',monospace;">obs {_age_str}</div>',
+                unsafe_allow_html=True)
+        with o2:
+            st.metric('Running Max', f'{_max:.1f} F' if _max is not None else '—')
+            st.caption(f'{_n} obs today' if _n else 'since local midnight')
+        with o3:
+            st.metric('Next Possible', f'{_nxt:.1f} F' if _nxt is not None else '—')
+            st.caption('feed steps 1.8F (whole °C)')
+        with o4:
+            if _trend is not None:
+                st.metric('30m Trend', f'{_trend:+.1f} F')
+                st.caption('0.0 is normal — see below')
+            else:
+                st.metric('30m Trend', '—')
+                st.caption('not enough history')
+
+        # The comparison that matters: does the model's obs_high agree with the
+        # station's own running max? A gap here is the 79.0-on-a-78-day bug.
+        if _max is not None and obs_high_today is not None:
+            _gap = round(obs_high_today - _max, 1)
+            if abs(_gap) >= 1.0:
+                st.warning(
+                    f'⚠️ Source disagreement: model obs high reads '
+                    f'{obs_high_today}F, station running max reads {_max:.1f}F '
+                    f'({_gap:+.1f}F). The station is what Kalshi settles on. '
+                    f'Verify before trusting the model\'s obs floor.')
+            else:
+                st.caption(f'✅ Model obs high {obs_high_today}F agrees with '
+                           f'station max {_max:.1f}F ({_gap:+.1f}F).')
+        elif _max is not None and obs_high_today is None:
+            st.caption(f'Model has no obs high today; station running max is '
+                       f'{_max:.1f}F.')
+
+        # Bracket proximity, stated in values the station can actually send.
+        if _max is not None and _nxt is not None:
+            for _lbl, _lo, _hi in parse_ladder(ladder_text):
+                if _hi is None:
+                    continue
+                # already broken
+                if _max > _hi + 0.4:
+                    continue
+                # the next transmittable value would break this bracket
+                if _nxt > _hi + 0.4:
+                    st.info(
+                        f'📍 {_lbl}: running max {_max:.1f}F is inside, but the '
+                        f'next value the station can send is {_nxt:.1f}F, which '
+                        f'is above the {_hi}F ceiling. One step breaks it.')
+                    break
+    else:
+        st.caption(f'No obs_live row for {city} today. '
+                   f'(Seattle and San Francisco are in the poller but not in '
+                   f'this app\'s 18-city roster, and vice versa is possible.)')
+
+    with st.expander('📡 All cities — station obs', expanded=False):
+        st.caption('Read from Kalshi\'s own settlement stations every 5 minutes. '
+                   'NEXT is the next value the station can physically transmit, '
+                   'not the next whole degree — the feed sends whole degrees '
+                   'Celsius, so Fahrenheit moves in 1.8F steps.')
+        _tbl = []
+        for _r in sorted(_obs_rows,
+                         key=lambda x: (x.get('day_max_f') is None,
+                                        -(x.get('day_max_f') or 0))):
+            _a = _r.get('obs_age_min')
+            _t = _r.get('trend_30min')
+            _tbl.append({
+                'City': _r.get('city', '—'),
+                'Station': _r.get('station', '—'),
+                'Now': f"{_r['temp_f']:.1f}F" if _r.get('temp_f') is not None else '—',
+                'Obs Age': (f"{_a:.0f}m" + (' ⚠️' if _a and _a > 20 else '')) if _a is not None else '—',
+                'Day Max': f"{_r['day_max_f']:.1f}F" if _r.get('day_max_f') is not None else '—',
+                'Next': f"{_r['next_step_f']:.1f}F" if _r.get('next_step_f') is not None else '—',
+                '30m': (('+' if _t > 0 else '') + f'{_t:.1f}') if _t is not None else '—',
+                'N': _r.get('n_obs_today', '—'),
+            })
+        st.dataframe(pd.DataFrame(_tbl), use_container_width=True, hide_index=True)
+        st.caption('⚠️ Preliminary, pre-QC observations. Kalshi settles on the '
+                   'official CLI, not this feed. Use it to SEE the day, never '
+                   'to score it.')
 
 st.markdown('<div class="mph-section-header">🌤️ Live Weather</div>', unsafe_allow_html=True)
 
