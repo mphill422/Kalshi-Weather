@@ -1,131 +1,108 @@
 """
 fetch_obs_live.py — running daily max from the station Kalshi settles on.
 
-WHY THIS EXISTS, AND WHAT IT CANNOT DO
-=======================================
-On 2026-09-06 San Antonio displayed "97" for roughly ninety minutes, then
-printed 99. The bracket flipped and a 58c entry that had reached 97c settled a
-loser. Two days were spent hunting for a feed with finer resolution.
+V2 (2026-09-08): THE T-GROUP. This is the change that matters.
+=================================================================
+On 2026-09-08 the panel showed New York at 79.0F. The station had actually
+transmitted 25.6C — which is 78.1F. A full degree lower. That difference sat
+directly on a bracket boundary and it changed a live decision.
 
-That feed does not exist. Here is what the data actually looks like — Synoptic,
-KSAT, ten consecutive 5-minute observations on 2026-09-07:
+Both hourly METARs that afternoon read the same:
 
-    96.8, 95.0, 95.0, 95.0, 96.8, 96.8, 96.8, 95.0, 96.8, 96.8
+    KNYC 081851Z AUTO 28006KT 10SM CLR 26/13 A3023 RMK AO2 SLP229 T02560128
+    KNYC 081951Z AUTO VRB03KT 10SM CLR 26/13 A3023 RMK AO2 SLP228 T02560133
+                                                                  ^^^^^^
+The `26/13` is the rounded pair everyone displays. The `T0256` is the real
+number: 25.6C, precise to a tenth. That group is in every ASOS METAR and every
+consumer source throws it away.
 
-Two distinct values. 95.0F is exactly 35C. 96.8F is exactly 36C.
+WHY THE 5-MINUTE FEED CANNOT GIVE YOU THIS
+-------------------------------------------
+Verified independently against api.weather.gov and Synoptic: the 5-minute ASOS
+observations transmit WHOLE DEGREES CELSIUS. Near a hot afternoon the only
+values that exist are:
 
-⚠️ THE 5-MINUTE ASOS FEED TRANSMITS WHOLE DEGREES CELSIUS. The Fahrenheit
-decimals are a unit conversion artifact, not precision. The only readings
-possible near a hot afternoon are:
+    35C = 95.0F   36C = 96.8F   37C = 98.6F   38C = 100.4F
 
-    35C = 95.0F     36C = 96.8F     37C = 98.6F     38C = 100.4F
+There is nothing between 96.8 and 98.6 — the step is 1.8F. So a 5-minute
+reading of "79.0F" actually means "somewhere in 25.5C to 26.4C", which is
+77.9F to 79.5F. On a 79-or-below bracket that range spans the boundary.
 
-There is NOTHING between 96.8 and 98.6. The step is 1.8F.
+The T-group collapses that range to a single number. It is available ONCE AN
+HOUR, at :51, and it is the only precise reading the station publishes.
 
-So the 97 -> 99 jump was the station stepping 36C to 37C. Nothing was hidden.
-There was genuinely no intermediate value to see, and no amount of polling or
-paying would have produced one.
+WHAT V2 ADDS
+------------
+  - metar_temp_f   : the T-group value, to a tenth
+  - metar_time_utc : when that METAR was issued
+  - metar_age_min  : true age of the precise reading
+  - precise_max_f  : running max computed from T-GROUPS ONLY
+  - precise_max_time
+  - n_metars_today : how many hourly reports have landed
 
-Verified against BOTH feeds independently:
-  - api.weather.gov 5-minute rows: temperature.value = 35, 35, 35, 36, 35 (C)
-  - Synoptic same window: 95.0, 95.0, 95.0, 96.8, 95.0 (F)
-Same numbers. Synoptic offers nothing NWS does not on resolution.
+So the panel can show both: the 5-minute feed for currency, the T-group for
+precision, and the gap between them made visible instead of hidden.
 
-⚠️ ONLY the hourly :51 METAR carries true tenths, in the T-group of the raw
-message: `T03500194` = 35.0C / 19.4C dewpoint. Once an hour, not every 5 min.
+⚠️ THE PRECISE MAX IS HOURLY, THE FEED MAX IS 5-MINUTELY. They answer different
+questions and neither is strictly better:
 
-WHAT THIS DOES BUY, WHICH IS STILL WORTH HAVING
-------------------------------------------------
-  1. TRUE OBSERVATION AGE. The Streamlit panel showed "0s old" next to an
-     observation that was 48 minutes stale — "0s" meant the FETCH was fresh,
-     not the reading. This reports the age of the reading itself.
-  2. A RUNNING MAX COMPUTED FROM RAW OBSERVATIONS at the station Kalshi
-     settles on, rather than trusting a vendor's summary field. On 2026-09-06
-     Wethr reported an obs high of 79.0F on a day the actual high was 78 —
-     which eliminated "78 or below" from the model and was simply wrong.
-     The punchlist also records Denver at 24.0F against a CLI of 56.0F with
-     every quality flag reading clean.
-  3. 5-minute cadence on that max, all 20 stations in ONE API call.
-  4. Sky condition from the SAME station. Wunderground showed high cloud cover
-     for San Antonio on 9/6 while KSAT itself read CLR through FEW075 all
-     afternoon. Second-hand source, wrong answer.
+  - day_max_f     may MISS the true peak (whole-degree C, up to 0.9F low) but
+                  samples every 5 minutes so it rarely misses the peak HOUR
+  - precise_max_f is exact to a tenth but only samples 12-14 times a day, so a
+                  peak that occurs between :51 reports is invisible to it
 
-WHAT IT IS NOT
---------------
-NOT a forecast. It reports what the high IS so far and has no opinion about
-where it ends up. Do not let a rising obs floor talk you out of a band entry —
-the 58-69c band is measured on the ENTRY price, not on how the afternoon feels.
+Kalshi settles on CLI, which is built from the precise record. So
+precise_max_f is closer to what settles, but it is a FLOOR — the true daily max
+is at least that, possibly higher if the peak fell between hourly reports.
 
-NOT a settlement source. Kalshi settles on the official CLI. These are pre-QC
-preliminary observations. Use this to SEE the day, never to score it.
+⚠️ SOME STATIONS REPORT LESS OFTEN THAN OTHERS. KNYC (Central Park) produced
+14 observations by 2:38pm on 2026-09-08 while the airport ASOS sites had 244+.
+It also SKIPPED or delayed its 19:51 report by more than ten minutes that day —
+confirmed against two independent NWS paths, so it was the station, not a
+cache. n_metars_today makes that visible per city.
 
-NOT relevant to FAV V1 at all. That strategy never looks at a temperature.
+WHY THIS FILE EXISTS AT ALL
+----------------------------
+The Streamlit panel showed "0s old" next to an observation that was 48 minutes
+stale — "0s" meant the FETCH was fresh, not the reading. The same week Wethr
+reported an obs high of 79.0F on a day the actual high was 78, which eliminated
+"78 or below" from the model. This reads the station Kalshi settles on, reports
+the true age of the reading, and computes the running max from raw observations
+rather than trusting a vendor's summary field.
 
-NEAR-EDGE IS MEASURED IN CELSIUS, DELIBERATELY
------------------------------------------------
-An earlier draft flagged when the running max came within 0.5F of the next
-whole Fahrenheit degree. That is meaningless when the underlying values move in
-1.8F steps — the max is ALWAYS sitting on a value like 96.8 and can only ever
-jump to 98.6.
-
-So the flag tracks what actually matters: how close the running max is to a
-Kalshi BRACKET BOUNDARY, and what the next possible reading would be. If the
-max is 96.8 and the bracket is 96-97, the next transmittable value (98.6)
-breaks it. That is real information. "0.2F from 97" is not.
+NOT a forecast. NOT a settlement source. NOT relevant to FAV V1, which never
+looks at a temperature.
 
 STATIONS
 --------
 Kalshi's OWN settlement stations, read off weather.com/kalshi.
 Chicago is MIDWAY (KMDW) and Houston is HOBBY (KHOU) — O'Hare and Bush are
-SEPARATE Kalshi markets and run several degrees apart (on 2026-09-06 the list
-showed HOU 93 and IAH 92). Getting these wrong produces settlement surprises
-that look like model error.
+SEPARATE Kalshi markets and run several degrees apart.
 
 SETUP
 -----
-1. Synoptic account -> Credentials -> Public tokens -> Create token.
-   (A private KEY is not a token. Keys manage tokens; you cannot make data
-   requests with a key.)
-2. GitHub secret: SYNOPTIC_TOKEN
-3. Table (Supabase SQL editor, safe to re-run):
+1. Synoptic public token -> GitHub secret SYNOPTIC_TOKEN
+2. Table columns (safe to re-run):
 
-  CREATE TABLE IF NOT EXISTS public.obs_live (
-    id            BIGSERIAL PRIMARY KEY,
-    city          TEXT NOT NULL,
-    station       TEXT NOT NULL,
-    local_date    DATE NOT NULL,
-    temp_f        NUMERIC(6,2),
-    temp_time_utc TIMESTAMPTZ,
-    obs_age_min   NUMERIC(6,1),
-    day_max_f     NUMERIC(6,2),
-    day_max_time  TIMESTAMPTZ,
-    next_step_f   NUMERIC(6,2),
-    trend_30min   NUMERIC(5,2),
-    n_obs_today   INTEGER,
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (city, local_date)
-  );
-  ALTER TABLE public.obs_live ENABLE ROW LEVEL SECURITY;
-  CREATE POLICY "Allow all access" ON public.obs_live
-    FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);
-  CREATE INDEX IF NOT EXISTS idx_obs_live_date ON public.obs_live (local_date);
+  ALTER TABLE public.obs_live
+    ADD COLUMN IF NOT EXISTS metar_temp_f     NUMERIC(6,2),
+    ADD COLUMN IF NOT EXISTS metar_time_utc   TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS metar_age_min    NUMERIC(6,1),
+    ADD COLUMN IF NOT EXISTS precise_max_f    NUMERIC(6,2),
+    ADD COLUMN IF NOT EXISTS precise_max_time TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS n_metars_today   INTEGER;
 
-4. cron-job.org -> workflow_dispatch on obs_live.yml,
-   America/New_York, every 5 min 9am-9pm ET.
+3. cron-job.org -> workflow_dispatch on obs_live.yml, America/New_York,
+   */5 9-21 * * *.  NOT GitHub's `schedule` — it delayed this repo's runs by
+   ~3 hours on 2026-09-03.
 
-   ⚠️ NOT GitHub's `schedule`. GitHub delayed this repo's scheduled runs by
-   ~3 HOURS on 2026-09-03. For a job whose entire purpose is freshness that is
-   disqualifying.
-
-STATELESS BY DESIGN. Every run recomputes the daily max from the raw 24h array
-rather than incrementing a stored value. A missed run cannot corrupt the max and
+STATELESS BY DESIGN. Every run recomputes both maxima from the raw arrays
+rather than incrementing stored values. A missed run cannot corrupt the max and
 a bad reading cannot poison it permanently.
-
-⚠️ LICENSING. Confirm your Synoptic account tier covers this use. The free Open
-Access program is for academic and non-profit research.
 """
 
 import os
+import re
 import requests
 import datetime as dt
 from zoneinfo import ZoneInfo
@@ -135,6 +112,8 @@ SB_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SB_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ["SUPABASE_KEY"]
 
 SYNOPTIC = "https://api.synopticdata.com/v2/stations/timeseries"
+NWS_OBS = "https://api.weather.gov/stations/{stid}/observations"
+NWS_HEADERS = {"User-Agent": "kalshi-obs/2.0", "Accept": "application/geo+json"}
 
 # Kalshi settlement stations. Chicago = MIDWAY. Houston = HOBBY.
 STATIONS = {
@@ -161,11 +140,13 @@ STATIONS = {
 }
 
 TREND_WINDOW_MIN = 30
-
-# An observation older than this is called out. The 5-minute feed means a
-# healthy station is never more than ~6 minutes stale; 20 means something is
-# wrong with the station or the feed, not with the weather.
 STALE_WARN_MIN = 20
+
+# T-group: T + sign + 3 digits (temp in tenths C) + sign + 3 digits (dewpoint).
+# Sign digit is 0 for positive, 1 for negative.
+#   T02560128 -> +25.6C / +12.8C
+#   T10061033 -> -00.6C /  -3.3C
+T_GROUP = re.compile(r"\bT([01])(\d{3})([01])(\d{3})\b")
 
 
 def sb_headers(prefer="return=minimal"):
@@ -177,12 +158,33 @@ def sb_headers(prefer="return=minimal"):
     }
 
 
+def parse_t_group(raw_message):
+    """Precise temperature in F from a METAR remark T-group, or None.
+
+    This is the whole point of V2. `26/13` in the body is rounded; `T02560128`
+    carries tenths. Every ASOS METAR has it; every consumer display drops it.
+    """
+    if not raw_message:
+        return None
+    m = T_GROUP.search(raw_message)
+    if not m:
+        return None
+    try:
+        sign, tenths = m.group(1), m.group(2)
+        c = int(tenths) / 10.0
+        if sign == "1":
+            c = -c
+        return round(c * 9.0 / 5.0 + 32.0, 2)
+    except Exception:
+        return None
+
+
 def next_celsius_step_f(temp_f):
-    """The next value the station could actually transmit, in F.
+    """Next value the 5-minute feed could transmit, in F.
 
     The feed sends whole degrees C, so from 96.8F (36C) the only possible next
-    reading up is 98.6F (37C). Reporting "0.2F from 97" would be nonsense —
-    97.0F is not a value this station can produce.
+    reading up is 98.6F (37C). "0.2F from 97" would be nonsense — 97.0F is not
+    a value this station can produce.
     """
     try:
         c = (float(temp_f) - 32.0) * 5.0 / 9.0
@@ -191,15 +193,15 @@ def next_celsius_step_f(temp_f):
         return None
 
 
-def fetch_all():
-    """One call for all 20 stations, 24h of air_temp at native resolution."""
+def fetch_synoptic():
+    """One call, all 20 stations, 24h of air_temp at native (~5 min) cadence."""
     params = {
         "stid": ",".join(STATIONS.keys()),
         "vars": "air_temp",
-        "recent": 1440,              # minutes
-        "units": "english",          # degrees F (converted from native C)
+        "recent": 1440,
+        "units": "english",
         "obtimezone": "utc",
-        "qc": "on",                  # surface QC rather than silently passing
+        "qc": "on",
         "token": SYNOPTIC_TOKEN,
     }
     try:
@@ -218,18 +220,60 @@ def fetch_all():
     return data
 
 
-def parse_station(entry, tzname, now_utc):
-    """Rows for the station's LOCAL calendar day, midnight to now.
+def fetch_metars(stid, tzname, now_utc):
+    """Hourly METARs for today, parsed for T-group precision.
 
-    Local date matters: a 20:40 UTC observation is the same calendar day in
-    New York and in Phoenix, but the daily max must reset at LOCAL midnight
-    because that is what Kalshi settles on.
+    One request per station — 20 calls per run. NWS has no bulk endpoint, and
+    24 observations is enough to cover a full day of :51 reports plus SPECIs.
+
+    Returns (rows, n) where rows is [(when_utc, temp_f), ...] for TODAY in the
+    station's LOCAL calendar day, sorted oldest first.
+    """
+    try:
+        r = requests.get(NWS_OBS.format(stid=stid),
+                         params={"limit": 24},
+                         headers=NWS_HEADERS, timeout=25)
+        if r.status_code != 200:
+            return [], 0
+        features = (r.json() or {}).get("features") or []
+    except Exception as e:
+        print(f"    {stid} METAR fetch failed: {type(e).__name__}")
+        return [], 0
+
+    tz = ZoneInfo(tzname)
+    today_local = now_utc.astimezone(tz).date()
+
+    rows = []
+    for f in features:
+        props = f.get("properties") or {}
+        raw = props.get("rawMessage")
+        ts = props.get("timestamp")
+        if not raw or not ts:
+            continue
+        t_f = parse_t_group(raw)
+        if t_f is None:
+            continue
+        try:
+            when = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if when.astimezone(tz).date() != today_local:
+            continue
+        rows.append((when, t_f))
+
+    rows.sort(key=lambda x: x[0])
+    return rows, len(rows)
+
+
+def parse_station(entry, tzname, now_utc):
+    """5-minute rows for the station's LOCAL calendar day.
+
+    Local date matters: the daily max must reset at LOCAL midnight, because
+    that is the day Kalshi settles.
     """
     obs = entry.get("OBSERVATIONS") or {}
     times = obs.get("date_time") or []
-    temps = (obs.get("air_temp_set_1")
-             or obs.get("air_temp_set_1d")
-             or [])
+    temps = (obs.get("air_temp_set_1") or obs.get("air_temp_set_1d") or [])
     if not times or not temps:
         return [], None
 
@@ -256,11 +300,9 @@ def parse_station(entry, tzname, now_utc):
 
 
 def trend_over(rows, minutes):
-    """Change in F across the last `minutes`. None if not enough history.
-
-    Note this will read 0.0 a lot — the feed steps in 1.8F increments, so a
-    genuinely warming afternoon shows flat until it jumps a full step.
-    """
+    """Change in F across the last `minutes`. Reads 0.0 often — the 5-minute
+    feed steps 1.8F at a time, so a warming afternoon looks flat until it
+    jumps a whole Celsius degree."""
     if len(rows) < 2:
         return None
     latest_t, latest_v = rows[-1]
@@ -288,52 +330,66 @@ def upsert(row):
 
 def main():
     now_utc = dt.datetime.now(dt.timezone.utc)
-    print(f"OBS LIVE | {now_utc:%Y-%m-%d %H:%M:%S} UTC | {len(STATIONS)} stations")
-    print("running daily max from Kalshi's own settlement stations")
-    print("⚠️ feed transmits WHOLE DEGREES C — F values step 1.8 at a time\n")
+    print(f"OBS LIVE v2 | {now_utc:%Y-%m-%d %H:%M:%S} UTC | {len(STATIONS)} stations")
+    print("5-min feed = whole degrees C (1.8F steps) | hourly METAR T-group = tenths\n")
 
-    data = fetch_all()
+    data = fetch_synoptic()
     if not data:
-        print("no data returned — aborting")
+        print("no Synoptic data — aborting")
         return
 
     stations = data.get("STATION") or []
-    print(f"{'CITY':<15} {'NOW':>7} {'AGE':>5}  {'DAY MAX':>8} {'AT':>7}  "
-          f"{'NEXT':>7}  {'30m':>5}   n")
-    print("-" * 68)
+    by_stid = {(e.get("STID") or "").upper(): e for e in stations}
 
-    seen = set()
+    print(f"{'CITY':<15} {'FEED':>6} {'AGE':>5}  {'T-GRP':>6} {'AGE':>5}  "
+          f"{'FEEDMAX':>7} {'PRECMAX':>7} {'NEXT':>6}  {'30m':>5}  n/m")
+    print("-" * 88)
+
     written = 0
-    for entry in stations:
-        stid = (entry.get("STID") or "").upper()
-        if stid not in STATIONS:
+    for stid, (city, tzname) in STATIONS.items():
+        entry = by_stid.get(stid)
+        if not entry:
+            print(f"{city:<15} no Synoptic data")
             continue
-        city, tzname = STATIONS[stid]
-        seen.add(stid)
 
         rows, local_date = parse_station(entry, tzname, now_utc)
         if not rows:
-            print(f"{city:<15} {'—':>7}  no observations today")
+            print(f"{city:<15} no observations today")
             continue
 
         tz = ZoneInfo(tzname)
         last_t, last_v = rows[-1]
         age_min = round((now_utc - last_t).total_seconds() / 60.0, 1)
-
         max_t, max_v = max(rows, key=lambda x: x[1])
         trend = trend_over(rows, TREND_WINDOW_MIN)
         next_step = next_celsius_step_f(max_v)
 
+        # V2: the precise hourly record
+        metars, n_metars = fetch_metars(stid, tzname, now_utc)
+        if metars:
+            m_last_t, m_last_v = metars[-1]
+            m_age = round((now_utc - m_last_t).total_seconds() / 60.0, 1)
+            pm_t, pm_v = max(metars, key=lambda x: x[1])
+        else:
+            m_last_t = m_last_v = m_age = pm_t = pm_v = None
+
         flag = ""
         if age_min > STALE_WARN_MIN:
-            flag += f"  ⚠️ STALE {age_min:.0f}m"
-        if trend is not None and trend > 0:
-            flag += f"  ↑ +{trend:.1f}/30m"
+            flag += f"  ⚠️ FEED {age_min:.0f}m"
+        if m_age is not None and m_age > 75:
+            flag += f"  ⚠️ METAR {m_age:.0f}m"
+        # the gap that cost a decision on 2026-09-08
+        if pm_v is not None and abs(max_v - pm_v) >= 0.8:
+            flag += f"  ⚠️ feed/T-grp gap {max_v - pm_v:+.1f}F"
 
-        print(f"{city:<15} {last_v:>7.1f} {age_min:>4.0f}m  {max_v:>8.1f} "
-              f"{max_t.astimezone(tz):%H:%M}  {next_step:>7.1f}  "
-              f"{(f'{trend:+.1f}' if trend is not None else '—'):>5} "
-              f"{len(rows):>4}{flag}")
+        print(f"{city:<15} {last_v:>6.1f} {age_min:>4.0f}m  "
+              f"{(f'{m_last_v:.1f}' if m_last_v is not None else '—'):>6} "
+              f"{(f'{m_age:.0f}m' if m_age is not None else '—'):>5}  "
+              f"{max_v:>7.1f} "
+              f"{(f'{pm_v:.1f}' if pm_v is not None else '—'):>7} "
+              f"{next_step:>6.1f}  "
+              f"{(f'{trend:+.1f}' if trend is not None else '—'):>5}  "
+              f"{len(rows)}/{n_metars}{flag}")
 
         if upsert({
             "city": city,
@@ -347,20 +403,24 @@ def main():
             "next_step_f": next_step,
             "trend_30min": trend,
             "n_obs_today": len(rows),
+            "metar_temp_f": round(m_last_v, 2) if m_last_v is not None else None,
+            "metar_time_utc": m_last_t.isoformat() if m_last_t else None,
+            "metar_age_min": m_age,
+            "precise_max_f": round(pm_v, 2) if pm_v is not None else None,
+            "precise_max_time": pm_t.isoformat() if pm_t else None,
+            "n_metars_today": n_metars,
             "updated_at": now_utc.isoformat(),
         }):
             written += 1
 
-    missing = set(STATIONS) - seen
-    if missing:
-        print(f"\n  no data returned for: {', '.join(sorted(missing))}")
     print(f"\n  wrote {written} rows")
-
-    print("\nNEXT is the next value the station can actually transmit.")
-    print("If DAY MAX is 96.8 and your bracket is 96-97, NEXT (98.6) breaks it.")
-    print("\n  select city, temp_f, obs_age_min, day_max_f, next_step_f, trend_30min")
+    print("\n  FEEDMAX is 5-minutely but quantized to whole degrees C.")
+    print("  PRECMAX is exact to a tenth but only ~12-14 samples a day.")
+    print("  PRECMAX is a FLOOR — a peak between :51 reports is invisible to it.")
+    print("\n  select city, temp_f, metar_temp_f, day_max_f, precise_max_f,")
+    print("         obs_age_min, metar_age_min, n_metars_today")
     print("  from obs_live where local_date = current_date")
-    print("  order by day_max_f desc;")
+    print("  order by precise_max_f desc nulls last;")
 
 
 if __name__ == "__main__":
