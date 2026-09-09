@@ -1,8 +1,66 @@
 """
 fetch_obs_live.py — running daily max from the station Kalshi settles on.
 
-V2.1 (2026-09-08): THE T-GROUP, with the day-window fix.
+V2.2 (2026-09-09): THE STALE ROW FIX.
 =================================================================
+On 2026-09-09 the panel showed San Antonio at a DAY MAX of 81.0F, in a green
+box, at 5:19pm ET. The station had actually reached 97.0F at 3:51pm local. The
+panel was not wrong about the data it had — it was showing a database row
+written at about 13:24Z (8:24am local) and never updated since. Nine hours
+stale, displayed as if it were live.
+
+Boston showed the same signature (an off-grid 81.0F) the week before. Same
+failure, and it will keep happening until the three causes below are closed.
+
+WHAT WAS ACTUALLY BROKEN
+------------------------
+1. THE TOTAL ABORT. `main()` did:
+
+       data = fetch_synoptic()
+       if not data:
+           print("no Synoptic data — aborting")
+           return
+
+   One failed Synoptic call — expired token, quota exhausted, a 500, a timeout
+   — and the ENTIRE run returned before writing a single row. Not one city
+   updated. The previous row stayed in the table looking perfectly healthy,
+   because nothing in it records WHEN it was written relative to now. Every
+   subsequent run hit the same wall and did the same nothing.
+
+   V2.2 degrades instead of aborting. If Synoptic is down the run continues on
+   METARs alone and still writes rows, because a row that says "METAR only,
+   feed unavailable" is infinitely better than a row from this morning.
+
+2. THE NWS TRUNCATION — the mirror image of the V2.0 bug.
+   V2.0 used `limit=24` and got the 24 most RECENT observations, so it caught
+   only the last hour or two. V2.1 fixed that with `start=local_midnight` but
+   passed NO limit. api.weather.gov applies its own default cap and, with a
+   start bound, returns the OLDEST records in the window. So the day was cut
+   off from the FRONT: San Antonio returned 11 METARs ending at 13:24Z, and
+   `precise_max_f` became the max of the MORNING — 81.0F — while the afternoon
+   climb to 97.0F was never in the array at all.
+
+   V2.2 passes an explicit `limit`, bounds with `end`, and follows pagination
+   if the API offers it. It also asserts the newest row it got back is roughly
+   current, and flags the station if it isn't.
+
+3. NOTHING MEASURED FRESHNESS AT READ TIME. `obs_age_min` was computed when
+   the row was WRITTEN. A row written at 13:24Z saying "obs_age_min: 4.2" still
+   says 4.2 at 22:00Z. The panel had no way to know.
+
+   V2.2 writes `updated_at` (it already did), plus `is_stale`, `stale_reason`,
+   `synoptic_ok` and `metar_ok`. The panel must compare `updated_at` to NOW
+   itself — see the note at the bottom of this file.
+
+⚠️ THE DISPLAY IS STILL HALF THE BUG. This file cannot stop streamlit_app.py
+from painting a nine-hour-old number green. The panel MUST refuse to show a
+DAY MAX at all when now() - updated_at exceeds ~15 minutes. Fields are provided
+below; wiring them up is a change to streamlit_app.py.
+
+--- everything below is the V2.1 documentation, unchanged and still true ---
+
+THE T-GROUP
+-----------
 On 2026-09-08 the panel showed New York at 79.0F. The station had actually
 transmitted 25.6C — which is 78.1F. A full degree lower. That difference sat
 directly on a bracket boundary and it changed a live decision.
@@ -31,18 +89,6 @@ reading of "79.0F" actually means "somewhere in 25.5C to 26.4C", which is
 The T-group collapses that range to a single number. It is available ONCE AN
 HOUR, at :51, and it is the only precise reading the station publishes.
 
-WHAT V2 ADDS
-------------
-  - metar_temp_f   : the T-group value, to a tenth
-  - metar_time_utc : when that METAR was issued
-  - metar_age_min  : true age of the precise reading
-  - precise_max_f  : running max computed from T-GROUPS ONLY
-  - precise_max_time
-  - n_metars_today : how many hourly reports have landed
-
-So the panel can show both: the 5-minute feed for currency, the T-group for
-precision, and the gap between them made visible instead of hidden.
-
 ⚠️ THE PRECISE MAX IS HOURLY, THE FEED MAX IS 5-MINUTELY. They answer different
 questions and neither is strictly better:
 
@@ -57,18 +103,8 @@ is at least that, possibly higher if the peak fell between hourly reports.
 
 ⚠️ SOME STATIONS REPORT LESS OFTEN THAN OTHERS. KNYC (Central Park) produced
 14 observations by 2:38pm on 2026-09-08 while the airport ASOS sites had 244+.
-It also SKIPPED or delayed its 19:51 report by more than ten minutes that day —
-confirmed against two independent NWS paths, so it was the station, not a
-cache. n_metars_today makes that visible per city.
-
-WHY THIS FILE EXISTS AT ALL
-----------------------------
-The Streamlit panel showed "0s old" next to an observation that was 48 minutes
-stale — "0s" meant the FETCH was fresh, not the reading. The same week Wethr
-reported an obs high of 79.0F on a day the actual high was 78, which eliminated
-"78 or below" from the model. This reads the station Kalshi settles on, reports
-the true age of the reading, and computes the running max from raw observations
-rather than trusting a vendor's summary field.
+It also SKIPPED or delayed its 19:51 report by more than ten minutes that day.
+n_metars_today makes that visible per city.
 
 NOT a forecast. NOT a settlement source. NOT relevant to FAV V1, which never
 looks at a temperature.
@@ -90,7 +126,11 @@ SETUP
     ADD COLUMN IF NOT EXISTS metar_age_min    NUMERIC(6,1),
     ADD COLUMN IF NOT EXISTS precise_max_f    NUMERIC(6,2),
     ADD COLUMN IF NOT EXISTS precise_max_time TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS n_metars_today   INTEGER;
+    ADD COLUMN IF NOT EXISTS n_metars_today   INTEGER,
+    ADD COLUMN IF NOT EXISTS is_stale         BOOLEAN,
+    ADD COLUMN IF NOT EXISTS stale_reason     TEXT,
+    ADD COLUMN IF NOT EXISTS synoptic_ok      BOOLEAN,
+    ADD COLUMN IF NOT EXISTS metar_ok         BOOLEAN;
 
 3. cron-job.org -> workflow_dispatch on obs_live.yml, America/New_York,
    */5 9-21 * * *.  NOT GitHub's `schedule` — it delayed this repo's runs by
@@ -113,7 +153,7 @@ SB_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ["SUPABASE_KEY"]
 
 SYNOPTIC = "https://api.synopticdata.com/v2/stations/timeseries"
 NWS_OBS = "https://api.weather.gov/stations/{stid}/observations"
-NWS_HEADERS = {"User-Agent": "kalshi-obs/2.1", "Accept": "application/geo+json"}
+NWS_HEADERS = {"User-Agent": "kalshi-obs/2.2", "Accept": "application/geo+json"}
 
 # Kalshi settlement stations. Chicago = MIDWAY. Houston = HOBBY.
 STATIONS = {
@@ -140,7 +180,9 @@ STATIONS = {
 }
 
 TREND_WINDOW_MIN = 30
-STALE_WARN_MIN = 20
+STALE_WARN_MIN = 20          # 5-minute feed considered stale past this
+METAR_STALE_MIN = 75         # hourly METAR considered stale past this
+NWS_LIMIT = 500              # ⚠️ V2.2: explicit. Absent, the API truncates.
 
 # T-group: T + sign + 3 digits (temp in tenths C) + sign + 3 digits (dewpoint).
 # Sign digit is 0 for positive, 1 for negative.
@@ -161,8 +203,8 @@ def sb_headers(prefer="return=minimal"):
 def parse_t_group(raw_message):
     """Precise temperature in F from a METAR remark T-group, or None.
 
-    This is the whole point of V2. `26/13` in the body is rounded; `T02560128`
-    carries tenths. Every ASOS METAR has it; every consumer display drops it.
+    `26/13` in the body is rounded; `T02560128` carries tenths. Every ASOS
+    METAR has it; every consumer display drops it.
     """
     if not raw_message:
         return None
@@ -194,7 +236,11 @@ def next_celsius_step_f(temp_f):
 
 
 def fetch_synoptic():
-    """One call, all 20 stations, 24h of air_temp at native (~5 min) cadence."""
+    """One call, all 20 stations, 24h of air_temp at native (~5 min) cadence.
+
+    Returns None on ANY failure. ⚠️ V2.2: a None here no longer aborts the run —
+    see main(). That abort is what froze every row for nine hours on 09-09.
+    """
     params = {
         "stid": ",".join(STATIONS.keys()),
         "vars": "air_temp",
@@ -212,7 +258,11 @@ def fetch_synoptic():
     if r.status_code != 200:
         print(f"  Synoptic HTTP {r.status_code}: {r.text[:200]}")
         return None
-    data = r.json()
+    try:
+        data = r.json()
+    except Exception as e:
+        print(f"  Synoptic returned non-JSON: {type(e).__name__}")
+        return None
     summary = data.get("SUMMARY") or {}
     if summary.get("RESPONSE_CODE") != 1:
         print(f"  Synoptic error: {summary.get('RESPONSE_MESSAGE')}")
@@ -223,40 +273,59 @@ def fetch_synoptic():
 def fetch_metars(stid, tzname, now_utc):
     """Hourly METARs for today, parsed for T-group precision.
 
-    ⚠️ MUST bound by `start`, NOT by `limit`. V2.0 used limit=24, which returns
-    the 24 most RECENT observations — on an airport station reporting every 5
-    minutes that is about two hours, so it caught only 1-2 of the :51 METARs.
-    Observed on the first run: Phoenix 240 feed obs / 1 METAR, Dallas 266/1,
-    Houston 267/1, while sparse-reporting Denver got 19/15. precise_max_f was
-    therefore the max of the last hour, not the day — Phoenix showed a feed max
-    of 107.6F against a "precise max" of 106.0F because the peak was never in
-    the window.
+    ⚠️ THE WINDOW HAS BEEN WRONG TWICE. Get this right or the daily max is a
+    lie in whichever direction the truncation falls.
 
-    Bounding by local midnight returns the whole day regardless of how often
-    the station reports.
+      V2.0 used `limit=24`  -> the 24 most RECENT obs. On a station reporting
+                               every 5 minutes that is ~2 hours. Caught 1-2 of
+                               the :51 METARs. Max was of the last hour.
+      V2.1 used `start=` only -> no explicit limit, so the API's default cap
+                               applied and returned the OLDEST rows in the
+                               window. San Antonio 2026-09-09 returned 11
+                               METARs ending 13:24Z; the 97.0F afternoon peak
+                               was never in the array. Max was of the MORNING.
+      V2.2 uses start + end + explicit limit + pagination.
 
-    One request per station, 20 per run, ~156 runs/day. If NWS starts refusing,
-    this is the first thing to look at.
+    Also asserts the newest row returned is actually recent. If the API hands
+    back a window that ends hours ago, that is reported as truncation rather
+    than silently believed.
 
-    Returns (rows, n) where rows is [(when_utc, temp_f), ...] for TODAY in the
-    station's LOCAL calendar day, sorted oldest first.
+    Returns (rows, n, truncated) where rows is [(when_utc, temp_f), ...] for
+    TODAY in the station's LOCAL calendar day, sorted oldest first.
     """
     tz = ZoneInfo(tzname)
     today_local = now_utc.astimezone(tz).date()
     local_midnight = dt.datetime.combine(
         today_local, dt.time(0, 0), tzinfo=tz).astimezone(dt.timezone.utc)
 
+    params = {
+        "start": local_midnight.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limit": NWS_LIMIT,
+    }
+
+    features = []
+    url = NWS_OBS.format(stid=stid)
+    pages = 0
     try:
-        r = requests.get(
-            NWS_OBS.format(stid=stid),
-            params={"start": local_midnight.strftime("%Y-%m-%dT%H:%M:%SZ")},
-            headers=NWS_HEADERS, timeout=30)
-        if r.status_code != 200:
-            return [], 0
-        features = (r.json() or {}).get("features") or []
+        while url and pages < 5:
+            r = requests.get(url, params=params if pages == 0 else None,
+                             headers=NWS_HEADERS, timeout=30)
+            if r.status_code != 200:
+                print(f"    {stid} METAR HTTP {r.status_code}")
+                break
+            body = r.json() or {}
+            got = body.get("features") or []
+            features.extend(got)
+            pages += 1
+            # api.weather.gov may expose a next link; follow it if present.
+            nxt = ((body.get("pagination") or {}).get("next")) or None
+            if not nxt or not got:
+                break
+            url = nxt
     except Exception as e:
         print(f"    {stid} METAR fetch failed: {type(e).__name__}")
-        return [], 0
+        return [], 0, True
 
     rows = []
     for f in features:
@@ -277,7 +346,15 @@ def fetch_metars(stid, tzname, now_utc):
         rows.append((when, t_f))
 
     rows.sort(key=lambda x: x[0])
-    return rows, len(rows)
+
+    # ⚠️ Truncation check. If the newest METAR we hold is far older than the
+    # newest one that SHOULD exist, we did not get the whole day.
+    truncated = False
+    if rows:
+        newest_age_min = (now_utc - rows[-1][0]).total_seconds() / 60.0
+        if newest_age_min > METAR_STALE_MIN:
+            truncated = True
+    return rows, len(rows), truncated
 
 
 def parse_station(entry, tzname, now_utc):
@@ -328,6 +405,17 @@ def trend_over(rows, minutes):
     return round(latest_v - older[-1][1], 2)
 
 
+def expected_metars_by_now(tzname, now_utc):
+    """Roughly how many hourly METARs should exist since local midnight.
+
+    Used only to flag suspiciously sparse returns. KNYC is legitimately sparse,
+    so this warns, it does not reject.
+    """
+    tz = ZoneInfo(tzname)
+    local_now = now_utc.astimezone(tz)
+    return max(1, local_now.hour)
+
+
 def upsert(row):
     try:
         r = requests.post(
@@ -345,42 +433,54 @@ def upsert(row):
 
 def main():
     now_utc = dt.datetime.now(dt.timezone.utc)
-    print(f"OBS LIVE v2.1 | {now_utc:%Y-%m-%d %H:%M:%S} UTC | {len(STATIONS)} stations")
+    print(f"OBS LIVE v2.2 | {now_utc:%Y-%m-%d %H:%M:%S} UTC | {len(STATIONS)} stations")
     print("5-min feed = whole degrees C (1.8F steps) | hourly METAR T-group = tenths\n")
 
     data = fetch_synoptic()
-    if not data:
-        print("no Synoptic data — aborting")
-        return
+    synoptic_ok = data is not None
 
-    stations = data.get("STATION") or []
-    by_stid = {(e.get("STID") or "").upper(): e for e in stations}
+    if not synoptic_ok:
+        # ⚠️ V2.2: THIS NO LONGER ABORTS.
+        # V2.1 returned here. Every city kept its previous row, the panel had
+        # no way to tell, and San Antonio displayed an 8:24am number in a green
+        # box at 5:19pm while the station was 16 degrees hotter.
+        print("⚠️ SYNOPTIC UNAVAILABLE — continuing on METARs only.")
+        print("   Rows WILL still be written, flagged synoptic_ok=false.\n")
+        by_stid = {}
+    else:
+        stations = data.get("STATION") or []
+        by_stid = {(e.get("STID") or "").upper(): e for e in stations}
 
     print(f"{'CITY':<15} {'FEED':>6} {'AGE':>5}  {'T-GRP':>6} {'AGE':>5}  "
           f"{'FEEDMAX':>7} {'PRECMAX':>7} {'NEXT':>6}  {'30m':>5}  n/m")
-    print("-" * 88)
+    print("-" * 92)
 
     written = 0
+    stale_cities = []
+
     for stid, (city, tzname) in STATIONS.items():
-        entry = by_stid.get(stid)
-        if not entry:
-            print(f"{city:<15} no Synoptic data")
-            continue
-
-        rows, local_date = parse_station(entry, tzname, now_utc)
-        if not rows:
-            print(f"{city:<15} no observations today")
-            continue
-
         tz = ZoneInfo(tzname)
-        last_t, last_v = rows[-1]
-        age_min = round((now_utc - last_t).total_seconds() / 60.0, 1)
-        max_t, max_v = max(rows, key=lambda x: x[1])
-        trend = trend_over(rows, TREND_WINDOW_MIN)
-        next_step = next_celsius_step_f(max_v)
+        local_date = now_utc.astimezone(tz).date()
 
-        # V2: the precise hourly record
-        metars, n_metars = fetch_metars(stid, tzname, now_utc)
+        # ---- 5-minute feed (may be entirely absent if Synoptic is down) ----
+        rows = []
+        entry = by_stid.get(stid)
+        if entry:
+            rows, parsed_date = parse_station(entry, tzname, now_utc)
+            if parsed_date:
+                local_date = parsed_date
+
+        if rows:
+            last_t, last_v = rows[-1]
+            age_min = round((now_utc - last_t).total_seconds() / 60.0, 1)
+            max_t, max_v = max(rows, key=lambda x: x[1])
+            trend = trend_over(rows, TREND_WINDOW_MIN)
+            next_step = next_celsius_step_f(max_v)
+        else:
+            last_t = last_v = age_min = max_t = max_v = trend = next_step = None
+
+        # ---- hourly METAR T-groups (the precise record) ----
+        metars, n_metars, truncated = fetch_metars(stid, tzname, now_utc)
         if metars:
             m_last_t, m_last_v = metars[-1]
             m_age = round((now_utc - m_last_t).total_seconds() / 60.0, 1)
@@ -388,21 +488,61 @@ def main():
         else:
             m_last_t = m_last_v = m_age = pm_t = pm_v = None
 
+        metar_ok = bool(metars) and not truncated
+
+        # ---- staleness verdict -------------------------------------------
+        reasons = []
+        if not synoptic_ok:
+            reasons.append("synoptic down")
+        elif not rows:
+            reasons.append("no feed obs today")
+        elif age_min > STALE_WARN_MIN:
+            reasons.append(f"feed {age_min:.0f}m old")
+
+        if not metars:
+            reasons.append("no METARs today")
+        elif truncated:
+            reasons.append(f"METAR window truncated (newest {m_age:.0f}m old)")
+        elif m_age > METAR_STALE_MIN:
+            reasons.append(f"METAR {m_age:.0f}m old")
+
+        exp = expected_metars_by_now(tzname, now_utc)
+        if n_metars and n_metars < exp * 0.5:
+            reasons.append(f"sparse: {n_metars} METARs, expected ~{exp}")
+
+        is_stale = bool(reasons)
+        stale_reason = "; ".join(reasons) if reasons else None
+        if is_stale:
+            stale_cities.append(city)
+
+        if not rows and not metars:
+            print(f"{city:<15} NO DATA — {stale_reason}")
+            # still write the row so the panel can see the failure
+            upsert({
+                "city": city, "station": stid,
+                "local_date": local_date.isoformat(),
+                "is_stale": True, "stale_reason": stale_reason,
+                "synoptic_ok": synoptic_ok, "metar_ok": False,
+                "n_obs_today": 0, "n_metars_today": 0,
+                "updated_at": now_utc.isoformat(),
+            })
+            continue
+
         flag = ""
-        if age_min > STALE_WARN_MIN:
-            flag += f"  ⚠️ FEED {age_min:.0f}m"
-        if m_age is not None and m_age > 75:
-            flag += f"  ⚠️ METAR {m_age:.0f}m"
+        if is_stale:
+            flag = f"  ⚠️ {stale_reason}"
         # the gap that cost a decision on 2026-09-08
-        if pm_v is not None and abs(max_v - pm_v) >= 0.8:
+        if pm_v is not None and max_v is not None and abs(max_v - pm_v) >= 0.8:
             flag += f"  ⚠️ feed/T-grp gap {max_v - pm_v:+.1f}F"
 
-        print(f"{city:<15} {last_v:>6.1f} {age_min:>4.0f}m  "
+        print(f"{city:<15} "
+              f"{(f'{last_v:.1f}' if last_v is not None else '—'):>6} "
+              f"{(f'{age_min:.0f}m' if age_min is not None else '—'):>5}  "
               f"{(f'{m_last_v:.1f}' if m_last_v is not None else '—'):>6} "
               f"{(f'{m_age:.0f}m' if m_age is not None else '—'):>5}  "
-              f"{max_v:>7.1f} "
+              f"{(f'{max_v:.1f}' if max_v is not None else '—'):>7} "
               f"{(f'{pm_v:.1f}' if pm_v is not None else '—'):>7} "
-              f"{next_step:>6.1f}  "
+              f"{(f'{next_step:.1f}' if next_step is not None else '—'):>6}  "
               f"{(f'{trend:+.1f}' if trend is not None else '—'):>5}  "
               f"{len(rows)}/{n_metars}{flag}")
 
@@ -410,11 +550,11 @@ def main():
             "city": city,
             "station": stid,
             "local_date": local_date.isoformat(),
-            "temp_f": round(last_v, 2),
-            "temp_time_utc": last_t.isoformat(),
+            "temp_f": round(last_v, 2) if last_v is not None else None,
+            "temp_time_utc": last_t.isoformat() if last_t else None,
             "obs_age_min": age_min,
-            "day_max_f": round(max_v, 2),
-            "day_max_time": max_t.isoformat(),
+            "day_max_f": round(max_v, 2) if max_v is not None else None,
+            "day_max_time": max_t.isoformat() if max_t else None,
             "next_step_f": next_step,
             "trend_30min": trend,
             "n_obs_today": len(rows),
@@ -424,16 +564,29 @@ def main():
             "precise_max_f": round(pm_v, 2) if pm_v is not None else None,
             "precise_max_time": pm_t.isoformat() if pm_t else None,
             "n_metars_today": n_metars,
+            "is_stale": is_stale,
+            "stale_reason": stale_reason,
+            "synoptic_ok": synoptic_ok,
+            "metar_ok": metar_ok,
             "updated_at": now_utc.isoformat(),
         }):
             written += 1
 
     print(f"\n  wrote {written} rows")
+    if stale_cities:
+        print(f"  ⚠️ STALE OR DEGRADED: {', '.join(stale_cities)}")
+    else:
+        print("  all stations fresh")
+
     print("\n  FEEDMAX is 5-minutely but quantized to whole degrees C.")
     print("  PRECMAX is exact to a tenth but only ~12-14 samples a day.")
     print("  PRECMAX is a FLOOR — a peak between :51 reports is invisible to it.")
+    print("\n  ⚠️ THE PANEL MUST STILL CHECK updated_at ITSELF.")
+    print("     obs_age_min is computed at WRITE time and does not age.")
+    print("     If now() - updated_at > 15 min, show STALE, not a number.")
     print("\n  select city, temp_f, metar_temp_f, day_max_f, precise_max_f,")
-    print("         obs_age_min, metar_age_min, n_metars_today")
+    print("         obs_age_min, metar_age_min, n_metars_today,")
+    print("         is_stale, stale_reason, updated_at")
     print("  from obs_live where local_date = current_date")
     print("  order by precise_max_f desc nulls last;")
 
