@@ -1,8 +1,38 @@
 """
-app.py — MPH Weather, V6.1
+app.py — MPH Weather, V6.2
 
-WHAT CHANGED FROM V6.0, AND WHY
-================================
+V6.2 — THE QUANTIZATION BUG (2026-09-09 evening)
+=================================================
+V6.1 shipped a bracket check that read a feed value as a measurement. On
+Atlanta that evening it said:
+
+    BROKEN — max 89.6 is already above 89.
+
+That was false. 89.6F is EXACTLY 32C. The station transmits whole degrees
+Celsius between hourly METARs, so "89.6" means "somewhere that rounds to 32C",
+which is 88.7F to 90.5F. Roughly 44% of that window settles 89, 56% settles 90.
+
+The Kalshi ladder at that moment: 88-89 at 51%, 90-91 at 49%. The market had it
+right and the app was calling a coin flip a certainty.
+
+⚠️ EVERY VALUE THAT LOOKED PRECISE WAS ON THE GRID.
+    95.0 = 35C    96.8 = 36C    98.6 = 37C
+    73.4 = 23C    75.2 = 24C    89.6 = 32C
+Boston's 81.0F, the one reading that was NOT on the grid, turned out to be a
+stale row from an earlier day. Do not conclude a station reports Fahrenheit
+tenths because one number looked like it did.
+
+So the bracket check now returns one of three answers:
+    BROKEN     — even the LOW end of the window settles above your ceiling
+    SAFE       — even the HIGH end settles at or below it
+    UNRESOLVED — the window straddles the boundary, with the share of it that
+                 settles at or below your ceiling
+
+and the quantization window is printed under the headline number rather than
+buried. A 1.8F ambiguity on a 2F bracket is not a footnote.
+
+WHAT CHANGED IN V6.1, AND WHY
+===============================
 V6.0 showed the 5-minute feed and the hourly METAR side by side as equals.
 2026-09-09 proved they are not equals, and which one leads matters when you are
 watching a live position.
@@ -181,6 +211,39 @@ def break_even(price_cents):
     return round(price_cents + kalshi_fee_cents(price_cents), 1)
 
 
+def quantization_band(f):
+    """What a 5-minute feed reading ACTUALLY tells you.
+
+    Most ASOS stations transmit whole degrees CELSIUS between the hourly :51
+    METARs. So a feed value of 89.6F is not a measurement of 89.6 — it is the
+    station saying "32C", and the true temperature was anywhere that rounds to
+    32C: 31.5 to 32.5C, or 88.7 to 90.5F. A 1.8F window.
+
+    Returns (lo_f, hi_f, celsius_int, is_on_grid).
+
+    ⚠️ VERIFIED THE HARD WAY. Every value that looked like a precise Fahrenheit
+    reading turned out to be on the grid:
+        95.0 = 35C   96.8 = 36C   98.6 = 37C
+        73.4 = 23C   75.2 = 24C   89.6 = 32C
+    The one Boston reading that was NOT on the grid (81.0F) was a stale row
+    from an earlier day. Do not assume a station reports tenths because one
+    number looked like it did.
+
+    Off-grid values are returned as a zero-width band — nothing to widen.
+    """
+    try:
+        c = (float(f) - 32.0) * 5.0 / 9.0
+    except Exception:
+        return f, f, None, False
+    c_round = round(c)
+    on_grid = abs(c - c_round) < 0.02
+    if not on_grid:
+        return f, f, None, False
+    lo = (c_round - 0.5) * 9.0 / 5.0 + 32.0
+    hi = (c_round + 0.5) * 9.0 / 5.0 + 32.0
+    return round(lo, 1), round(hi, 1), c_round, True
+
+
 # ── Header ───────────────────────────────────────────────────────────────────
 now_et = datetime.now(ET)
 h1, h2 = st.columns([4, 1])
@@ -192,7 +255,7 @@ with h1:
     <span style="font-size:11px;color:#00ff88;border:1px solid #00ff8840;
                  background:#00ff8820;padding:2px 9px;border-radius:20px;
                  margin-left:8px;vertical-align:middle;
-                 font-family:'JetBrains Mono',monospace;">V6.1</span></div>
+                 font-family:'JetBrains Mono',monospace;">V6.2</span></div>
   <div style="font-size:12px;color:#64748b;font-family:'JetBrains Mono',monospace;">
     {now_et:%Y-%m-%d %I:%M:%S %p ET} · settles on Iowa State CLI</div>
 </div>
@@ -233,6 +296,13 @@ else:
 
         # THE HEADLINE. 200+ samples, catches the peak. This is the number that
         # matters for a bracket, and it is the one the market is reading.
+        # But it is quantized — say so right under it, not three panels down.
+        _band_note = ''
+        if feed_max is not None:
+            _lo, _hi, _c, _og = quantization_band(feed_max)
+            if _og:
+                _band_note = f' · true peak {_lo}–{_hi} ({_c}°C)'
+
         hero_l, hero_r = st.columns([2, 3])
         with hero_l:
             st.markdown(
@@ -241,7 +311,7 @@ else:
                 f'<div class="hero-v">{feed_max:.1f}°F</div>'
                 f'<div class="sub">{n_obs or 0} obs today · '
                 f'{"obs " + format(feed_age, ".0f") + "m ago" if feed_age is not None else "—"}'
-                f'</div></div>',
+                f'{_band_note}</div></div>',
                 unsafe_allow_html=True)
         with hero_r:
             c1, c2, c3 = st.columns(3)
@@ -281,7 +351,13 @@ else:
             st.caption(f'Feed steps 1.8°F (whole °C). Nothing exists between '
                        f'**{feed_max:.1f}** and **{nxt:.1f}**.')
 
-        # Bracket proximity, stated in values the station can actually send.
+        # ⚠️ A FEED VALUE ON THE CELSIUS GRID IS A RANGE, NOT A POINT.
+        # V6.1 reported it as exact and told the user "BROKEN — max 89.6 is
+        # already above 89" for Atlanta on 2026-09-09. But 89.6F is exactly
+        # 32C, so the true peak was anywhere in 88.7-90.5F — about 44% of which
+        # settles 89. The market was 51/49 and correctly split. Calling that
+        # BROKEN was a false read produced by treating a quantized value as a
+        # measurement.
         st.markdown('<div class="sub">Bracket check — enter the ceiling you '
                     'care about</div>', unsafe_allow_html=True)
         b1, b2 = st.columns([1, 4])
@@ -291,16 +367,40 @@ else:
                                       step=1, label_visibility='collapsed')
         with b2:
             st.write('')
-            if feed_max is not None and nxt is not None:
-                if feed_max > ceiling + 0.4:
-                    st.error(f'BROKEN — max {feed_max:.1f} is already above {ceiling}.')
-                elif nxt > ceiling + 0.4:
-                    st.warning(f'ONE STEP BREAKS IT — max {feed_max:.1f} is inside, '
-                               f'but the next value the station can send is '
-                               f'{nxt:.1f}, above the {ceiling} ceiling.')
+            if feed_max is not None:
+                lo, hi, c_round, on_grid = quantization_band(feed_max)
+                # CLI rounds to the nearest whole degree F
+                settle_lo = int(lo + 0.5)
+                settle_hi = int(hi + 0.5 - 1e-9)
+
+                if settle_lo > ceiling:
+                    st.error(f'BROKEN — the peak settles {settle_lo} at best, '
+                             f'above your {ceiling} ceiling.')
+                elif settle_hi <= ceiling:
+                    st.success(f'SAFE so far — the peak settles {settle_hi} at '
+                               f'worst, at or below {ceiling}. '
+                               f'(Still climbing? next possible '
+                               f'{nxt:.1f}F.)' if nxt else
+                               f'SAFE so far — settles {settle_hi} at worst.')
                 else:
-                    st.success(f'Safe for now — max {feed_max:.1f}, next possible '
-                               f'{nxt:.1f}, ceiling {ceiling}.')
+                    share = ((ceiling + 0.5 - lo) / (hi - lo)) if hi > lo else 0.5
+                    share = max(0.0, min(1.0, share))
+                    st.warning(
+                        f'UNRESOLVED — feed max {feed_max:.1f}F is {c_round}°C, '
+                        f'so the true peak was **{lo:.1f}–{hi:.1f}°F**. Roughly '
+                        f'**{share*100:.0f}%** of that range settles {ceiling} '
+                        f'or below. The station cannot tell you more until the '
+                        f'next :51 METAR.')
+
+                if on_grid:
+                    st.caption(f'⚠️ {feed_max:.1f}F is exactly {c_round}°C — a '
+                               f'quantized transmission, not a measurement. The '
+                               f'real value is somewhere in a 1.8°F window. '
+                               f'Treating it as exact is how you get a false '
+                               f'BROKEN.')
+                elif met_now is not None:
+                    st.caption(f'This station reports native Fahrenheit tenths — '
+                               f'the max is exact, no quantization window.')
 
     with st.expander('All cities', expanded=False):
         tbl = []
@@ -474,5 +574,5 @@ with tab_acc:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 st.markdown('---')
-st.caption('V6.1 — feed max leads, METAR is secondary. No gates, no trust '
+st.caption('V6.2 — feed max leads, quantization made explicit. No gates, no trust '
            'scores, no bet selection. FAV V1 places the bets; this reads the tables.')
