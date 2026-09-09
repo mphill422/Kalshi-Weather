@@ -1,7 +1,7 @@
 """
 fetch_obs_live.py — running daily max from the station Kalshi settles on.
 
-V2 (2026-09-08): THE T-GROUP. This is the change that matters.
+V2.1 (2026-09-08): THE T-GROUP, with the day-window fix.
 =================================================================
 On 2026-09-08 the panel showed New York at 79.0F. The station had actually
 transmitted 25.6C — which is 78.1F. A full degree lower. That difference sat
@@ -113,7 +113,7 @@ SB_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ["SUPABASE_KEY"]
 
 SYNOPTIC = "https://api.synopticdata.com/v2/stations/timeseries"
 NWS_OBS = "https://api.weather.gov/stations/{stid}/observations"
-NWS_HEADERS = {"User-Agent": "kalshi-obs/2.0", "Accept": "application/geo+json"}
+NWS_HEADERS = {"User-Agent": "kalshi-obs/2.1", "Accept": "application/geo+json"}
 
 # Kalshi settlement stations. Chicago = MIDWAY. Houston = HOBBY.
 STATIONS = {
@@ -223,25 +223,40 @@ def fetch_synoptic():
 def fetch_metars(stid, tzname, now_utc):
     """Hourly METARs for today, parsed for T-group precision.
 
-    One request per station — 20 calls per run. NWS has no bulk endpoint, and
-    24 observations is enough to cover a full day of :51 reports plus SPECIs.
+    ⚠️ MUST bound by `start`, NOT by `limit`. V2.0 used limit=24, which returns
+    the 24 most RECENT observations — on an airport station reporting every 5
+    minutes that is about two hours, so it caught only 1-2 of the :51 METARs.
+    Observed on the first run: Phoenix 240 feed obs / 1 METAR, Dallas 266/1,
+    Houston 267/1, while sparse-reporting Denver got 19/15. precise_max_f was
+    therefore the max of the last hour, not the day — Phoenix showed a feed max
+    of 107.6F against a "precise max" of 106.0F because the peak was never in
+    the window.
+
+    Bounding by local midnight returns the whole day regardless of how often
+    the station reports.
+
+    One request per station, 20 per run, ~156 runs/day. If NWS starts refusing,
+    this is the first thing to look at.
 
     Returns (rows, n) where rows is [(when_utc, temp_f), ...] for TODAY in the
     station's LOCAL calendar day, sorted oldest first.
     """
+    tz = ZoneInfo(tzname)
+    today_local = now_utc.astimezone(tz).date()
+    local_midnight = dt.datetime.combine(
+        today_local, dt.time(0, 0), tzinfo=tz).astimezone(dt.timezone.utc)
+
     try:
-        r = requests.get(NWS_OBS.format(stid=stid),
-                         params={"limit": 24},
-                         headers=NWS_HEADERS, timeout=25)
+        r = requests.get(
+            NWS_OBS.format(stid=stid),
+            params={"start": local_midnight.strftime("%Y-%m-%dT%H:%M:%SZ")},
+            headers=NWS_HEADERS, timeout=30)
         if r.status_code != 200:
             return [], 0
         features = (r.json() or {}).get("features") or []
     except Exception as e:
         print(f"    {stid} METAR fetch failed: {type(e).__name__}")
         return [], 0
-
-    tz = ZoneInfo(tzname)
-    today_local = now_utc.astimezone(tz).date()
 
     rows = []
     for f in features:
@@ -330,7 +345,7 @@ def upsert(row):
 
 def main():
     now_utc = dt.datetime.now(dt.timezone.utc)
-    print(f"OBS LIVE v2 | {now_utc:%Y-%m-%d %H:%M:%S} UTC | {len(STATIONS)} stations")
+    print(f"OBS LIVE v2.1 | {now_utc:%Y-%m-%d %H:%M:%S} UTC | {len(STATIONS)} stations")
     print("5-min feed = whole degrees C (1.8F steps) | hourly METAR T-group = tenths\n")
 
     data = fetch_synoptic()
