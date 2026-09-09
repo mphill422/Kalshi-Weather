@@ -1,55 +1,52 @@
 """
-app.py — MPH Weather, V6.0
+app.py — MPH Weather, V6.1
 
-WHAT THIS REPLACES
-==================
-streamlit_app.py was 3,356 lines. Its main output was a three-gate bet
-selector whose picks lost 205 straight paper bets across four tags. The gates,
-the trust tables, the NBM ladder, the Kelly sizing, the ladder editor, and the
-per-city quality scores are all gone — none of them decided anything that made
-money, and the one thing the app was actually used for every day was reading
-the current observation, which it did badly.
+WHAT CHANGED FROM V6.0, AND WHY
+================================
+V6.0 showed the 5-minute feed and the hourly METAR side by side as equals.
+2026-09-09 proved they are not equals, and which one leads matters when you are
+watching a live position.
 
-This file does three things:
+Boston, that afternoon:
 
-  1. LIVE OBS — the station reading Kalshi settles on, both the 5-minute feed
-     and the hourly METAR T-group, with the true age of each.
-  2. TODAY'S CONSENSUS — the one number fetch_weather.py V6 writes.
-  3. RESULTS — FAV V1 by window and by agreement tag; consensus accuracy.
+    feed max     73.4F   (201 observations)
+    precise max  69.98F  (9 METARs)
+    19:54 METAR  21.7C = 71.1F
+    20:15 feed   24.0C = 75.2F
 
-It places no bets, picks no brackets, and computes no probabilities. It is a
-window onto tables that other files write.
+The METAR record was 2.3F BELOW the feed and four degrees below where the day
+actually got to. Nine hourly samples cannot catch a peak that happens between
+:51 reports. Meanwhile the Kalshi ladder had already moved — 75-or-below fell
+from 16c to 6c — because the market was reading the same 5-minute data the
+feed was.
 
-WHY THE OBS PANEL LEADS
-=======================
-On 2026-09-08 the old app showed New York at 79.0F. The station had transmitted
-25.6C, which is 78.1F. A full degree, sitting directly on a bracket boundary,
-and it changed a live decision. The 79.0 came from the 5-minute ASOS feed,
-which transmits WHOLE DEGREES CELSIUS — so a displayed 79.0F really means
-"somewhere in 25.5C to 26.4C", or 77.9F to 79.5F.
+⚠️ SO THE FEED MAX LEADS NOW. It is the headline number. The T-group is a
+secondary reading, useful for one job: telling you exactly where you sit when
+the running max is parked on a bracket boundary. That is what it did on
+2026-09-08 in New York, where the display said 79.0 and the station had
+transmitted 25.6C = 78.1F — a full degree, sitting on the 79/80 line.
 
-The hourly METAR carries the precise value in its T-group:
+Both readings, ranked by what they are good for:
 
-    KNYC 081851Z AUTO 28006KT 10SM CLR 26/13 A3023 RMK AO2 SLP229 T02560128
-                                                                  ^^^^^^
-`26/13` is the rounded pair everyone displays. `T0256` is 25.6C to a tenth.
-Every ASOS METAR has it. Every consumer source throws it away.
+    day_max_f      every ~5 min, 200+ samples. CATCHES THE PEAK.
+                   Quantized to whole degrees Celsius on most stations, so it
+                   can read up to 0.9F low. Boston and Minneapolis report
+                   native Fahrenheit tenths and do not have this problem.
 
-fetch_obs_live.py V2 now stores both. This panel shows both, side by side,
-with the gap flagged.
+    precise_max_f  exact to a tenth, 9-14 samples a day. MISSES PEAKS between
+                   :51 reports. It is a FLOOR, never the answer.
 
-⚠️ NEITHER MAX IS STRICTLY BETTER.
-  day_max_f     — every 5 min, but quantized to 1.8F steps. Can read up to
-                  0.9F LOW.
-  precise_max_f — exact to a tenth, but only 12-14 samples a day. A peak that
-                  falls between :51 reports is invisible to it, so it is a
-                  FLOOR, not the answer.
-Kalshi settles on CLI, which is built from the precise record.
+OTHER CHANGES
+  - Cache dropped 60s -> 10s on obs_live. On 2026-09-09 a tab left open since
+    morning served an 81.0F reading that was hours stale while the real max was
+    73.4. If you are watching a position, near-zero is the only safe cache.
+  - Every panel stamps how old its data is, in seconds.
+  - Bracket proximity is stated in values the station can actually send.
 
-⚠️ STATIONS DIFFER ENORMOUSLY. KNYC (Central Park) produced 14 observations by
-2:38pm on 2026-09-08 while airport ASOS sites had 244+. It also delayed its
-19:51 METAR past 4:03pm — confirmed against two independent NWS paths, so the
-station, not a cache. n_obs / n_metars makes that visible per city.
+WHAT THIS FILE DOES NOT DO
+It places no bets, picks no brackets, computes no probabilities, and has no
+gates or trust scores. The 3,356-line version that did all of that produced 205
+losing paper bets. FAV V1 places the bets; this reads the tables.
 
 Secrets: supabase.url, supabase.key, app_password (optional).
 """
@@ -82,8 +79,7 @@ def check_password():
     c1, c2, c3 = st.columns([1, 2, 1])
     with c2:
         pw = st.text_input('Password', type='password',
-                           label_visibility='collapsed',
-                           placeholder='Password')
+                           label_visibility='collapsed', placeholder='Password')
         if pw:
             if pw == correct:
                 st.session_state['_authed'] = True
@@ -107,7 +103,14 @@ st.markdown("""
 .stMetric label { color:#64748b !important; font-size:11px !important;
                   text-transform:uppercase !important; letter-spacing:.8px !important; }
 .stMetric [data-testid="stMetricValue"] { color:#fff !important;
-    font-family:'JetBrains Mono',monospace !important; font-size:20px !important; }
+    font-family:'JetBrains Mono',monospace !important; font-size:22px !important; }
+.hero { background:#0d1b2a; border:2px solid #00ff88; border-radius:10px;
+        padding:14px 20px; margin-bottom:10px; }
+.hero-l { color:#64748b; font-size:11px; text-transform:uppercase;
+          letter-spacing:1px; }
+.hero-v { color:#00ff88; font-size:34px; font-weight:700;
+          font-family:'JetBrains Mono',monospace; line-height:1.1; }
+.sub { color:#94a3b8; font-size:12px; font-family:'JetBrains Mono',monospace; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -137,7 +140,9 @@ def sb_get(table, params, timeout=15):
         return []
 
 
-@st.cache_data(ttl=60)
+# ⚠️ 10s, not 60s. A tab left open since morning served a 3-hour-stale max on
+# 2026-09-09 and it read as live. If you are watching a position, cache is risk.
+@st.cache_data(ttl=10)
 def fetch_obs_live():
     return sb_get('obs_live', {'local_date': 'eq.' + today_et(),
                                'order': 'city.asc', 'limit': '50'})
@@ -157,30 +162,46 @@ def fetch_settled(days=30):
                                   'order': 'date.desc', 'limit': '2000'})
 
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=60)
 def fetch_favorites():
     return sb_get('favorites_bets', {'order': 'date.desc', 'limit': '1000'})
 
 
+def kalshi_fee_cents(price_cents):
+    """Per-contract fee in cents, per Kalshi's published schedule:
+        fee = round up(M x 0.07 x C x P x (1-P)),  M defaults to 1
+    Confirmed 2026-09-08 against a real fill (30 contracts @ 65c -> $0.48).
+    Weather series are not in the non-standard multiplier table, so M = 1."""
+    p = price_cents / 100.0
+    return 0.07 * p * (1 - p) * 100
+
+
+def break_even(price_cents):
+    """Win rate needed to break even, holding to settlement (no exit fee)."""
+    return round(price_cents + kalshi_fee_cents(price_cents), 1)
+
+
 # ── Header ───────────────────────────────────────────────────────────────────
 now_et = datetime.now(ET)
-st.markdown(f"""
+h1, h2 = st.columns([4, 1])
+with h1:
+    st.markdown(f"""
 <div style="background:linear-gradient(135deg,#0d1b2a,#1a2744,#0d1b2a);
-            border:1px solid #1e3a5f;border-radius:12px;padding:18px 26px;
-            margin-bottom:16px;">
-  <div style="font-size:24px;font-weight:700;color:#fff;">🌡️ MPH Weather
+            border:1px solid #1e3a5f;border-radius:12px;padding:16px 24px;">
+  <div style="font-size:22px;font-weight:700;color:#fff;">🌡️ MPH Weather
     <span style="font-size:11px;color:#00ff88;border:1px solid #00ff8840;
                  background:#00ff8820;padding:2px 9px;border-radius:20px;
                  margin-left:8px;vertical-align:middle;
-                 font-family:'JetBrains Mono',monospace;">V6.0</span></div>
+                 font-family:'JetBrains Mono',monospace;">V6.1</span></div>
   <div style="font-size:12px;color:#64748b;font-family:'JetBrains Mono',monospace;">
-    {now_et:%Y-%m-%d %I:%M %p ET} · settlement source: Iowa State CLI</div>
+    {now_et:%Y-%m-%d %I:%M:%S %p ET} · settles on Iowa State CLI</div>
 </div>
 """, unsafe_allow_html=True)
-
-if st.button('🔄 Refresh'):
-    st.cache_data.clear()
-    st.rerun()
+with h2:
+    st.write('')
+    if st.button('🔄 Refresh', use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
 
 
 # ── 1. LIVE OBS ──────────────────────────────────────────────────────────────
@@ -191,8 +212,7 @@ obs_rows = fetch_obs_live()
 
 if not obs_rows:
     st.caption('No obs_live rows today. The poller runs every 5 min, 9am–9pm ET '
-               'via cron-job.org → obs_live.yml. If empty during those hours, '
-               'check the Obs Live workflow.')
+               'via cron-job.org → obs_live.yml.')
 else:
     cities = sorted(r['city'] for r in obs_rows if r.get('city'))
     default = cities.index('New York') if 'New York' in cities else 0
@@ -209,71 +229,103 @@ else:
         prec_max = row.get('precise_max_f')
         n_obs = row.get('n_obs_today')
         n_met = row.get('n_metars_today')
+        updated = row.get('updated_at')
 
-        def age_color(a, warn, bad):
-            if a is None:
-                return '#64748b'
-            return '#00ff88' if a <= warn else '#f59e0b' if a <= bad else '#ef4444'
-
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric('5-min Feed', f'{feed_now:.1f} F' if feed_now is not None else '—')
+        # THE HEADLINE. 200+ samples, catches the peak. This is the number that
+        # matters for a bracket, and it is the one the market is reading.
+        hero_l, hero_r = st.columns([2, 3])
+        with hero_l:
             st.markdown(
-                f'<div style="color:{age_color(feed_age,10,20)};font-size:11px;'
-                f'font-family:\'JetBrains Mono\',monospace;">'
-                f'{f"obs {feed_age:.0f}m ago" if feed_age is not None else "—"}'
-                f'{f" · {n_obs} today" if n_obs else ""}</div>',
+                f'<div class="hero">'
+                f'<div class="hero-l">Day Max — 5-min feed</div>'
+                f'<div class="hero-v">{feed_max:.1f}°F</div>'
+                f'<div class="sub">{n_obs or 0} obs today · '
+                f'{"obs " + format(feed_age, ".0f") + "m ago" if feed_age is not None else "—"}'
+                f'</div></div>',
                 unsafe_allow_html=True)
-        with c2:
-            st.metric('METAR (precise)', f'{met_now:.1f} F' if met_now is not None else '—')
-            st.markdown(
-                f'<div style="color:{age_color(met_age,70,90)};font-size:11px;'
-                f'font-family:\'JetBrains Mono\',monospace;">'
-                f'{f"{met_age:.0f}m ago" if met_age is not None else "no METAR yet"}'
-                f'{f" · {n_met} today" if n_met else ""}</div>',
-                unsafe_allow_html=True)
-        with c3:
-            st.metric('Feed Max', f'{feed_max:.1f} F' if feed_max is not None else '—')
-            st.caption('5-min, ±0.9F (whole °C)')
-        with c4:
-            st.metric('Precise Max', f'{prec_max:.1f} F' if prec_max is not None else '—')
-            st.caption('hourly T-group, a floor')
+        with hero_r:
+            c1, c2, c3 = st.columns(3)
+            c1.metric('Now', f'{feed_now:.1f}' if feed_now is not None else '—')
+            c2.metric('Next possible', f'{nxt:.1f}' if nxt is not None else '—')
+            c3.metric('Trend 30m',
+                      f"{row.get('trend_30min'):+.1f}"
+                      if row.get('trend_30min') is not None else '—')
 
-        # the 2026-09-08 gap, made visible
-        if feed_max is not None and prec_max is not None:
-            gap = round(feed_max - prec_max, 1)
-            if abs(gap) >= 0.8:
-                st.warning(
-                    f'⚠️ Feed max reads {feed_max:.1f}F, precise max reads '
-                    f'{prec_max:.1f}F ({gap:+.1f}F). The 5-minute feed is '
-                    f'quantized to whole degrees Celsius; the T-group is exact. '
-                    f'CLI settles from the precise record.')
+        # SECONDARY. Exact, but samples too rarely to be a max. Its one job is
+        # telling you where you sit when the max is parked on a boundary.
+        with st.container():
+            m1, m2 = st.columns([1, 3])
+            with m1:
+                st.metric('METAR (exact)',
+                          f'{met_now:.1f}' if met_now is not None else '—')
+            with m2:
+                st.write('')
+                gap_note = ''
+                if feed_max is not None and prec_max is not None:
+                    g = round(feed_max - prec_max, 1)
+                    gap_note = (f' · METAR max {prec_max:.1f} '
+                                f'({g:+.1f} vs feed)')
+                st.markdown(
+                    f'<div class="sub" style="padding-top:14px;">'
+                    f'{f"{met_age:.0f}m ago" if met_age is not None else "no METAR yet"} · '
+                    f'{n_met or 0} today{gap_note}</div>',
+                    unsafe_allow_html=True)
+
+        if prec_max is not None and feed_max is not None and (feed_max - prec_max) >= 1.5:
+            st.caption(f'⚠️ The hourly METAR record tops out {feed_max - prec_max:.1f}F '
+                       f'below the 5-minute feed. With {n_met or 0} METARs against '
+                       f'{n_obs or 0} feed obs, the peak fell between :51 reports. '
+                       f'Trust the feed max.')
 
         if nxt is not None and feed_max is not None:
-            st.caption(f'Next value the feed can transmit: **{nxt:.1f}F** '
-                       f'(steps 1.8F). Nothing exists between {feed_max:.1f} and {nxt:.1f}.')
+            st.caption(f'Feed steps 1.8°F (whole °C). Nothing exists between '
+                       f'**{feed_max:.1f}** and **{nxt:.1f}**.')
+
+        # Bracket proximity, stated in values the station can actually send.
+        st.markdown('<div class="sub">Bracket check — enter the ceiling you '
+                    'care about</div>', unsafe_allow_html=True)
+        b1, b2 = st.columns([1, 4])
+        with b1:
+            ceiling = st.number_input('Ceiling °F', min_value=0, max_value=130,
+                                      value=int(feed_max) if feed_max else 80,
+                                      step=1, label_visibility='collapsed')
+        with b2:
+            st.write('')
+            if feed_max is not None and nxt is not None:
+                if feed_max > ceiling + 0.4:
+                    st.error(f'BROKEN — max {feed_max:.1f} is already above {ceiling}.')
+                elif nxt > ceiling + 0.4:
+                    st.warning(f'ONE STEP BREAKS IT — max {feed_max:.1f} is inside, '
+                               f'but the next value the station can send is '
+                               f'{nxt:.1f}, above the {ceiling} ceiling.')
+                else:
+                    st.success(f'Safe for now — max {feed_max:.1f}, next possible '
+                               f'{nxt:.1f}, ceiling {ceiling}.')
 
     with st.expander('All cities', expanded=False):
         tbl = []
         for r in sorted(obs_rows,
-                        key=lambda x: (x.get('precise_max_f') is None,
-                                       -(x.get('precise_max_f') or 0))):
+                        key=lambda x: (x.get('day_max_f') is None,
+                                       -(x.get('day_max_f') or 0))):
             a, m = r.get('obs_age_min'), r.get('metar_age_min')
+            fx, px = r.get('day_max_f'), r.get('precise_max_f')
             tbl.append({
                 'City': r.get('city', '—'),
                 'Stn': r.get('station', '—'),
-                'Feed': f"{r['temp_f']:.1f}" if r.get('temp_f') is not None else '—',
+                'DAY MAX': f"{fx:.1f}" if fx is not None else '—',
+                'Now': f"{r['temp_f']:.1f}" if r.get('temp_f') is not None else '—',
                 'Age': (f"{a:.0f}m" + (' ⚠️' if a and a > 20 else '')) if a is not None else '—',
-                'METAR': f"{r['metar_temp_f']:.1f}" if r.get('metar_temp_f') is not None else '—',
-                'Age ': (f"{m:.0f}m" + (' ⚠️' if m and m > 75 else '')) if m is not None else '—',
-                'Feed Max': f"{r['day_max_f']:.1f}" if r.get('day_max_f') is not None else '—',
-                'Prec Max': f"{r['precise_max_f']:.1f}" if r.get('precise_max_f') is not None else '—',
                 'Next': f"{r['next_step_f']:.1f}" if r.get('next_step_f') is not None else '—',
-                'n/m': f"{r.get('n_obs_today','—')}/{r.get('n_metars_today','—')}",
+                'METAR max': f"{px:.1f}" if px is not None else '—',
+                'gap': f"{fx - px:+.1f}" if (fx is not None and px is not None) else '—',
+                'obs/met': f"{r.get('n_obs_today','—')}/{r.get('n_metars_today','—')}",
             })
         st.dataframe(pd.DataFrame(tbl), use_container_width=True, hide_index=True)
-        st.caption('⚠️ Preliminary, pre-QC. Kalshi settles on official CLI, not this '
-                   'feed. Use it to SEE the day, never to score it.')
+        st.caption('DAY MAX is the 5-minute feed — 200+ samples, catches the peak, '
+                   'quantized to whole °C on most stations. METAR max is exact but '
+                   'samples 9–14 times a day and routinely misses the peak; the '
+                   '**gap** column is how much it is missing by. '
+                   '⚠️ Preliminary, pre-QC. Kalshi settles on official CLI.')
 
 
 # ── 2. TODAY'S CONSENSUS ─────────────────────────────────────────────────────
@@ -283,8 +335,7 @@ cons_rows = fetch_today_consensus()
 
 if not cons_rows:
     st.caption('No consensus rows today. fetch_weather.py V6 writes these at '
-               '14:00 UTC. FAV V1.1 reads them at 14:30 for its agreement tag — '
-               'if this is empty during the day, morning bets log with a NULL tag.')
+               '14:00 UTC.')
 else:
     obs_by_city = {r.get('city'): r for r in obs_rows} if obs_rows else {}
     tbl = []
@@ -292,36 +343,35 @@ else:
         city = r.get('city')
         c = r.get('consensus')
         o = obs_by_city.get(city, {})
-        prec = o.get('precise_max_f')
-        # how far above the day's precise max does consensus sit?
-        togo = round(c - prec, 1) if (c is not None and prec is not None) else None
+        fmax = o.get('day_max_f')
+        togo = round(c - fmax, 1) if (c is not None and fmax is not None) else None
         tbl.append({
             'City': city,
             'Consensus': f'{c:.1f}' if c is not None else '—',
+            'Day Max': f'{fmax:.1f}' if fmax is not None else '—',
+            'To Go': f'{togo:+.1f}' if togo is not None else '—',
             'NWS': f"{r['forecast']:.1f}" if r.get('forecast') is not None else '—',
             'GFS': f"{r['ensemble_mean']:.1f}" if r.get('ensemble_mean') is not None else '—',
             'Bias': f"{r['bias_correction']:+.2f}" if r.get('bias_correction') is not None else '—',
-            'Obs High': f"{r['obs_high']:.1f}" if r.get('obs_high') is not None else '—',
-            'Prec Max': f'{prec:.1f}' if prec is not None else '—',
-            'To Go': f'{togo:+.1f}' if togo is not None else '—',
             '⚠️': '⚠️' if r.get('high_uncertainty') else '',
         })
     st.dataframe(pd.DataFrame(tbl), use_container_width=True, hide_index=True)
-    st.caption('**To Go** = consensus minus the day\'s precise max so far. '
-               'Negative means the station has already passed the forecast. '
-               '⚠️ = NWS and GFS disagree by more than 5F.')
+    st.caption('**To Go** = consensus minus the day\'s feed max. Negative means '
+               'the station has already passed the forecast. ⚠️ = NWS and GFS '
+               'disagree by more than 5°F. Consensus has never picked a '
+               'profitable bracket — this is for seeing where the day stands, '
+               'not for betting.')
 
 
 # ── 3. RESULTS ───────────────────────────────────────────────────────────────
 st.markdown('<div class="sec">📊 Results</div>', unsafe_allow_html=True)
 
-tab_fav, tab_agree, tab_acc = st.tabs(
-    ['FAV V1 by window', 'Agreement tag', 'Consensus accuracy'])
-
 fav = fetch_favorites()
 settled_fav = [b for b in fav if b.get('result') in ('Won', 'Lost')]
 
-with tab_fav:
+tab_win, tab_day, tab_acc = st.tabs(['By window', 'By day', 'Consensus accuracy'])
+
+with tab_win:
     if not settled_fav:
         st.caption('No settled FAV V1 bets yet.')
     else:
@@ -335,55 +385,59 @@ with tab_fav:
             asks = [float(b['yes_ask_cents']) for b in g if b.get('yes_ask_cents')]
             avg_ask = sum(asks) / len(asks) if asks else 0
             net = sum(float(b.get('net_profit') or 0) for b in g)
+            wp = 100.0 * wins / n
+            be = break_even(avg_ask)
             rows.append({
                 'Window': w, 'n': n, 'Wins': wins,
-                'Win %': f'{100.0*wins/n:.1f}',
+                'Win %': f'{wp:.1f}',
                 'Avg Ask': f'{avg_ask:.1f}c',
-                'Break-even': f'{avg_ask+3.6:.1f}%',
+                'Break-even': f'{be:.1f}%',
+                'Margin': f'{wp - be:+.1f}',
                 'Net': f'${net:+.2f}',
             })
         tot_n = len(settled_fav)
         tot_w = sum(1 for b in settled_fav if b['result'] == 'Won')
         tot_net = sum(float(b.get('net_profit') or 0) for b in settled_fav)
+        all_asks = [float(b['yes_ask_cents']) for b in settled_fav if b.get('yes_ask_cents')]
+        tot_ask = sum(all_asks) / len(all_asks) if all_asks else 0
+        tot_wp = 100.0 * tot_w / tot_n
+        tot_be = break_even(tot_ask)
         rows.append({'Window': 'TOTAL', 'n': tot_n, 'Wins': tot_w,
-                     'Win %': f'{100.0*tot_w/tot_n:.1f}', 'Avg Ask': '',
-                     'Break-even': '', 'Net': f'${tot_net:+.2f}'})
+                     'Win %': f'{tot_wp:.1f}', 'Avg Ask': f'{tot_ask:.1f}c',
+                     'Break-even': f'{tot_be:.1f}%',
+                     'Margin': f'{tot_wp - tot_be:+.1f}',
+                     'Net': f'${tot_net:+.2f}'})
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.caption('Kill line: **below 66% win rate at n=50 per window, that '
-                   'window retires.** Break-even is avg ask + 3.6c fee — the fee '
-                   'rests on ONE observed ticket and is not confirmed.')
+        st.caption('Break-even is entry price + Kalshi\'s fee at that price — it is '
+                   'a curve, not a number (58c needs 59.7%, 79c needs 80.2%). '
+                   '**Kill line: a window retires when its win rate sits below its '
+                   'own break-even at n=50.** One fee at entry; holding a winner '
+                   'to settlement costs nothing extra.')
 
-with tab_agree:
-    tagged = [b for b in settled_fav if b.get('agrees_with_consensus') is not None]
-    if not tagged:
-        st.caption('No settled bets carry an agreement tag yet. Tagging started '
-                   '2026-09-07; the question needs ~50 settled per group.')
+with tab_day:
+    if not settled_fav:
+        st.caption('No settled bets yet.')
     else:
+        by_day = {}
+        for b in settled_fav:
+            by_day.setdefault(b.get('date'), []).append(b)
         rows = []
-        for w in ('MORNING', 'MIDDAY', 'AFTERNOON'):
-            for agree in (True, False):
-                g = [b for b in tagged
-                     if b.get('window_label') == w
-                     and b.get('agrees_with_consensus') is agree]
-                if not g:
-                    continue
-                n = len(g)
-                wins = sum(1 for b in g if b['result'] == 'Won')
-                net = sum(float(b.get('net_profit') or 0) for b in g)
-                rows.append({
-                    'Window': w,
-                    'Consensus': 'AGREE' if agree else 'DISAGREE',
-                    'n': n, 'Wins': wins,
-                    'Win %': f'{100.0*wins/n:.1f}',
-                    'Net': f'${net:+.2f}',
-                })
+        for d in sorted(by_day, reverse=True):
+            g = by_day[d]
+            n = len(g)
+            wins = sum(1 for x in g if x['result'] == 'Won')
+            net = sum(float(x.get('net_profit') or 0) for x in g)
+            late = max((x.get('minutes_late') or 0) for x in g)
+            rows.append({
+                'Date': d, 'n': n, 'Wins': wins,
+                'Win %': f'{100.0*wins/n:.1f}',
+                'Net': f'${net:+.2f}',
+                'Worst late': f'{late}m',
+            })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.caption('Backtest (33 days, reconstructed ladders) said AGREE beats '
-                   'all-bets by 4.9 points in the morning, and turns midday '
-                   '(−1.02 → +13.56) and afternoon (−0.73 → +5.32) positive. '
-                   '**Gate line: AGREE must beat DISAGREE by 5+ points at n=50 '
-                   'each before switching from tag to filter.** Every bet is '
-                   'still taken meanwhile.')
+        st.caption('Worst late should read 0m — that is the cron-job.org dispatch '
+                   'landing on time. If it climbs, entry prices are not what the '
+                   'band was measured on.')
 
 with tab_acc:
     settled = fetch_settled(30)
@@ -399,10 +453,8 @@ with tab_acc:
             a1.metric('MAE', f'{mae:.2f} F')
             a2.metric('Mean Error', f'{mean:+.2f} F')
             a3.metric('N', str(len(errs)))
-            st.caption('Sign convention: error = actual − consensus. **POSITIVE '
-                       'means settlement came in WARMER than predicted — the '
-                       'model runs COLD.** Misreading this caused a wrong call '
-                       'on 2026-08-24.')
+            st.caption('error = actual − consensus. **POSITIVE means settlement '
+                       'came in WARMER than predicted — the model runs COLD.**')
 
         by_city = {}
         for r in settled:
@@ -420,11 +472,7 @@ with tab_acc:
                 'Worst': f'{max(e, key=abs):+.1f}',
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.caption('Consensus MAE runs ~0.73F on a city\'s clearest third of days '
-                   'and ~1.10F on its cloudiest third (368 city-days, terciled '
-                   'within each city). Uncertainty is predictable even where the '
-                   'central estimate is not biased.')
 
 st.markdown('---')
-st.caption('V6.0 — consensus writer + station obs. No gates, no trust scores, '
-           'no bet selection. FAV V1 places the bets; this reads the tables.')
+st.caption('V6.1 — feed max leads, METAR is secondary. No gates, no trust '
+           'scores, no bet selection. FAV V1 places the bets; this reads the tables.')
