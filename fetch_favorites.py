@@ -14,6 +14,60 @@ trust score, no opinion about tomorrow's temperature.
 That is the entire strategy. It is the automated version of the Daily Capture
 Grid — same three times, same bands, same pick.
 
+V1.3 CHANGES (2026-09-08) — THE FEE WAS WRONG BY MORE THAN HALF
+================================================================
+Every net figure produced before this version used FEE_CENTS = 3.6, a flat
+per-contract number backed out from a single ticket. It was wrong in BOTH its
+value and its shape.
+
+Kalshi's published schedule:
+
+    fee = round_up_to_cent( 0.07 * C * P * (1-P) )
+        C = contracts, P = price in DOLLARS
+
+CONFIRMED against a real fill: Las Vegas 95-96, Sep 7, 30 contracts at 65c.
+Formula gives $19.50 + $0.48 = $19.98. The ticket read $19.99. 1.60c per
+contract, not 3.6c.
+
+Two things the flat figure got wrong:
+
+  1. IT IS A PARABOLA, not a rate. P*(1-P) peaks at 50c and collapses toward
+     the extremes. Across the band: 58c pays 1.71c, 69c pays 1.50c, 79c pays
+     1.16c. At 99c it is 0.07c — which is why selling a winner at 99 costs
+     almost nothing in fees (it costs you the last cent of value instead).
+
+  2. THERE IS NO SETTLEMENT FEE. A winner held to resolution pays ONLY the
+     entry fee. Selling before settlement pays the fee a second time. FAV V1
+     holds to settlement, so it pays once. The 3.6c figure was most likely a
+     round-trip number from a manual trade that was sold.
+
+WHAT THAT DOES TO THE RECORD (97 settled bets, 4 days):
+
+    window      n    win%   old BE   NEW BE    old net    NEW net
+    AFTERNOON  30    73.3    72.5     70.4     +$2.83     +$7.30
+    MIDDAY     40    67.5    66.5     64.5     +$3.38     +$9.52
+    MORNING    27    63.0    65.8     63.9     -$7.09     -$2.94
+    TOTAL      97    68.0    68.2     66.1     -$0.89    +$13.88
+
+The strategy has been profitable the entire time. A bad fee estimate was
+hiding it. Afternoon and midday clear break-even by about three points each;
+morning is still marginally under.
+
+⚠️ THE KILL LINE CHANGED SHAPE, NOT JUST VALUE.
+The old line — "below 66% win rate at n=50, retire the window" — was set before
+the fee curve was known and is wrong in both directions. Break-even is a
+function of ENTRY PRICE:
+
+    58c -> 59.7%    62c -> 63.7%    69c -> 70.5%    79c -> 80.2%
+
+A 79c afternoon bet winning 75% of the time is LOSING. A 58c morning bet
+winning 62% is WINNING. One threshold cannot express that.
+
+    NEW KILL LINE: a window retires when its win rate sits below its OWN
+    average break-even (avg ask + fee at that ask) at n=50 settled.
+
+Current standing: afternoon +2.9 points, midday +3.0, morning -0.9.
+
 V1.2 CHANGES (2026-09-08)
 =========================
 REMOVED: the consensus agreement tag added in V1.1.
@@ -70,8 +124,8 @@ ADDED: the runner-up bracket and its price.
     ⚠️ NONE OF THIS CHANGES A BET. Every in-band favorite is still taken,
     exactly as before. These are columns, not logic.
 
-WHERE THE STRATEGY ACTUALLY STANDS (97 settled, 4 days)
-=======================================================
+WHERE THE STRATEGY STOOD UNDER THE OLD (WRONG) FEE — kept for the record
+========================================================================
         window      n    win%    break-even    net
         AFTERNOON  30    73.3      72.5      +$2.83
         MIDDAY     40    67.5      66.5      +$3.38
@@ -85,15 +139,12 @@ below it.
 Day by day: +0.87, +21.65, -13.75, -9.64. The entire four-day P&L is one day.
 Three of four days finished under the 66% break-even.
 
-⚠️ THE FEE IS THE BINDING CONSTRAINT, NOT THE STRATEGY. FEE_CENTS = 3.6 is
-backed out from ONE Kalshi ticket. At a 0.2-point margin the difference between
-3.0c and 4.2c decides whether this works at all. Nothing in this file can fix
-that — CONFIRM THE FEE against a second settled ticket at a different price
-before drawing any conclusion from the numbers above.
+⚠️ Those are the OLD numbers, computed with the wrong fee. See the V1.3 block
+at the top for the corrected table: net is +$13.88, not -$0.89.
 
-⚠️ KILL LINE, written before the data arrived: below 66% win rate at n=50 per
-window, that window retires. Morning is at 63.0% on n=27 — the closest to it
-and the furthest from a verdict.
+⚠️ KILL LINE: a window retires when its win rate sits below its OWN average
+break-even at n=50 settled. Morning is at 63.0% against a 63.9% break-even on
+n=27 — under the line but not yet at the sample size that would retire it.
 
 BAND DEFINITIONS
 ================
@@ -233,6 +284,7 @@ Secrets: SUPABASE_URL, and SUPABASE_SERVICE_KEY or SUPABASE_KEY.
 No Kalshi credentials needed — the markets endpoint is public.
 """
 
+import math
 import os
 import re
 import time
@@ -245,17 +297,22 @@ SB_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SB_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ["SUPABASE_KEY"]
 
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2/markets"
-HEADERS = {"User-Agent": "kalshi-favorites/1.2", "Accept": "application/json"}
+HEADERS = {"User-Agent": "kalshi-favorites/1.3", "Accept": "application/json"}
 
 ET = pytz.timezone("America/New_York")
 
 STAKE = 5.0
 TAG_PREFIX = "FAV_V1"
 
-# Per-contract fee, backed out from ONE Kalshi ticket. See the FEE warning in
-# the docstring — at the current margin this number decides everything.
-# `profit` stays gross; this applies to net_profit only.
-FEE_CENTS = 3.6
+# Kalshi's PUBLISHED fee formula, confirmed against a real ticket 2026-09-08:
+#
+#     fee = round_up_to_cent( 0.07 * C * P * (1-P) )
+#         C = number of contracts, P = price in DOLLARS (65c = 0.65)
+#
+# It is a parabola peaking at 50c and falling to nearly nothing at the extremes.
+# It is NOT a flat rate, and the 3.6c figure used through 2026-09-08 was wrong
+# by more than half. See the FEE section in the docstring.
+FEE_COEFFICIENT = 0.07
 
 # Windows in EASTERN LOCAL TIME. pytz resolves DST.
 #   (hour, minute, label, band_low_cents, band_high_cents_exclusive)
@@ -467,20 +524,63 @@ def top_two(markets):
 
 
 def fee_for(amount, price_cents):
-    """Estimated round-trip fee in dollars on a stake at a given ask.
+    """Entry fee in dollars, per Kalshi's published schedule.
 
-    contracts = stake / (price in dollars). Flat per-contract approximation.
-    ⚠️ One observed ticket. At the current margin this is the number that
-    decides whether the strategy works. Confirm it.
+        fee = round_up_to_cent( 0.07 * C * P * (1-P) )
+
+    CONFIRMED 2026-09-08 against a real fill: Las Vegas 95-96 on Sep 7, 30
+    contracts at 65c. Formula gives $19.50 + $0.48 = $19.98; the ticket read
+    $19.99. That is 1.60c per contract.
+
+    ⚠️ ONE FEE, NOT TWO. This strategy holds to settlement, and Kalshi charges
+    nothing at resolution — a winner held to expiry pays only the entry fee.
+    Selling before settlement pays the fee a second time, which is what the
+    3.6c figure was probably measuring.
+
+    The fee falls as price rises, because P*(1-P) shrinks toward the extremes:
+
+        58c -> 1.71c      69c -> 1.50c      79c -> 1.16c
+        62c -> 1.65c      72c -> 1.41c      99c -> 0.07c
+
+    ⚠️ ROUNDING BITES SMALL ORDERS. The round-up is on the TRADE, not the
+    contract. An 8-contract order at 62c owes $0.135 and pays $0.14 — 1.74c per
+    contract instead of 1.65c. At a $5 stake that is a few percent; at real
+    size it disappears. Do not read the per-contract rate off a small ticket.
     """
     try:
-        p = float(price_cents)
-        if p <= 0:
+        p = float(price_cents) / 100.0
+        if p <= 0 or p >= 1:
             return 0.0
-        contracts = float(amount) * 100.0 / p
-        return round(contracts * (FEE_CENTS / 100.0), 4)
+        contracts = float(amount) / p
+        raw = FEE_COEFFICIENT * contracts * p * (1.0 - p)
+        return math.ceil(raw * 100.0) / 100.0
     except Exception:
         return 0.0
+
+
+def break_even_pct(price_cents):
+    """Win rate needed to break even at this entry price, fee included.
+
+    Buying at P and holding to settlement: a win returns (1-P), a loss costs P,
+    and the entry fee f is paid either way. Break-even w solves
+
+        w*(1-P) - (1-w)*P - f = 0   ->   w = P + f
+
+    with everything in dollars. So it is simply the price plus the per-contract
+    fee — which is why a cheap bet in the band needs a LOWER win rate than an
+    expensive one even though the fee itself is larger.
+
+        58c -> 59.7%      69c -> 70.5%      79c -> 80.2%
+        62c -> 63.7%      72c -> 73.4%
+    """
+    try:
+        p = float(price_cents) / 100.0
+        if p <= 0 or p >= 1:
+            return None
+        f = FEE_COEFFICIENT * p * (1.0 - p)
+        return round((p + f) * 100.0, 1)
+    except Exception:
+        return None
 
 
 # ── Logging pass ─────────────────────────────────────────────────────────────
@@ -555,7 +655,8 @@ def run_window(label, band_lo, band_hi, now_et, minutes_late):
         if insert_bet(row):
             logged.append(f"{city} {bracket} @ {ask}c")
             print(f"  {city:<15} {bracket:<16} {ask:>3}c  ✅ LOGGED  "
-                  f"(Σp {sigma_p:.2f} · runner {runner_bracket} @ {runner_ask}c"
+                  f"(BE {break_even_pct(ask):.1f}% · fee ${fee_for(STAKE, ask):.2f} · "
+                  f"Σp {sigma_p:.2f} · runner {runner_bracket} @ {runner_ask}c"
                   f"{side} · gap {ask - runner_ask}c)")
         else:
             print(f"  {city:<15} {bracket:<16} {ask:>3}c  insert failed")
@@ -632,7 +733,7 @@ def settle():
     if n:
         print(f"  settled {n}: {won} won, {lost} lost ({100.0*won/n:.1f}%)")
         print(f"  gross ${gross:+.2f} | net ${net:+.2f} "
-              f"(fee est. {FEE_CENTS}c/contract, ONE-ticket basis — unconfirmed)")
+              f"(Kalshi published formula, one entry fee, no settlement fee)")
     else:
         print("  no results available yet")
 
@@ -640,7 +741,7 @@ def settle():
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     now_et = dt.datetime.now(ET)
-    print(f"FAV V1.2 | {now_et:%Y-%m-%d %H:%M} ET | {len(SERIES)} cities")
+    print(f"FAV V1.3 | {now_et:%Y-%m-%d %H:%M} ET | {len(SERIES)} cities")
     print("no forecast — buying the market's own favorite, in band")
     print(f"latch: fires 0 to +{WINDOW_LATCH_MIN} min after target, never early")
     print("logging runner-up bracket — columns only, no bet is filtered\n")
@@ -676,12 +777,14 @@ def main():
 
     settle()
 
-    print("\nThe tally:")
+    print("\nThe tally (break-even is price-dependent — see break_even_pct):")
     print("  select coalesce(window_label,'TOTAL') win_label, count(*) n,")
     print("         sum((result='Won')::int) wins,")
     print("         round(100.0*avg((result='Won')::int),1) win_pct,")
     print("         round(avg(yes_ask_cents),1) avg_ask,")
-    print("         round(avg(yes_ask_cents)+3.6,1) break_even_pct,")
+    print("         round(avg(yes_ask_cents")
+    print("               + 0.07*yes_ask_cents*(100-yes_ask_cents)/100.0),1) break_even_pct,")
+    print("         round(sum(profit),2) gross,")
     print("         round(sum(net_profit),2) net")
     print("  from favorites_bets where result in ('Won','Lost')")
     print("  group by rollup (window_label) order by win_label nulls last;")
