@@ -1,77 +1,100 @@
 """
-app.py — MPH Weather, V6.2
+app.py — MPH Weather, V6.3
 
-V6.2 — THE QUANTIZATION BUG (2026-09-09 evening)
-=================================================
+V6.3 — THE GREEN BOX THAT LIED (2026-09-09 night)
+==================================================
+At 5:19pm ET the panel showed San Antonio:
+
+    DAY MAX — 5-MIN FEED   81.0°F
+    17 obs today · obs 24m ago
+
+in a green box. The station had actually reached the 98.6F step at ~4pm local.
+The row on screen had been written at about 13:24Z — 8:24am local — and had not
+moved in nine hours. At 8:39pm the SAME numbers (81.0 / 80.1 / 17 obs / 11
+METARs) appeared under **Los Angeles**.
+
+Two separate defects produced that, and V6.2 had no defence against either.
+
+1. NOTHING IN THIS FILE MEASURED FRESHNESS.
+   `feed_age = row.get('obs_age_min')` is stamped by the poller at WRITE time.
+   A row written at 13:24Z saying "obs_age_min: 4.2" still says 4.2 at 22:00Z.
+   The header clock, meanwhile, renders `datetime.now(ET)` — so the page showed
+   8:39pm above a reading from breakfast and called it live.
+
+   ⚠️ THE .hero CLASS HARDCODED `border:2px solid #00ff88`. There was no code
+   path in V6.2 that could produce a non-green headline. The box was green
+   because it is always green, not because the data was good.
+
+   V6.3 computes age from `updated_at` against now, EVERY RENDER. Past
+   STALE_HARD_SEC the headline number is replaced by the word STALE. It is not
+   dimmed, not caveated — replaced. A number you cannot trust is worse than no
+   number, because you will act on it.
+
+2. THE OFF-GRID TEST WAS BACKWARDS — and it is why a corrupt value produced
+   the app's MOST confident output.
+   V6.2 said: on the Celsius grid -> quantized, show a 1.8F window. Off the
+   grid -> `st.caption('This station reports native Fahrenheit tenths — the max
+   is exact, no quantization window.')`
+
+   Real ASOS values land ON the grid. 81.0F is not on it (27C = 80.6). So a
+   stale, duplicated or corrupt value is EXACTLY the kind that reads as
+   off-grid — and V6.2 responded by dropping its error bars and printing a flat
+   red BROKEN. Off-grid is a symptom of bad data, not evidence of precision.
+
+   V6.3 treats off-grid as SUSPICIOUS unless the station is on the known
+   native-tenths list (Boston, Minneapolis). Otherwise it warns and withholds
+   the verdict.
+
+3. NEW: DUPLICATE-ROW DETECTOR.
+   The city selector in V6.2 is correct — it filters `r['city'] == sel`. So
+   identical numbers under two different cities means the DATABASE holds
+   identical rows, which the poller should never write. This file cannot fix
+   the poller, but it can refuse to pretend. If two or more cities share the
+   same day_max_f AND n_obs_today AND n_metars_today, every affected row is
+   flagged and the bracket check is disabled for all of them.
+
+4. TIMEZONE BUG IN THE DATE FILTER.
+   `local_date = eq. today_et()` filtered every city by the EASTERN date. The
+   poller writes each row under the STATION's local date. Between 9pm ET and
+   midnight PT the Pacific cities' rows silently disappear from the dashboard.
+   V6.3 queries today AND yesterday and keeps the newest row per city.
+
+--- V6.2 documentation below, unchanged and still true ---
+
+THE QUANTIZATION BUG
 V6.1 shipped a bracket check that read a feed value as a measurement. On
-Atlanta that evening it said:
-
-    BROKEN — max 89.6 is already above 89.
-
-That was false. 89.6F is EXACTLY 32C. The station transmits whole degrees
-Celsius between hourly METARs, so "89.6" means "somewhere that rounds to 32C",
-which is 88.7F to 90.5F. Roughly 44% of that window settles 89, 56% settles 90.
-
-The Kalshi ladder at that moment: 88-89 at 51%, 90-91 at 49%. The market had it
-right and the app was calling a coin flip a certainty.
+Atlanta it said "BROKEN — max 89.6 is already above 89." That was false. 89.6F
+is EXACTLY 32C. The station transmits whole degrees Celsius between hourly
+METARs, so "89.6" means "somewhere that rounds to 32C", which is 88.7F to
+90.5F. Roughly 44% of that window settles 89, 56% settles 90. The Kalshi ladder
+at that moment: 88-89 at 51%, 90-91 at 49%. The market had it right and the app
+was calling a coin flip a certainty.
 
 ⚠️ EVERY VALUE THAT LOOKED PRECISE WAS ON THE GRID.
     95.0 = 35C    96.8 = 36C    98.6 = 37C
     73.4 = 23C    75.2 = 24C    89.6 = 32C
-Boston's 81.0F, the one reading that was NOT on the grid, turned out to be a
-stale row from an earlier day. Do not conclude a station reports Fahrenheit
-tenths because one number looked like it did.
 
-So the bracket check now returns one of three answers:
+So the bracket check returns one of three answers:
     BROKEN     — even the LOW end of the window settles above your ceiling
     SAFE       — even the HIGH end settles at or below it
     UNRESOLVED — the window straddles the boundary, with the share of it that
                  settles at or below your ceiling
 
-and the quantization window is printed under the headline number rather than
-buried. A 1.8F ambiguity on a 2F bracket is not a footnote.
+⚠️ THE UNRESOLVED SHARE ASSUMES A UNIFORM DISTRIBUTION INSIDE THE BAND.
+It is not uniform. If the bracketing hourly METARs both sit below the band, the
+true peak almost certainly clipped the BOTTOM of it rather than running to the
+top, and the uniform figure overstates the upside. Read the share as an upper
+bound on the bad outcome, not a probability. Observed live on San Antonio
+2026-09-09: this panel said 44%, the market said 26%.
 
-WHAT CHANGED IN V6.1, AND WHY
-===============================
-V6.0 showed the 5-minute feed and the hourly METAR side by side as equals.
-2026-09-09 proved they are not equals, and which one leads matters when you are
-watching a live position.
-
-Boston, that afternoon:
-
-    feed max     73.4F   (201 observations)
-    precise max  69.98F  (9 METARs)
-    19:54 METAR  21.7C = 71.1F
-    20:15 feed   24.0C = 75.2F
-
-The METAR record was 2.3F BELOW the feed and four degrees below where the day
-actually got to. Nine hourly samples cannot catch a peak that happens between
-:51 reports. Meanwhile the Kalshi ladder had already moved — 75-or-below fell
-from 16c to 6c — because the market was reading the same 5-minute data the
-feed was.
-
-⚠️ SO THE FEED MAX LEADS NOW. It is the headline number. The T-group is a
-secondary reading, useful for one job: telling you exactly where you sit when
-the running max is parked on a bracket boundary. That is what it did on
-2026-09-08 in New York, where the display said 79.0 and the station had
-transmitted 25.6C = 78.1F — a full degree, sitting on the 79/80 line.
-
-Both readings, ranked by what they are good for:
+THE FEED MAX LEADS
+Boston, 2026-09-09: feed max 73.4F (201 obs) vs precise max 69.98F (9 METARs).
+Nine hourly samples cannot catch a peak between :51 reports.
 
     day_max_f      every ~5 min, 200+ samples. CATCHES THE PEAK.
-                   Quantized to whole degrees Celsius on most stations, so it
-                   can read up to 0.9F low. Boston and Minneapolis report
-                   native Fahrenheit tenths and do not have this problem.
-
-    precise_max_f  exact to a tenth, 9-14 samples a day. MISSES PEAKS between
-                   :51 reports. It is a FLOOR, never the answer.
-
-OTHER CHANGES
-  - Cache dropped 60s -> 10s on obs_live. On 2026-09-09 a tab left open since
-    morning served an 81.0F reading that was hours stale while the real max was
-    73.4. If you are watching a position, near-zero is the only safe cache.
-  - Every panel stamps how old its data is, in seconds.
-  - Bracket proximity is stated in values the station can actually send.
+                   Quantized to whole degrees Celsius on most stations.
+    precise_max_f  exact to a tenth, 9-14 samples a day. MISSES PEAKS.
+                   It is a FLOOR, never the answer.
 
 WHAT THIS FILE DOES NOT DO
 It places no bets, picks no brackets, computes no probabilities, and has no
@@ -91,9 +114,56 @@ st.set_page_config(page_title='MPH Weather', layout='wide', page_icon='🌡️')
 
 ET = pytz.timezone('America/New_York')
 
+# ── Freshness thresholds ─────────────────────────────────────────────────────
+# The poller runs every 5 minutes. Anything past SOFT is worth flagging;
+# anything past HARD is not a number, it is a memory.
+STALE_SOFT_SEC = 8 * 60
+STALE_HARD_SEC = 15 * 60
+
+# Stations that genuinely transmit Fahrenheit tenths. Everything else that
+# lands off the Celsius grid is suspect, not precise.
+NATIVE_TENTHS = {'KBOS', 'KMSP'}
+
 
 def today_et():
     return datetime.now(ET).strftime('%Y-%m-%d')
+
+
+def yesterday_et():
+    return (datetime.now(ET) - timedelta(days=1)).strftime('%Y-%m-%d')
+
+
+def parse_ts(s):
+    """Supabase timestamptz -> aware datetime, or None."""
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(str(s).replace('Z', '+00:00'))
+    except Exception:
+        return None
+
+
+def age_seconds(ts):
+    """⚠️ READ-TIME age. This is the whole point of V6.3.
+
+    obs_age_min in the row is computed when the poller WRITES. It does not age.
+    A row written at 13:24Z claiming to be 4 minutes old still claims that at
+    22:00Z. Only this function knows what time it actually is.
+    """
+    dtv = parse_ts(ts)
+    if dtv is None:
+        return None
+    return (datetime.now(pytz.UTC) - dtv.astimezone(pytz.UTC)).total_seconds()
+
+
+def fmt_age(sec):
+    if sec is None:
+        return 'unknown age'
+    if sec < 90:
+        return f'{sec:.0f}s ago'
+    if sec < 5400:
+        return f'{sec/60:.0f}m ago'
+    return f'{sec/3600:.1f}h ago'
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -121,6 +191,8 @@ def check_password():
 
 check_password()
 
+# ⚠️ .hero is no longer unconditionally green. V6.2 hardcoded
+# `border:2px solid #00ff88` so no data condition could ever change it.
 st.markdown("""
 <style>
 #MainMenu, footer, header {visibility: hidden;}
@@ -134,12 +206,18 @@ st.markdown("""
                   text-transform:uppercase !important; letter-spacing:.8px !important; }
 .stMetric [data-testid="stMetricValue"] { color:#fff !important;
     font-family:'JetBrains Mono',monospace !important; font-size:22px !important; }
-.hero { background:#0d1b2a; border:2px solid #00ff88; border-radius:10px;
-        padding:14px 20px; margin-bottom:10px; }
+.hero { background:#0d1b2a; border-radius:10px; padding:14px 20px;
+        margin-bottom:10px; }
+.hero-ok    { border:2px solid #00ff88; }
+.hero-warn  { border:2px solid #fbbf24; }
+.hero-dead  { border:2px solid #ef4444; background:#2a0d12; }
 .hero-l { color:#64748b; font-size:11px; text-transform:uppercase;
           letter-spacing:1px; }
-.hero-v { color:#00ff88; font-size:34px; font-weight:700;
+.hero-v { font-size:34px; font-weight:700;
           font-family:'JetBrains Mono',monospace; line-height:1.1; }
+.v-ok   { color:#00ff88; }
+.v-warn { color:#fbbf24; }
+.v-dead { color:#ef4444; font-size:28px; }
 .sub { color:#94a3b8; font-size:12px; font-family:'JetBrains Mono',monospace; }
 </style>
 """, unsafe_allow_html=True)
@@ -170,12 +248,37 @@ def sb_get(table, params, timeout=15):
         return []
 
 
-# ⚠️ 10s, not 60s. A tab left open since morning served a 3-hour-stale max on
-# 2026-09-09 and it read as live. If you are watching a position, cache is risk.
+# ⚠️ 10s, not 60s. A tab left open since morning served an 81.0F reading that
+# was hours stale and it read as live. If you are watching a position, cache is
+# risk. NOTE: a short cache does NOT make data fresh — it only makes the app
+# re-read a possibly-frozen row more often. Freshness is age_seconds().
 @st.cache_data(ttl=10)
 def fetch_obs_live():
-    return sb_get('obs_live', {'local_date': 'eq.' + today_et(),
-                               'order': 'city.asc', 'limit': '50'})
+    """⚠️ TWO DATES, NOT ONE.
+
+    V6.2 filtered `local_date = eq. today_et()`. The poller writes each row
+    under the STATION's local date, so between 9pm ET and midnight PT every
+    Pacific city vanished from the dashboard. Query both days, keep the newest
+    row per city.
+    """
+    rows = sb_get('obs_live', {
+        'local_date': f'in.({yesterday_et()},{today_et()})',
+        'order': 'city.asc', 'limit': '100'})
+    newest = {}
+    for r in rows:
+        c = r.get('city')
+        if not c:
+            continue
+        prev = newest.get(c)
+        if prev is None:
+            newest[c] = r
+            continue
+        a, b = parse_ts(r.get('updated_at')), parse_ts(prev.get('updated_at'))
+        if a and b and a > b:
+            newest[c] = r
+        elif (r.get('local_date') or '') > (prev.get('local_date') or ''):
+            newest[c] = r
+    return sorted(newest.values(), key=lambda x: x.get('city') or '')
 
 
 @st.cache_data(ttl=120)
@@ -217,19 +320,9 @@ def quantization_band(f):
     Most ASOS stations transmit whole degrees CELSIUS between the hourly :51
     METARs. So a feed value of 89.6F is not a measurement of 89.6 — it is the
     station saying "32C", and the true temperature was anywhere that rounds to
-    32C: 31.5 to 32.5C, or 88.7 to 90.5F. A 1.8F window.
+    32C: 88.7 to 90.5F. A 1.8F window.
 
     Returns (lo_f, hi_f, celsius_int, is_on_grid).
-
-    ⚠️ VERIFIED THE HARD WAY. Every value that looked like a precise Fahrenheit
-    reading turned out to be on the grid:
-        95.0 = 35C   96.8 = 36C   98.6 = 37C
-        73.4 = 23C   75.2 = 24C   89.6 = 32C
-    The one Boston reading that was NOT on the grid (81.0F) was a stale row
-    from an earlier day. Do not assume a station reports tenths because one
-    number looked like it did.
-
-    Off-grid values are returned as a zero-width band — nothing to widen.
     """
     try:
         c = (float(f) - 32.0) * 5.0 / 9.0
@@ -244,6 +337,28 @@ def quantization_band(f):
     return round(lo, 1), round(hi, 1), c_round, True
 
 
+def find_duplicate_cities(rows):
+    """⚠️ Cities whose readings are byte-identical to another city's.
+
+    On 2026-09-09 San Antonio and Los Angeles both showed 81.0 / 80.1 / 17 obs
+    / 11 METARs. The selector in V6.2 was correct — it filters on city — which
+    means the DATABASE held identical rows. The poller should never write that.
+    This cannot fix it, but it refuses to display it as if it were real.
+    """
+    sig = {}
+    for r in rows:
+        key = (r.get('day_max_f'), r.get('temp_f'),
+               r.get('n_obs_today'), r.get('n_metars_today'))
+        if key == (None, None, None, None):
+            continue
+        sig.setdefault(key, []).append(r.get('city'))
+    dupes = set()
+    for key, cities in sig.items():
+        if len(cities) > 1:
+            dupes.update(c for c in cities if c)
+    return dupes
+
+
 # ── Header ───────────────────────────────────────────────────────────────────
 now_et = datetime.now(ET)
 h1, h2 = st.columns([4, 1])
@@ -255,7 +370,7 @@ with h1:
     <span style="font-size:11px;color:#00ff88;border:1px solid #00ff8840;
                  background:#00ff8820;padding:2px 9px;border-radius:20px;
                  margin-left:8px;vertical-align:middle;
-                 font-family:'JetBrains Mono',monospace;">V6.2</span></div>
+                 font-family:'JetBrains Mono',monospace;">V6.3</span></div>
   <div style="font-size:12px;color:#64748b;font-family:'JetBrains Mono',monospace;">
     {now_et:%Y-%m-%d %I:%M:%S %p ET} · settles on Iowa State CLI</div>
 </div>
@@ -272,6 +387,14 @@ st.markdown('<div class="sec">📡 Live Obs — Settlement Station</div>',
             unsafe_allow_html=True)
 
 obs_rows = fetch_obs_live()
+dupe_cities = find_duplicate_cities(obs_rows)
+
+if dupe_cities:
+    st.error(
+        f'⚠️ DUPLICATE ROWS IN obs_live — {len(dupe_cities)} cities are '
+        f'reporting identical readings: {", ".join(sorted(dupe_cities))}. '
+        f'That is a poller fault, not a display fault. Readings for these '
+        f'cities cannot be trusted and the bracket check is disabled for them.')
 
 if not obs_rows:
     st.caption('No obs_live rows today. The poller runs every 5 min, 9am–9pm ET '
@@ -284,147 +407,206 @@ else:
 
     if row:
         feed_now = row.get('temp_f')
-        feed_age = row.get('obs_age_min')
         feed_max = row.get('day_max_f')
         nxt = row.get('next_step_f')
         met_now = row.get('metar_temp_f')
-        met_age = row.get('metar_age_min')
         prec_max = row.get('precise_max_f')
         n_obs = row.get('n_obs_today')
         n_met = row.get('n_metars_today')
-        updated = row.get('updated_at')
+        station = (row.get('station') or '').upper()
 
-        # THE HEADLINE. 200+ samples, catches the peak. This is the number that
-        # matters for a bracket, and it is the one the market is reading.
-        # But it is quantized — say so right under it, not three panels down.
-        _band_note = ''
-        if feed_max is not None:
-            _lo, _hi, _c, _og = quantization_band(feed_max)
-            if _og:
-                _band_note = f' · true peak {_lo}–{_hi} ({_c}°C)'
+        # ⚠️ AGE IS COMPUTED HERE, FROM updated_at, AGAINST NOW.
+        # Never from obs_age_min — that is a write-time stamp and does not age.
+        row_age = age_seconds(row.get('updated_at'))
+        poller_says_stale = bool(row.get('is_stale'))
+        stale_reason = row.get('stale_reason')
+        is_dupe = sel in dupe_cities
 
-        hero_l, hero_r = st.columns([2, 3])
-        with hero_l:
+        hard_stale = (row_age is None) or (row_age > STALE_HARD_SEC)
+        soft_stale = (row_age is not None) and (row_age > STALE_SOFT_SEC)
+        untrustworthy = hard_stale or is_dupe
+
+        # ── THE HEADLINE ────────────────────────────────────────────────
+        # If the row is untrustworthy the NUMBER IS NOT SHOWN. Not greyed,
+        # not asterisked — replaced. V6.2 rendered 81.0 in green at 5:19pm
+        # from a row written at 8:24am, and it drove a real decision.
+        if untrustworthy:
+            why = []
+            if hard_stale:
+                why.append(f'last written {fmt_age(row_age)}')
+            if is_dupe:
+                why.append('duplicate of another city')
+            if stale_reason:
+                why.append(stale_reason)
             st.markdown(
-                f'<div class="hero">'
+                f'<div class="hero hero-dead">'
                 f'<div class="hero-l">Day Max — 5-min feed</div>'
-                f'<div class="hero-v">{feed_max:.1f}°F</div>'
-                f'<div class="sub">{n_obs or 0} obs today · '
-                f'{"obs " + format(feed_age, ".0f") + "m ago" if feed_age is not None else "—"}'
-                f'{_band_note}</div></div>',
+                f'<div class="hero-v v-dead">STALE — DO NOT USE</div>'
+                f'<div class="sub">{" · ".join(why)}</div></div>',
                 unsafe_allow_html=True)
-        with hero_r:
-            c1, c2, c3 = st.columns(3)
-            c1.metric('Now', f'{feed_now:.1f}' if feed_now is not None else '—')
-            c2.metric('Next possible', f'{nxt:.1f}' if nxt is not None else '—')
-            c3.metric('Trend 30m',
-                      f"{row.get('trend_30min'):+.1f}"
-                      if row.get('trend_30min') is not None else '—')
+            st.error('This row is not live. Check the obs_live poller before '
+                     'reading anything on this page. Pull the raw METAR '
+                     'directly if you need a number right now.')
+        else:
+            _band_note = ''
+            if feed_max is not None:
+                _lo, _hi, _c, _og = quantization_band(feed_max)
+                if _og:
+                    _band_note = f' · true peak {_lo}–{_hi}°F'
+            klass = 'hero-warn' if (soft_stale or poller_says_stale) else 'hero-ok'
+            vklass = 'v-warn' if (soft_stale or poller_says_stale) else 'v-ok'
+            st.markdown(
+                f'<div class="hero {klass}">'
+                f'<div class="hero-l">Day Max — 5-min feed</div>'
+                f'<div class="hero-v {vklass}">'
+                f'{feed_max:.1f}°F</div>'
+                f'<div class="sub">{n_obs or 0} obs today · '
+                f'written {fmt_age(row_age)}{_band_note}</div></div>',
+                unsafe_allow_html=True)
+            if soft_stale:
+                st.warning(f'Row is {fmt_age(row_age)} — the poller runs every '
+                           f'5 minutes, so this is behind. Treat as indicative.')
+            if poller_says_stale and stale_reason:
+                st.warning(f'Poller flagged this row: {stale_reason}')
 
-        # SECONDARY. Exact, but samples too rarely to be a max. Its one job is
-        # telling you where you sit when the max is parked on a boundary.
-        with st.container():
-            m1, m2 = st.columns([1, 3])
-            with m1:
-                st.metric('METAR (exact)',
-                          f'{met_now:.1f}' if met_now is not None else '—')
-            with m2:
-                st.write('')
+        c1, c2, c3 = st.columns(3)
+        c1.metric('Now', '—' if untrustworthy or feed_now is None else f'{feed_now:.1f}')
+        c2.metric('Next possible', '—' if untrustworthy or nxt is None else f'{nxt:.1f}')
+        c3.metric('Trend 30m',
+                  '—' if untrustworthy or row.get('trend_30min') is None
+                  else f"{row.get('trend_30min'):+.1f}")
+
+        # ── SECONDARY: the exact hourly reading ─────────────────────────
+        met_age = age_seconds(row.get('metar_time_utc'))
+        m1, m2 = st.columns([1, 3])
+        with m1:
+            st.metric('METAR (exact)',
+                      '—' if untrustworthy or met_now is None else f'{met_now:.1f}')
+        with m2:
+            st.write('')
+            if untrustworthy:
+                st.markdown('<div class="sub" style="padding-top:14px;">'
+                            'withheld — row not live</div>',
+                            unsafe_allow_html=True)
+            else:
                 gap_note = ''
                 if feed_max is not None and prec_max is not None:
                     g = round(feed_max - prec_max, 1)
-                    gap_note = (f' · METAR max {prec_max:.1f} '
-                                f'({g:+.1f} vs feed)')
+                    gap_note = f' · METAR max {prec_max:.1f} ({g:+.1f} vs feed)'
                 st.markdown(
                     f'<div class="sub" style="padding-top:14px;">'
-                    f'{f"{met_age:.0f}m ago" if met_age is not None else "no METAR yet"} · '
-                    f'{n_met or 0} today{gap_note}</div>',
+                    f'{fmt_age(met_age)} · {n_met or 0} today{gap_note}</div>',
                     unsafe_allow_html=True)
 
-        if prec_max is not None and feed_max is not None and (feed_max - prec_max) >= 1.5:
+        if (not untrustworthy and prec_max is not None and feed_max is not None
+                and (feed_max - prec_max) >= 1.5):
             st.caption(f'⚠️ The hourly METAR record tops out {feed_max - prec_max:.1f}F '
                        f'below the 5-minute feed. With {n_met or 0} METARs against '
                        f'{n_obs or 0} feed obs, the peak fell between :51 reports. '
                        f'Trust the feed max.')
 
-        if nxt is not None and feed_max is not None:
-            st.caption(f'Feed steps 1.8°F (whole °C). Nothing exists between '
+        if not untrustworthy and nxt is not None and feed_max is not None:
+            st.caption(f'Feed steps 1.8°F. Nothing exists between '
                        f'**{feed_max:.1f}** and **{nxt:.1f}**.')
 
-        # ⚠️ A FEED VALUE ON THE CELSIUS GRID IS A RANGE, NOT A POINT.
-        # V6.1 reported it as exact and told the user "BROKEN — max 89.6 is
-        # already above 89" for Atlanta on 2026-09-09. But 89.6F is exactly
-        # 32C, so the true peak was anywhere in 88.7-90.5F — about 44% of which
-        # settles 89. The market was 51/49 and correctly split. Calling that
-        # BROKEN was a false read produced by treating a quantized value as a
-        # measurement.
+        # ── BRACKET CHECK ───────────────────────────────────────────────
         st.markdown('<div class="sub">Bracket check — enter the ceiling you '
                     'care about</div>', unsafe_allow_html=True)
-        b1, b2 = st.columns([1, 4])
-        with b1:
-            ceiling = st.number_input('Ceiling °F', min_value=0, max_value=130,
-                                      value=int(feed_max) if feed_max else 80,
-                                      step=1, label_visibility='collapsed')
-        with b2:
-            st.write('')
-            if feed_max is not None:
-                lo, hi, c_round, on_grid = quantization_band(feed_max)
-                # CLI rounds to the nearest whole degree F
-                settle_lo = int(lo + 0.5)
-                settle_hi = int(hi + 0.5 - 1e-9)
 
-                if settle_lo > ceiling:
-                    st.error(f'BROKEN — the peak settles {settle_lo} at best, '
-                             f'above your {ceiling} ceiling.')
-                elif settle_hi <= ceiling:
-                    st.success(f'SAFE so far — the peak settles {settle_hi} at '
-                               f'worst, at or below {ceiling}. '
-                               f'(Still climbing? next possible '
-                               f'{nxt:.1f}F.)' if nxt else
-                               f'SAFE so far — settles {settle_hi} at worst.')
-                else:
-                    share = ((ceiling + 0.5 - lo) / (hi - lo)) if hi > lo else 0.5
-                    share = max(0.0, min(1.0, share))
-                    st.warning(
-                        f'UNRESOLVED — feed max {feed_max:.1f}F is {c_round}°C, '
-                        f'so the true peak was **{lo:.1f}–{hi:.1f}°F**. Roughly '
-                        f'**{share*100:.0f}%** of that range settles {ceiling} '
-                        f'or below. The station cannot tell you more until the '
-                        f'next :51 METAR.')
+        if untrustworthy:
+            # ⚠️ V6.2 computed a verdict from whatever was in the row. With a
+            # stale 81.0 and an 80 ceiling it printed a flat red BROKEN, with
+            # no hedge, because 81.0 is off the Celsius grid — see below.
+            st.info('Bracket check disabled — the underlying row is not live. '
+                    'A verdict computed from a stale reading is worse than no '
+                    'verdict.')
+        else:
+            b1, b2 = st.columns([1, 4])
+            with b1:
+                ceiling = st.number_input('Ceiling °F', min_value=0, max_value=130,
+                                          value=int(feed_max) if feed_max else 80,
+                                          step=1, label_visibility='collapsed')
+            with b2:
+                st.write('')
+                if feed_max is not None:
+                    lo, hi, c_round, on_grid = quantization_band(feed_max)
+                    native_tenths = station in NATIVE_TENTHS
 
-                if on_grid:
-                    st.caption(f'⚠️ {feed_max:.1f}F is exactly {c_round}°C — a '
-                               f'quantized transmission, not a measurement. The '
-                               f'real value is somewhere in a 1.8°F window. '
-                               f'Treating it as exact is how you get a false '
-                               f'BROKEN.')
-                elif met_now is not None:
-                    st.caption(f'This station reports native Fahrenheit tenths — '
-                               f'the max is exact, no quantization window.')
+                    if not on_grid and not native_tenths:
+                        # ⚠️ THE INVERSION THAT MADE A BAD ROW LOOK CERTAIN.
+                        # V6.2 said off-grid -> "native Fahrenheit tenths, the
+                        # max is exact, no quantization window", and then
+                        # printed a hard verdict. But real ASOS values land ON
+                        # the grid. 81.0F is not on it (27C = 80.6). Off-grid
+                        # is a SYMPTOM OF BAD DATA at every station except the
+                        # two that genuinely send tenths.
+                        st.warning(
+                            f'⚠️ {feed_max:.1f}°F does not sit on this '
+                            f'station\'s transmission grid, and {station or "this station"} '
+                            f'is not one of the native-tenths sites. That is a '
+                            f'sign of a bad or stale reading, not a precise '
+                            f'one. No verdict given.')
+                    else:
+                        settle_lo = int(lo + 0.5)
+                        settle_hi = int(hi + 0.5 - 1e-9)
+                        if settle_lo > ceiling:
+                            st.error(f'BROKEN — the peak settles {settle_lo} at '
+                                     f'best, above your {ceiling} ceiling.')
+                        elif settle_hi <= ceiling:
+                            st.success(f'SAFE so far — the peak settles '
+                                       f'{settle_hi} at worst, at or below '
+                                       f'{ceiling}.')
+                        else:
+                            share = ((ceiling + 0.5 - lo) / (hi - lo)) if hi > lo else 0.5
+                            share = max(0.0, min(1.0, share))
+                            st.warning(
+                                f'UNRESOLVED — the true peak was '
+                                f'**{lo:.1f}–{hi:.1f}°F**. On a flat assumption '
+                                f'about **{share*100:.0f}%** of that range '
+                                f'settles {ceiling} or below.')
+                            st.caption(
+                                '⚠️ That share assumes the true value is spread '
+                                'evenly across the band. It is not. If the '
+                                'hourly METARs either side sit below the band, '
+                                'the peak most likely clipped its BOTTOM and '
+                                'the real odds are better than this figure. '
+                                'Treat it as an upper bound on the bad outcome. '
+                                '(San Antonio 2026-09-09: this said 44%, the '
+                                'market said 26%.)')
+
+                    if on_grid:
+                        st.caption(f'{feed_max:.1f}°F is a quantized '
+                                   f'transmission, not a measurement — the real '
+                                   f'value is somewhere in a 1.8°F window.')
+                    elif native_tenths:
+                        st.caption(f'{station} transmits Fahrenheit tenths — '
+                                   f'this max is exact.')
 
     with st.expander('All cities', expanded=False):
         tbl = []
         for r in sorted(obs_rows,
                         key=lambda x: (x.get('day_max_f') is None,
                                        -(x.get('day_max_f') or 0))):
-            a, m = r.get('obs_age_min'), r.get('metar_age_min')
+            ra = age_seconds(r.get('updated_at'))
+            ma = age_seconds(r.get('metar_time_utc'))
             fx, px = r.get('day_max_f'), r.get('precise_max_f')
+            dead = (ra is None or ra > STALE_HARD_SEC or r.get('city') in dupe_cities)
             tbl.append({
                 'City': r.get('city', '—'),
                 'Stn': r.get('station', '—'),
-                'DAY MAX': f"{fx:.1f}" if fx is not None else '—',
-                'Now': f"{r['temp_f']:.1f}" if r.get('temp_f') is not None else '—',
-                'Age': (f"{a:.0f}m" + (' ⚠️' if a and a > 20 else '')) if a is not None else '—',
-                'Next': f"{r['next_step_f']:.1f}" if r.get('next_step_f') is not None else '—',
-                'METAR max': f"{px:.1f}" if px is not None else '—',
-                'gap': f"{fx - px:+.1f}" if (fx is not None and px is not None) else '—',
+                'DAY MAX': '⛔ stale' if dead else (f"{fx:.1f}" if fx is not None else '—'),
+                'Now': '—' if dead else (f"{r['temp_f']:.1f}" if r.get('temp_f') is not None else '—'),
+                'Row age': fmt_age(ra) + (' ⛔' if dead else (' ⚠️' if ra and ra > STALE_SOFT_SEC else '')),
+                'METAR age': fmt_age(ma),
+                'METAR max': '—' if dead else (f"{px:.1f}" if px is not None else '—'),
+                'gap': '—' if dead else (f"{fx - px:+.1f}" if (fx is not None and px is not None) else '—'),
                 'obs/met': f"{r.get('n_obs_today','—')}/{r.get('n_metars_today','—')}",
             })
         st.dataframe(pd.DataFrame(tbl), use_container_width=True, hide_index=True)
-        st.caption('DAY MAX is the 5-minute feed — 200+ samples, catches the peak, '
-                   'quantized to whole °C on most stations. METAR max is exact but '
-                   'samples 9–14 times a day and routinely misses the peak; the '
-                   '**gap** column is how much it is missing by. '
+        st.caption('**Row age** is measured from updated_at against now, every '
+                   'render. It is the only number on this page that cannot go '
+                   'stale without saying so. ⛔ means the row has not been '
+                   'rewritten in 15 minutes, or it duplicates another city. '
                    '⚠️ Preliminary, pre-QC. Kalshi settles on official CLI.')
 
 
@@ -443,12 +625,14 @@ else:
         city = r.get('city')
         c = r.get('consensus')
         o = obs_by_city.get(city, {})
-        fmax = o.get('day_max_f')
+        o_age = age_seconds(o.get('updated_at')) if o else None
+        o_dead = (o_age is None or o_age > STALE_HARD_SEC or city in dupe_cities)
+        fmax = None if o_dead else o.get('day_max_f')
         togo = round(c - fmax, 1) if (c is not None and fmax is not None) else None
         tbl.append({
             'City': city,
             'Consensus': f'{c:.1f}' if c is not None else '—',
-            'Day Max': f'{fmax:.1f}' if fmax is not None else '—',
+            'Day Max': '⛔' if o_dead else (f'{fmax:.1f}' if fmax is not None else '—'),
             'To Go': f'{togo:+.1f}' if togo is not None else '—',
             'NWS': f"{r['forecast']:.1f}" if r.get('forecast') is not None else '—',
             'GFS': f"{r['ensemble_mean']:.1f}" if r.get('ensemble_mean') is not None else '—',
@@ -457,7 +641,8 @@ else:
         })
     st.dataframe(pd.DataFrame(tbl), use_container_width=True, hide_index=True)
     st.caption('**To Go** = consensus minus the day\'s feed max. Negative means '
-               'the station has already passed the forecast. ⚠️ = NWS and GFS '
+               'the station has already passed the forecast. ⛔ means the obs '
+               'row is stale so To Go cannot be computed. ⚠️ = NWS and GFS '
                'disagree by more than 5°F. Consensus has never picked a '
                'profitable bracket — this is for seeing where the day stands, '
                'not for betting.')
@@ -574,5 +759,6 @@ with tab_acc:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 st.markdown('---')
-st.caption('V6.2 — feed max leads, quantization made explicit. No gates, no trust '
-           'scores, no bet selection. FAV V1 places the bets; this reads the tables.')
+st.caption('V6.3 — freshness measured at read time, off-grid treated as suspect, '
+           'duplicate rows surfaced. No gates, no trust scores, no bet '
+           'selection. FAV V1 places the bets; this reads the tables.')
