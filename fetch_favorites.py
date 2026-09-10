@@ -1,5 +1,5 @@
 """
-fetch_favorites.py — FAV V1.2. Buy the market's own favorite, in band, at set times.
+fetch_favorites.py — FAV V1.4. Buy the market's own favorite, in band, at set times.
 
 WHAT THIS IS
 ============
@@ -13,6 +13,82 @@ trust score, no opinion about tomorrow's temperature.
 
 That is the entire strategy. It is the automated version of the Daily Capture
 Grid — same three times, same bands, same pick.
+
+V1.4 CHANGES (2026-09-10) — TWO COLLECTORS, NO CHANGE TO ANY BET
+=================================================================
+Nothing in this version alters which bets are placed. Both additions are
+instrumentation for questions that could not be answered from stored data.
+
+1. SNAPSHOTS — the hour-of-day question, and the price-free baseline.
+
+   Two questions came up that the existing tables cannot answer:
+
+     (a) Is there a better entry time between 12:00 and 16:00? The record has
+         only three points (10:30 / 12:00 / 16:00) because those are the only
+         times a bet was ever logged.
+
+     (b) How often does the market's favorite win REGARDLESS of price? The
+         only figure available is 74.3% on 626 city-days from the consensus
+         comparison, pooled, with no split by hour or price.
+
+   `kalshi_candles` was the obvious place to look and it is USELESS for this.
+   Checked 2026-09-09: 1,207,943 rows, Aug 2 - Sep 3, 24 cities — and ZERO
+   rows with yes_ask between 30 and 80. Every captured price is a market
+   already resolved to near-0 or near-100. The interior brackets that carried
+   the action were never captured. Do not go back to that table.
+
+   So V1.4 captures forward. At each SNAPSHOT_HOUR it writes the favorite and
+   runner-up for all 20 cities to `favorites_snapshots` with:
+     - NO BAND FILTER. Every favorite is recorded at any price. That is what
+       makes (b) answerable — win rate by price decile across the whole range,
+       not just 58-79.
+     - NO BET. Nothing is staked, nothing enters favorites_bets, and none of
+       this pools with the FAV V1 record. Separate table, separate analysis.
+
+   ⚠️ SNAPSHOTS ARE NOT BETS. Never UNION these tables. The standing rule is
+   never pool strategy tags, and this is a different instrument entirely — it
+   has no stake, no fee, and no band.
+
+   Sample math, so expectations are calibrated: 20 cities x 5 snapshot hours is
+   100 rows/day. The hour-of-day question (~600 rows/hour) is answerable in
+   about three weeks. A per-city-per-hour breakdown is 100 cells and needs
+   months — collect at fine grain, analyse pooled first.
+
+2. OBS AT ENTRY — how far the temperature has to travel.
+
+   When a bet is logged at 12:00 on a 97-98 bracket, is the station currently
+   at 85 or at 95? Nothing recorded that. V1.4 reads obs_live at write time
+   and stores:
+
+       temp_at_entry        current 5-min feed reading
+       day_max_at_entry     running max so far today
+       degrees_to_lo        bracket_lo - day_max_at_entry
+       obs_age_min_at_entry so a stale obs row can be excluded later
+
+   ⚠️ THESE ARE COLUMNS, NOT A FILTER. No bet is skipped for being far from
+   its bracket. The point is to have the data in three months to test whether
+   distance predicts anything. Filtering on it now, on 126 settled bets, is
+   how the last four filters died.
+
+   ⚠️ obs_live CAN BE STALE. On 2026-09-09 it froze at 08:24 local and served
+   an 81.0F reading until 17:39 while San Antonio was at 98.6. The row is
+   written with whatever obs_live holds plus its age; ALWAYS filter on
+   obs_age_min_at_entry before using these fields.
+
+WHAT IS NOT HERE, AND WHY
+=========================
+SLIPPAGE / ACTUAL FILL PRICE — cannot be built into this file.
+
+    FAV V1 is a PAPER logger. It never sends an order; it writes a row at the
+    displayed ask and settles against Kalshi's `result` field. There is no fill
+    to capture because there is no trade.
+
+    Slippage is real and it is the biggest unmeasured risk to the record — a
+    displayed 58c showed as 61c on a manual fill, and the whole edge is 2-3
+    points. But measuring it requires REAL orders and Kalshi API credentials
+    (portfolio/fills), neither of which this script has. Until then it has to
+    be logged by hand off the manual trades: displayed ask at click, actual
+    average fill from the confirmation. Ten pairs is enough.
 
 V1.3 CHANGES (2026-09-08) — THE FEE WAS WRONG BY MORE THAN HALF
 ================================================================
@@ -157,6 +233,14 @@ independently at 16:00 ET. Forward data agrees there is no ordering within the
 band — the price tiers scatter with no monotonic trend, which is what you get
 if price inside the band carries no information.
 
+⚠️ THE 55-57 TEST USED THE WRONG FEE. It was run when the fee was believed to
+be a flat 3.6c. At 56c the true fee is 1.72c, so break-even is ~57.7% and not
+the ~59.6% the old figure implied — a two-point handicap that test never
+removed. -2.38 at n=246 may be closer to flat than to losing. NOT a reason to
+reopen the floor; it IS a reason to re-run the band analysis against
+break_even_pct() before treating 58 as settled. The snapshots collected by
+V1.4 record every price with no band filter, which is the clean way to redo it.
+
 The floor survived two further tests. City-days where the favorite NEVER
 cleared 58c all day (Seattle 59.4% of days, SF 46.9%, Denver 42.9%) scored
 45.3% at 47.8c ask, -6.11 net. Persistent cheapness is correctly priced.
@@ -188,6 +272,8 @@ August and 74.3% / +8.14 in September. Read the corrected numbers.
 ⚠️ A 17:00 window was considered and not built. By 4pm many cities are already
 above 79c; by 5pm more are. It would likely produce FEWER qualifying bets, not
 more, and the +10.41 figure for that hour carries the same ladder bug.
+V1.4 SNAPSHOTS a 17:00 reading without betting it, which settles the question
+from data rather than argument.
 
 ⚠️ DST. Windows are EASTERN LOCAL TIME through pytz. From early November the
 same ET times are UTC-5. Hardcoding UTC would silently shift every window.
@@ -222,6 +308,15 @@ city-days), Trenton and Newark (~150 candle rows total).
 ⚠️ NO PER-CITY FILTER IS SUPPORTED. City selection has failed four separate
 tests now: the tier-3 scan, lock-in timing, persistent uncertainty, and the
 per-city breakdown of this table. The band is the edge.
+
+⚠️ THE PER-CITY TABLE LOOKS COMPELLING AND IS NOT. Run 2026-09-09 on 126
+settled bets: seven cities at exactly 100% (Minneapolis 3/3, DC 5/5, Denver
+8/8, LA 4/4, Vegas 5/5, Atlanta 5/5, Houston 2/2) and five at 33% or below
+(Boston, SF, Miami 1/3, New Orleans 2/9, Austin 0/6). Almost nothing in
+between. That bimodal shape with an empty middle is the signature of small
+samples, not skill — and every city's average ask sits between 62 and 69c, so
+the market prices them all the same. Denver's 8 bets are ~4 city-days, since
+the three windows on one day are not independent.
 
 SETTLEMENT
 ==========
@@ -263,6 +358,52 @@ RUN THIS BEFORE DEPLOYING V1.2 (safe to re-run):
     ADD COLUMN IF NOT EXISTS runner_hi      INTEGER,
     ADD COLUMN IF NOT EXISTS gap_cents      INTEGER;
 
+⚠️ RUN THIS BEFORE DEPLOYING V1.4 (safe to re-run). Without it every insert
+returns PGRST204 "Could not find the column" and writes ZERO rows — that
+exact failure cost a full day of obs_live on 2026-09-09.
+
+  ALTER TABLE public.favorites_bets
+    ADD COLUMN IF NOT EXISTS temp_at_entry        NUMERIC(6,2),
+    ADD COLUMN IF NOT EXISTS day_max_at_entry     NUMERIC(6,2),
+    ADD COLUMN IF NOT EXISTS degrees_to_lo        NUMERIC(6,2),
+    ADD COLUMN IF NOT EXISTS obs_age_min_at_entry NUMERIC(6,1);
+
+  CREATE TABLE IF NOT EXISTS public.favorites_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    date DATE NOT NULL,
+    city TEXT NOT NULL,
+    snap_label TEXT NOT NULL,
+    series TEXT,
+    event_ticker TEXT,
+    market_ticker TEXT,
+    bracket TEXT,
+    bracket_lo INTEGER,
+    bracket_hi INTEGER,
+    yes_ask_cents INTEGER,
+    runner_bracket TEXT,
+    runner_ask INTEGER,
+    runner_lo INTEGER,
+    runner_hi INTEGER,
+    gap_cents INTEGER,
+    sigma_p NUMERIC,
+    n_brackets INTEGER,
+    in_band BOOLEAN,
+    temp_at_snap NUMERIC(6,2),
+    day_max_at_snap NUMERIC(6,2),
+    degrees_to_lo NUMERIC(6,2),
+    obs_age_min_at_snap NUMERIC(6,1),
+    result TEXT NOT NULL DEFAULT 'Pending',
+    settled_at TIMESTAMPTZ,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    minutes_late INTEGER,
+    UNIQUE (date, city, snap_label)
+  );
+  ALTER TABLE public.favorites_snapshots ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY "Allow all access" ON public.favorites_snapshots
+    FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);
+  CREATE INDEX IF NOT EXISTS idx_snap_date ON public.favorites_snapshots (date);
+  CREATE INDEX IF NOT EXISTS idx_snap_label ON public.favorites_snapshots (snap_label);
+
 THE QUERY V1.2 EXISTS FOR (run at ~60 settled losses):
 
   -- when the favorite loses, does the settlement land on the runner-up?
@@ -279,6 +420,31 @@ THE QUERY V1.2 EXISTS FOR (run at ~60 settled losses):
   where f.result = 'Lost' and s.actual is not null and f.runner_lo is not null
   group by f.window_label, runner_side
   order by f.window_label, runner_side;
+
+THE QUERIES V1.4 EXISTS FOR (run at ~3 weeks of snapshots):
+
+  -- (a) is there a better hour? in-band only, so it is comparable to the bets
+  select snap_label, count(*) n,
+         round(avg(yes_ask_cents),1) avg_ask,
+         round(100.0*avg((result='Won')::int),1) win_pct,
+         round(100.0*avg((result='Won')::int)
+               - avg(yes_ask_cents
+                 + 0.07*yes_ask_cents*(100-yes_ask_cents)/100.0),1) margin
+  from favorites_snapshots
+  where result in ('Won','Lost') and in_band
+  group by snap_label order by snap_label;
+
+  -- (b) the price-free baseline: how good is the favorite at ANY price?
+  select width_bucket(yes_ask_cents, 30, 100, 7)*10+30 as price_bucket,
+         count(*) n,
+         round(100.0*avg((result='Won')::int),1) win_pct,
+         round(avg(yes_ask_cents
+               + 0.07*yes_ask_cents*(100-yes_ask_cents)/100.0),1) break_even
+  from favorites_snapshots
+  where result in ('Won','Lost')
+  group by 1 order by 1;
+
+  ⚠️ Read n before any percentage in either. Most cells will be thin for weeks.
 
 Secrets: SUPABASE_URL, and SUPABASE_SERVICE_KEY or SUPABASE_KEY.
 No Kalshi credentials needed — the markets endpoint is public.
@@ -297,7 +463,7 @@ SB_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SB_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ["SUPABASE_KEY"]
 
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2/markets"
-HEADERS = {"User-Agent": "kalshi-favorites/1.3", "Accept": "application/json"}
+HEADERS = {"User-Agent": "kalshi-favorites/1.4", "Accept": "application/json"}
 
 ET = pytz.timezone("America/New_York")
 
@@ -321,6 +487,23 @@ WINDOWS = [
     (12,  0, "MIDDAY",    58, 70),
     (16,  0, "AFTERNOON", 58, 80),
 ]
+
+# ⚠️ SNAPSHOT HOURS PLACE NO BETS. They fill the gaps between the three betting
+# windows so the hour-of-day question can be answered from data instead of
+# argument. 17:00 is included precisely because a 17:00 WINDOW was rejected on
+# reasoning alone — this measures it without risking anything.
+#   (hour, minute, label)
+SNAPSHOT_HOURS = [
+    (11, 0, "T1100"),
+    (13, 0, "T1300"),
+    (14, 0, "T1400"),
+    (15, 0, "T1500"),
+    (17, 0, "T1700"),
+]
+
+# Band used ONLY to tag snapshots as in_band for comparison with the bets.
+# It filters nothing — every favorite is recorded at every price.
+SNAP_BAND_LO, SNAP_BAND_HI = 58, 80
 
 # One-sided latch, minutes AFTER the target. Delay is always late, never early.
 WINDOW_LATCH_MIN = 25
@@ -370,9 +553,28 @@ def insert_bet(row):
             sb_url("favorites_bets") + "?on_conflict=date,city,window_label",
             headers=sb_headers("return=minimal,resolution=ignore-duplicates"),
             json=row, timeout=15)
-        return r.status_code in (200, 201, 204)
+        if r.status_code not in (200, 201, 204):
+            print(f"    insert HTTP {r.status_code}: {r.text[:140]}")
+            return False
+        return True
     except Exception as e:
         print(f"    insert failed: {type(e).__name__}: {str(e)[:120]}")
+        return False
+
+
+def insert_snapshot(row):
+    """UNIQUE (date, city, snap_label) makes a repeat run a no-op."""
+    try:
+        r = requests.post(
+            sb_url("favorites_snapshots") + "?on_conflict=date,city,snap_label",
+            headers=sb_headers("return=minimal,resolution=ignore-duplicates"),
+            json=row, timeout=15)
+        if r.status_code not in (200, 201, 204):
+            print(f"    snap insert HTTP {r.status_code}: {r.text[:140]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"    snap insert failed: {type(e).__name__}: {str(e)[:120]}")
         return False
 
 
@@ -396,22 +598,87 @@ def window_already_logged(date_str, label):
     return False
 
 
-def fetch_pending():
+def snapshot_already_logged(date_str, label):
     try:
         r = requests.get(
-            sb_url("favorites_bets"),
+            sb_url("favorites_snapshots"),
             headers=sb_headers(),
-            params={"result": "eq.Pending", "order": "date.asc", "limit": "500"},
+            params={"date": f"eq.{date_str}", "snap_label": f"eq.{label}",
+                    "select": "id", "limit": "1"},
+            timeout=15)
+        if r.status_code == 200:
+            return len(r.json()) > 0
+    except Exception:
+        pass
+    return False
+
+
+def fetch_obs_today(date_str):
+    """obs_live rows for today, keyed by city.
+
+    ⚠️ THE ROW CAN BE HOURS OLD AND LOOK FINE. On 2026-09-09 obs_live froze at
+    08:24 local and kept serving 81.0F for San Antonio until 17:39, while the
+    station was at 98.6. obs_age_min is stamped at WRITE time and does not age,
+    so it is stored here as-is and MUST be filtered on before the distance
+    fields are trusted. Returns {} on any failure — these are optional columns
+    and a missing obs row must never block a bet.
+    """
+    try:
+        r = requests.get(
+            sb_url("obs_live"),
+            headers=sb_headers(),
+            params={"local_date": f"eq.{date_str}",
+                    "select": "city,temp_f,day_max_f,obs_age_min",
+                    "limit": "60"},
+            timeout=15)
+        if r.status_code != 200:
+            return {}
+        return {row.get("city"): row for row in (r.json() or []) if row.get("city")}
+    except Exception:
+        return {}
+
+
+def obs_fields(obs_row, bracket_lo, suffix):
+    """Distance-to-bracket columns. All None if obs is missing — never blocks."""
+    out = {
+        f"temp_at_{suffix}": None,
+        f"day_max_at_{suffix}": None,
+        "degrees_to_lo": None,
+        f"obs_age_min_at_{suffix}": None,
+    }
+    if not obs_row:
+        return out
+    try:
+        t = obs_row.get("temp_f")
+        dm = obs_row.get("day_max_f")
+        out[f"temp_at_{suffix}"] = round(float(t), 2) if t is not None else None
+        out[f"day_max_at_{suffix}"] = round(float(dm), 2) if dm is not None else None
+        age = obs_row.get("obs_age_min")
+        out[f"obs_age_min_at_{suffix}"] = round(float(age), 1) if age is not None else None
+        if dm is not None and bracket_lo is not None:
+            out["degrees_to_lo"] = round(float(bracket_lo) - float(dm), 2)
+    except Exception:
+        pass
+    return out
+
+
+def fetch_pending(table, order_col="date"):
+    try:
+        r = requests.get(
+            sb_url(table),
+            headers=sb_headers(),
+            params={"result": "eq.Pending", "order": f"{order_col}.asc",
+                    "limit": "1000"},
             timeout=20)
         return r.json() if r.status_code == 200 else []
     except Exception:
         return []
 
 
-def update_bet(bet_id, updates):
+def update_row(table, row_id, updates):
     try:
         r = requests.patch(
-            sb_url("favorites_bets") + "?id=eq." + str(bet_id),
+            sb_url(table) + "?id=eq." + str(row_id),
             headers=sb_headers(), json=updates, timeout=15)
         return r.status_code in (200, 204)
     except Exception:
@@ -523,6 +790,18 @@ def top_two(markets):
     return m1, a1, m2, a2, sigma_p, len(priced)
 
 
+def ladder_for(city, series, now_et):
+    """One city's priced ladder, with the fallback path. Shared by both passes."""
+    et_ticker = event_ticker_for(series, now_et)
+    markets = kalshi_markets({"event_ticker": et_ticker, "limit": 40})
+    if not markets:
+        markets = kalshi_markets(
+            {"series_ticker": series, "status": "open", "limit": 40})
+        markets = [m for m in markets
+                   if et_ticker.upper() in (m.get("event_ticker") or "").upper()]
+    return markets
+
+
 def fee_for(amount, price_cents):
     """Entry fee in dollars, per Kalshi's published schedule.
 
@@ -546,6 +825,10 @@ def fee_for(amount, price_cents):
     contract. An 8-contract order at 62c owes $0.135 and pays $0.14 — 1.74c per
     contract instead of 1.65c. At a $5 stake that is a few percent; at real
     size it disappears. Do not read the per-contract rate off a small ticket.
+
+    ⚠️ THIS IS THE FEE, NOT THE COST. It does not include slippage. A displayed
+    58c has filled at 61c on a manual trade. See the SLIPPAGE note at the top —
+    it cannot be measured from this file because nothing here places an order.
     """
     try:
         p = float(price_cents) / 100.0
@@ -593,16 +876,15 @@ def run_window(label, band_lo, band_hi, now_et, minutes_late):
         print(f"  ⚠️ entry drift {minutes_late} min. Price at entry is the "
               f"strategy — check minutes_late across the sample.")
 
+    obs = fetch_obs_today(today)
+    if not obs:
+        print("  (no obs_live rows — distance columns will be null, "
+              "bets proceed unchanged)")
+
     logged, skipped_band, skipped_nomarket = [], 0, 0
 
     for city, series in SERIES.items():
-        et_ticker = event_ticker_for(series, now_et)
-        markets = kalshi_markets({"event_ticker": et_ticker, "limit": 40})
-        if not markets:
-            markets = kalshi_markets(
-                {"series_ticker": series, "status": "open", "limit": 40})
-            markets = [m for m in markets
-                       if et_ticker.upper() in (m.get("event_ticker") or "").upper()]
+        markets = ladder_for(city, series, now_et)
 
         top = top_two(markets)
         if top is None:
@@ -652,12 +934,17 @@ def run_window(label, band_lo, band_hi, now_et, minutes_late):
             "runner_hi": r_hi,
             "gap_cents": ask - runner_ask,
         }
+        # V1.4: columns only. No bet is skipped for being far from its bracket.
+        row.update(obs_fields(obs.get(city), lo, "entry"))
+
         if insert_bet(row):
+            d2l = row.get("degrees_to_lo")
             logged.append(f"{city} {bracket} @ {ask}c")
             print(f"  {city:<15} {bracket:<16} {ask:>3}c  ✅ LOGGED  "
                   f"(BE {break_even_pct(ask):.1f}% · fee ${fee_for(STAKE, ask):.2f} · "
                   f"Σp {sigma_p:.2f} · runner {runner_bracket} @ {runner_ask}c"
-                  f"{side} · gap {ask - runner_ask}c)")
+                  f"{side} · gap {ask - runner_ask}c"
+                  f"{f' · to-lo {d2l:+.1f}F' if d2l is not None else ''})")
         else:
             print(f"  {city:<15} {bracket:<16} {ask:>3}c  insert failed")
 
@@ -671,11 +958,84 @@ def run_window(label, band_lo, band_hi, now_et, minutes_late):
     return logged
 
 
+# ── Snapshot pass ────────────────────────────────────────────────────────────
+def run_snapshot(label, now_et, minutes_late):
+    """Record the favorite for every city at this hour. NO BET, NO BAND FILTER.
+
+    ⚠️ This does not stake anything and does not write to favorites_bets. It
+    exists to answer two questions the bet record structurally cannot:
+      - is there a better hour between the three betting windows
+      - how often does the favorite win at prices OUTSIDE 58-79
+
+    Never pool these rows with FAV V1 results.
+    """
+    today = now_et.strftime("%Y-%m-%d")
+    print(f"\n=== SNAPSHOT {label} | {today} | {minutes_late} min after target "
+          f"| no bets placed ===")
+
+    obs = fetch_obs_today(today)
+    written = in_band_n = nomarket = 0
+
+    for city, series in SERIES.items():
+        markets = ladder_for(city, series, now_et)
+        top = top_two(markets)
+        if top is None:
+            nomarket += 1
+            continue
+
+        m1, ask, m2, runner_ask, sigma_p, n_priced = top
+        bracket = label_of(m1)
+        runner_bracket = label_of(m2)
+        lo, hi = bracket_bounds(bracket)
+        r_lo, r_hi = bracket_bounds(runner_bracket)
+        in_band = bool(SNAP_BAND_LO <= ask < SNAP_BAND_HI)
+        if in_band:
+            in_band_n += 1
+
+        row = {
+            "date": today,
+            "city": city,
+            "snap_label": label,
+            "series": series,
+            "event_ticker": m1.get("event_ticker"),
+            "market_ticker": m1.get("ticker"),
+            "bracket": bracket,
+            "bracket_lo": lo,
+            "bracket_hi": hi,
+            "yes_ask_cents": ask,
+            "runner_bracket": runner_bracket,
+            "runner_ask": runner_ask,
+            "runner_lo": r_lo,
+            "runner_hi": r_hi,
+            "gap_cents": ask - runner_ask,
+            "sigma_p": sigma_p,
+            "n_brackets": n_priced,
+            "in_band": in_band,
+            "result": "Pending",
+            "captured_at": now_et.isoformat(),
+            "minutes_late": minutes_late,
+        }
+        row.update(obs_fields(obs.get(city), lo, "snap"))
+
+        if insert_snapshot(row):
+            written += 1
+        time.sleep(0.25)
+
+    print(f"  captured {written}/{len(SERIES)} | in band {in_band_n} | "
+          f"no ladder {nomarket}")
+    return written
+
+
 # ── Settlement pass ──────────────────────────────────────────────────────────
-def settle():
-    """Score against Kalshi's own result field, not a temperature we computed."""
-    print("\n=== Settlement ===")
-    pending = fetch_pending()
+def settle_table(table, id_field="market_ticker"):
+    """Score against Kalshi's own result field, not a temperature we computed.
+
+    Shared by favorites_bets and favorites_snapshots. Snapshots carry no stake,
+    so they get result only — no profit, no fee, no net.
+    """
+    is_bets = (table == "favorites_bets")
+    print(f"\n=== Settlement: {table} ===")
+    pending = fetch_pending(table)
     if not pending:
         print("  nothing pending")
         return
@@ -693,47 +1053,55 @@ def settle():
 
     won = lost = 0
     gross = net = 0.0
-    for et_ticker, bets in by_event.items():
+    for et_ticker, rows in by_event.items():
         if not et_ticker:
             continue
         markets = kalshi_markets({"event_ticker": et_ticker, "limit": 40})
         results = {m.get("ticker"): m.get("result") for m in markets}
-        for b in bets:
-            res = results.get(b.get("market_ticker"))
+        for b in rows:
+            res = results.get(b.get(id_field))
             if res not in ("yes", "no"):
                 continue
-            price = float(b.get("yes_ask_cents") or 0)
-            amount = float(b.get("amount") or STAKE)
-            if res == "yes" and price > 0:
-                profit = round(amount * (100.0 - price) / price, 2)
+
+            if res == "yes":
                 won += 1
             else:
-                profit = round(-amount, 2)
                 lost += 1
 
-            fee = b.get("fee_dollars")
-            if fee is None:
-                fee = fee_for(amount, price)
-            fee = float(fee)
-            net_profit = round(profit - fee, 4)
-
-            gross += profit
-            net += net_profit
-
-            update_bet(b["id"], {
+            updates = {
                 "result": "Won" if res == "yes" else "Lost",
-                "profit": profit,
-                "fee_dollars": fee,
-                "net_profit": net_profit,
                 "settled_at": dt.datetime.now(ET).isoformat(),
-            })
+            }
+
+            if is_bets:
+                price = float(b.get("yes_ask_cents") or 0)
+                amount = float(b.get("amount") or STAKE)
+                if res == "yes" and price > 0:
+                    profit = round(amount * (100.0 - price) / price, 2)
+                else:
+                    profit = round(-amount, 2)
+                fee = b.get("fee_dollars")
+                if fee is None:
+                    fee = fee_for(amount, price)
+                fee = float(fee)
+                net_profit = round(profit - fee, 4)
+                gross += profit
+                net += net_profit
+                updates.update({"profit": profit, "fee_dollars": fee,
+                                "net_profit": net_profit})
+
+            update_row(table, b["id"], updates)
         time.sleep(0.25)
 
     n = won + lost
     if n:
         print(f"  settled {n}: {won} won, {lost} lost ({100.0*won/n:.1f}%)")
-        print(f"  gross ${gross:+.2f} | net ${net:+.2f} "
-              f"(Kalshi published formula, one entry fee, no settlement fee)")
+        if is_bets:
+            print(f"  gross ${gross:+.2f} | net ${net:+.2f} "
+                  f"(Kalshi published formula, one entry fee, no settlement fee)")
+        else:
+            print("  (snapshots carry no stake — result only, never pooled "
+                  "with FAV V1)")
     else:
         print("  no results available yet")
 
@@ -741,10 +1109,12 @@ def settle():
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     now_et = dt.datetime.now(ET)
-    print(f"FAV V1.3 | {now_et:%Y-%m-%d %H:%M} ET | {len(SERIES)} cities")
+    print(f"FAV V1.4 | {now_et:%Y-%m-%d %H:%M} ET | {len(SERIES)} cities")
     print("no forecast — buying the market's own favorite, in band")
     print(f"latch: fires 0 to +{WINDOW_LATCH_MIN} min after target, never early")
-    print("logging runner-up bracket — columns only, no bet is filtered\n")
+    print("logging runner-up + obs-at-entry — columns only, no bet is filtered")
+    print(f"snapshots at {', '.join(l for _, _, l in SNAPSHOT_HOURS)} "
+          f"— no bets, no band filter\n")
 
     today = now_et.strftime("%Y-%m-%d")
     fired = False
@@ -766,16 +1136,30 @@ def main():
         run_window(label, lo, hi, now_et, int(round(delta_min)))
         fired = True
 
+    for hh, mm, label in SNAPSHOT_HOURS:
+        target = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        delta_min = (now_et - target).total_seconds() / 60.0
+        if not (0 <= delta_min <= WINDOW_LATCH_MIN):
+            continue
+        if snapshot_already_logged(today, label):
+            print(f"(snapshot {label} already captured for {today} — skipping)")
+            fired = True
+            continue
+        run_snapshot(label, now_et, int(round(delta_min)))
+        fired = True
+
     if not fired:
-        def mins_until(w):
-            t = now_et.replace(hour=w[0], minute=w[1], second=0, microsecond=0)
+        def mins_until(h, m):
+            t = now_et.replace(hour=h, minute=m, second=0, microsecond=0)
             d = (t - now_et).total_seconds() / 60.0
             return d if d >= 0 else d + 1440.0
-        nxt = min(WINDOWS, key=mins_until)
-        print(f"(no window active — next is {nxt[2]} at "
-              f"{nxt[0]:02d}:{nxt[1]:02d} ET, in {mins_until(nxt):.0f} min)")
+        allw = [(w[0], w[1], w[2]) for w in WINDOWS] + list(SNAPSHOT_HOURS)
+        nxt = min(allw, key=lambda w: mins_until(w[0], w[1]))
+        print(f"(nothing active — next is {nxt[2]} at "
+              f"{nxt[0]:02d}:{nxt[1]:02d} ET, in {mins_until(nxt[0], nxt[1]):.0f} min)")
 
-    settle()
+    settle_table("favorites_bets")
+    settle_table("favorites_snapshots")
 
     print("\nThe tally (break-even is price-dependent — see break_even_pct):")
     print("  select coalesce(window_label,'TOTAL') win_label, count(*) n,")
@@ -788,6 +1172,8 @@ def main():
     print("         round(sum(net_profit),2) net")
     print("  from favorites_bets where result in ('Won','Lost')")
     print("  group by rollup (window_label) order by win_label nulls last;")
+    print("\n  ⚠️ favorites_snapshots is a SEPARATE table. Never UNION it with")
+    print("     favorites_bets — no stake, no fee, no band. See the V1.4 block.")
 
 
 if __name__ == "__main__":
