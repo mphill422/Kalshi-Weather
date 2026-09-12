@@ -1,5 +1,5 @@
 """
-fetch_favorites.py — FAV V1.4. Buy the market's own favorite, in band, at set times.
+fetch_favorites.py — FAV V1.5. Buy the market's own favorite, in band, at set times.
 
 WHAT THIS IS
 ============
@@ -13,6 +13,54 @@ trust score, no opinion about tomorrow's temperature.
 
 That is the entire strategy. It is the automated version of the Daily Capture
 Grid — same three times, same bands, same pick.
+
+V1.5 CHANGES (2026-09-11) — SIX COLUMNS, NO CHANGE TO ANY BET
+==============================================================
+Six fields, all from the SAME markets call already being made. Nothing is
+filtered on any of them. Every one exists because a question was asked this
+week that the stored data could not answer.
+
+  yes_bid_cents / spread_cents
+      Only the ask was stored, so a 70c favorite quoted 69/70 and one quoted
+      58/70 were recorded as the same number. They are not the same market.
+
+      ⚠️ SPREAD IS NOT SLIPPAGE. This file is a PAPER logger — it sends no
+      order, so there is no fill to compare against. A wide spread is a hint
+      that a real fill might land badly; it is not a measurement of one.
+      Slippage still requires real orders and Kalshi credentials.
+
+  volume
+      Whether the edge sits in thin markets or liquid ones. Volume is heavily
+      city-correlated, and per-city selection has failed FOUR times, so any
+      result here needs a city control before it means anything.
+
+  third_bracket / third_ask / top3_share
+      gap_cents was supposed to answer "is this a dominant favorite" and
+      cannot. Measured 2026-09-11 on the 44 settled bets that carry it, the
+      favorite's lead over rank 2 ranged 16 to 67 cents and NEVER fell below
+      16 — the band selects out narrow favorites, so there is no low-dominance
+      population to compare against. Bucketing it gave 50.0 / 80.0 / 63.3 with
+      n of 4 / 10 / 30: no gradient, middle bucket best, i.e. noise.
+      top3_share measures ladder concentration instead, which gap_cents
+      structurally cannot see.
+
+⚠️ WHAT THESE COLUMNS CANNOT FIX. The binding constraint is sample, not
+fields. As of 2026-09-11 the record is 126 settled bets over six days, and
+the V1.2 columns (gap_cents, bracket bounds) exist on only 41-44 of them.
+Every structural hypothesis tested this week returned "not enough data":
+
+    price bands       pooled showed +8.4 margin at 65-69c; the by-day split
+                      put $18.59 of the $23.09 on a single Tuesday
+    dominance         no usable variation (see above)
+    bracket width     ZERO variation — every parsed bracket is 2F wide, so
+                      the hypothesis has no dimension to test on
+    per-city          seven cities at exactly 100%, five at 33% or below,
+                      nothing in between: the signature of tiny cells
+
+These columns are cheap and they start accumulating immediately. They are
+not expected to produce an answer for weeks. Resist re-running these cuts
+every evening — the analysis is what generates false positives, the waiting
+is what generates the sample.
 
 V1.4 CHANGES (2026-09-10) — TWO COLLECTORS, NO CHANGE TO ANY BET
 =================================================================
@@ -404,6 +452,27 @@ exact failure cost a full day of obs_live on 2026-09-09.
   CREATE INDEX IF NOT EXISTS idx_snap_date ON public.favorites_snapshots (date);
   CREATE INDEX IF NOT EXISTS idx_snap_label ON public.favorites_snapshots (snap_label);
 
+⚠️ RUN THIS BEFORE DEPLOYING V1.5 (safe to re-run). Both tables. Skip it and
+every insert returns PGRST204 and writes ZERO rows — that exact failure cost
+a full day of obs_live on 2026-09-09 and a full evening of favorites_snapshots
+on 2026-09-10.
+
+  ALTER TABLE public.favorites_bets
+    ADD COLUMN IF NOT EXISTS yes_bid_cents  INTEGER,
+    ADD COLUMN IF NOT EXISTS spread_cents   INTEGER,
+    ADD COLUMN IF NOT EXISTS volume         INTEGER,
+    ADD COLUMN IF NOT EXISTS third_bracket  TEXT,
+    ADD COLUMN IF NOT EXISTS third_ask      INTEGER,
+    ADD COLUMN IF NOT EXISTS top3_share     NUMERIC(6,4);
+
+  ALTER TABLE public.favorites_snapshots
+    ADD COLUMN IF NOT EXISTS yes_bid_cents  INTEGER,
+    ADD COLUMN IF NOT EXISTS spread_cents   INTEGER,
+    ADD COLUMN IF NOT EXISTS volume         INTEGER,
+    ADD COLUMN IF NOT EXISTS third_bracket  TEXT,
+    ADD COLUMN IF NOT EXISTS third_ask      INTEGER,
+    ADD COLUMN IF NOT EXISTS top3_share     NUMERIC(6,4);
+
 THE QUERY V1.2 EXISTS FOR (run at ~60 settled losses):
 
   -- when the favorite loses, does the settlement land on the runner-up?
@@ -463,7 +532,7 @@ SB_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SB_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ["SUPABASE_KEY"]
 
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2/markets"
-HEADERS = {"User-Agent": "kalshi-favorites/1.4", "Accept": "application/json"}
+HEADERS = {"User-Agent": "kalshi-favorites/1.5", "Accept": "application/json"}
 
 ET = pytz.timezone("America/New_York")
 
@@ -737,6 +806,48 @@ def ask_cents(m):
     return None
 
 
+def bid_cents(m):
+    """Bid price in cents, from the SAME markets call that gives the ask.
+
+    ⚠️ V1.5. Until now only the ask was stored, so a 70c favorite quoted
+    69/70 was indistinguishable from one quoted 58/70 — a tight two-sided
+    market and a thin one-sided one recorded as the same number.
+
+    spread = ask - bid is a columns-only addition. No bet is filtered on it.
+    """
+    v = m.get("yes_bid_dollars")
+    if v:
+        try:
+            return int(round(float(v) * 100))
+        except Exception:
+            pass
+    v = m.get("yes_bid")
+    if v is not None:
+        try:
+            return int(v)
+        except Exception:
+            pass
+    return None
+
+
+def volume_of(m):
+    """Contracts traded on this market, if the endpoint reports it.
+
+    ⚠️ V1.5. Logged to test whether the edge concentrates in thin markets or
+    in liquid ones. COLUMNS ONLY — per-city selection has failed four times
+    and volume is heavily city-correlated, so any result here needs the
+    half-split and a city control before it means anything.
+    """
+    for f in ("volume", "volume_24h"):
+        v = m.get(f)
+        if v is not None:
+            try:
+                return int(v)
+            except Exception:
+                continue
+    return None
+
+
 def bracket_bounds(label):
     """Parse a Kalshi bracket label into (lo, hi). None means unbounded.
 
@@ -768,26 +879,46 @@ def bracket_bounds(label):
     return None, None
 
 
-def top_two(markets):
-    """The market's favorite and its runner-up.
+def top_three(markets):
+    """The market's favorite, runner-up, and rank 3.
 
-    Returns (fav_market, fav_ask, runner_market, runner_ask, sigma_p, n_priced)
-    or None. runner_* may be None if the ladder has only one priced bracket
-    (it needs 2 to qualify at all, so in practice they are populated).
+    Returns (m1, a1, m2, a2, m3, a3, sigma_p, n_priced, top3_share) or None.
+    m3/a3 are None when the ladder has only two priced brackets.
 
     sigma_p is the sum of implied probabilities across the ladder — logged as
     context, NOT used as a filter. The weather model gated on sigma_p > 1.15;
     whether that helps THIS strategy is untested. Forward data so far shows no
     ordering by sigma tier.
+
+    ⚠️ V1.5 ADDS RANK 3. gap_cents (favorite minus runner-up) turned out to
+    carry almost no variation in the band: measured 2026-09-11 on 44 settled
+    bets it ranged 16 to 67 cents and NEVER below 16. The band selects out
+    narrow favorites entirely, so "is this a dominant favorite" could not be
+    asked — every in-band favorite already dominates rank 2.
+
+    top3_share (the top three asks as a fraction of the whole ladder) measures
+    something gap_cents cannot: whether the remaining probability is
+    concentrated in a couple of neighbours or smeared across the ladder. Two
+    markets with an identical 70c favorite and an identical 20c runner-up can
+    still differ in how the last 10c is distributed.
+
+    COLUMNS ONLY. No bet is filtered on any of this.
     """
     priced = [(m, ask_cents(m)) for m in markets]
     priced = [(m, a) for m, a in priced if a is not None and 0 < a < 100]
     if len(priced) < 2:
         return None
-    sigma_p = round(sum(a for _, a in priced) / 100.0, 4)
+    total = sum(a for _, a in priced)
+    sigma_p = round(total / 100.0, 4)
     priced.sort(key=lambda x: x[1], reverse=True)
     (m1, a1), (m2, a2) = priced[0], priced[1]
-    return m1, a1, m2, a2, sigma_p, len(priced)
+    if len(priced) >= 3:
+        m3, a3 = priced[2]
+    else:
+        m3, a3 = None, None
+    top3 = a1 + a2 + (a3 or 0)
+    top3_share = round(top3 / total, 4) if total else None
+    return m1, a1, m2, a2, m3, a3, sigma_p, len(priced), top3_share
 
 
 def ladder_for(city, series, now_et):
@@ -886,15 +1017,16 @@ def run_window(label, band_lo, band_hi, now_et, minutes_late):
     for city, series in SERIES.items():
         markets = ladder_for(city, series, now_et)
 
-        top = top_two(markets)
+        top = top_three(markets)
         if top is None:
             skipped_nomarket += 1
             print(f"  {city:<15} no ladder")
             continue
 
-        m1, ask, m2, runner_ask, sigma_p, n_priced = top
+        m1, ask, m2, runner_ask, m3, third_ask, sigma_p, n_priced, top3_share = top
         bracket = label_of(m1)
         runner_bracket = label_of(m2)
+        third_bracket = label_of(m3) if m3 else None
 
         if not (band_lo <= ask < band_hi):
             skipped_band += 1
@@ -903,6 +1035,10 @@ def run_window(label, band_lo, band_hi, now_et, minutes_late):
 
         lo, hi = bracket_bounds(bracket)
         r_lo, r_hi = bracket_bounds(runner_bracket)
+
+        # V1.5: two-sided quote and depth. Columns only.
+        bid = bid_cents(m1)
+        spread = (ask - bid) if bid is not None else None
 
         # which side is the runner-up on? this is the V1.2 question.
         side = ""
@@ -933,6 +1069,13 @@ def run_window(label, band_lo, band_hi, now_et, minutes_late):
             "runner_lo": r_lo,
             "runner_hi": r_hi,
             "gap_cents": ask - runner_ask,
+            # ⚠️ V1.5 — columns only, nothing is filtered on these.
+            "yes_bid_cents": bid,
+            "spread_cents": spread,
+            "volume": volume_of(m1),
+            "third_bracket": third_bracket,
+            "third_ask": third_ask,
+            "top3_share": top3_share,
         }
         # V1.4: columns only. No bet is skipped for being far from its bracket.
         row.update(obs_fields(obs.get(city), lo, "entry"))
@@ -978,16 +1121,19 @@ def run_snapshot(label, now_et, minutes_late):
 
     for city, series in SERIES.items():
         markets = ladder_for(city, series, now_et)
-        top = top_two(markets)
+        top = top_three(markets)
         if top is None:
             nomarket += 1
             continue
 
-        m1, ask, m2, runner_ask, sigma_p, n_priced = top
+        m1, ask, m2, runner_ask, m3, third_ask, sigma_p, n_priced, top3_share = top
         bracket = label_of(m1)
         runner_bracket = label_of(m2)
+        third_bracket = label_of(m3) if m3 else None
         lo, hi = bracket_bounds(bracket)
         r_lo, r_hi = bracket_bounds(runner_bracket)
+        bid = bid_cents(m1)
+        spread = (ask - bid) if bid is not None else None
         in_band = bool(SNAP_BAND_LO <= ask < SNAP_BAND_HI)
         if in_band:
             in_band_n += 1
@@ -1011,6 +1157,13 @@ def run_snapshot(label, now_et, minutes_late):
             "sigma_p": sigma_p,
             "n_brackets": n_priced,
             "in_band": in_band,
+            # ⚠️ V1.5 — columns only.
+            "yes_bid_cents": bid,
+            "spread_cents": spread,
+            "volume": volume_of(m1),
+            "third_bracket": third_bracket,
+            "third_ask": third_ask,
+            "top3_share": top3_share,
             "result": "Pending",
             "captured_at": now_et.isoformat(),
             "minutes_late": minutes_late,
@@ -1109,7 +1262,7 @@ def settle_table(table, id_field="market_ticker"):
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     now_et = dt.datetime.now(ET)
-    print(f"FAV V1.4 | {now_et:%Y-%m-%d %H:%M} ET | {len(SERIES)} cities")
+    print(f"FAV V1.5 | {now_et:%Y-%m-%d %H:%M} ET | {len(SERIES)} cities")
     print("no forecast — buying the market's own favorite, in band")
     print(f"latch: fires 0 to +{WINDOW_LATCH_MIN} min after target, never early")
     print("logging runner-up + obs-at-entry — columns only, no bet is filtered")
