@@ -561,9 +561,21 @@ WINDOWS = [
 # windows so the hour-of-day question can be answered from data instead of
 # argument. 17:00 is included precisely because a 17:00 WINDOW was rejected on
 # reasoning alone — this measures it without risking anything.
+#
+# ⚠️ T1200 OVERLAPS THE MIDDAY BET WINDOW ON PURPOSE. Both fire at 12:00 and
+# both are correct: MIDDAY writes a BET (band-filtered, staked) to
+# favorites_bets, T1200 writes an unfiltered OBSERVATION to
+# favorites_snapshots. Without it, noon would be the only hour in the day
+# recorded through the 58-79 filter while every other hour is recorded whole —
+# which makes noon non-comparable in any hour-vs-hour analysis.
+#
+# Observed 2026-09-12: Miami's favorite sat at 53c at noon and San Antonio's at
+# 52c, both out of band, so neither produced a row. Both later revised brackets
+# and both revisions won. The hour that mattered was invisible.
 #   (hour, minute, label)
 SNAPSHOT_HOURS = [
     (11, 0, "T1100"),
+    (12, 0, "T1200"),
     (13, 0, "T1300"),
     (14, 0, "T1400"),
     (15, 0, "T1500"),
