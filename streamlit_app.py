@@ -186,6 +186,24 @@ LIVE_SIGMA_MIN = 0.80
 
 KILL_LINE_N = 50
 
+# ⚠️ THE POLLER ONLY RUNS 9AM-9PM ET. Outside that window every row is stale by
+# design, and V6.4's first cut blanked all twenty with ⛔ and no explanation —
+# a screen that looks broken but is merely closed. Staleness during trading
+# hours is a fault; staleness at 10pm is the schedule.
+#
+# The distinction matters because the two call for opposite treatment. A frozen
+# row at 2pm can get you into a trade on a number from breakfast, which is what
+# happened on 2026-09-09. A frozen row at 10pm cannot mislead anyone into
+# anything — the markets it describes have settled.
+POLLER_START_HOUR = 9
+POLLER_END_HOUR = 21
+
+
+def poller_should_be_running(now=None):
+    """True when obs_live is scheduled to be writing right now."""
+    n = now or datetime.now(ET)
+    return POLLER_START_HOUR <= n.hour < POLLER_END_HOUR
+
 
 def today_et():
     return datetime.now(ET).strftime('%Y-%m-%d')
@@ -589,11 +607,25 @@ if not obs_rows:
     st.caption('No obs_live rows. The poller runs every 5 min, 9am–9pm ET via '
                'cron-job.org → obs_live.yml.')
 else:
+    live_hours = poller_should_be_running()
     board = []
     for r in obs_rows:
         city = r.get('city')
         ra = age_seconds(r.get('updated_at'))
-        dead = (ra is None or ra > STALE_HARD_SEC or city in dupe_cities)
+        is_dupe_row = city in dupe_cities
+        too_old = (ra is None or ra > STALE_HARD_SEC)
+
+        # ⚠️ TWO DIFFERENT KINDS OF STALE, TREATED DIFFERENTLY.
+        #   during 9am-9pm : a stale row is a FAULT. Blank it. This is the
+        #                    2026-09-09 failure — an 8:24am reading shown in
+        #                    green at 5:19pm, which drove a real decision.
+        #   outside those  : a stale row is the SCHEDULE. Show it, labelled
+        #                    "closed", because the day it describes is over
+        #                    and a settled number cannot mislead anyone.
+        # A duplicate row is untrustworthy at any hour — that is corruption,
+        # not timing.
+        dead = is_dupe_row or (too_old and live_hours)
+        closed = (too_old and not live_hours and not is_dupe_row)
         fmax = r.get('day_max_f')
         trend = r.get('trend_30min')
         lh = local_hour(city)
@@ -611,6 +643,8 @@ else:
         # +0.0 is the normal reading for most of any given hour.
         if dead:
             peak = '—'
+        elif closed:
+            peak = '🔒 closed'
         elif lh is None:
             peak = 'unknown tz'
         elif lh < 12:
@@ -630,8 +664,9 @@ else:
             likely = f'{dist[0][0]}  ({dist[0][1]*100:.0f}%)'
             alts = (' · '.join(f'{d}={s*100:.0f}%' for d, s in dist[1:])
                     if len(dist) > 1 else 'locked')
-            # Closeness flag: how much room the runner-up has.
-            if len(dist) == 1:
+            # Closeness flag: how much room the runner-up has. Suppressed once
+            # the day is closed — nothing is undecided about a finished day.
+            if closed or len(dist) == 1:
                 closeness = ''
             elif dist[0][1] < 0.45:
                 closeness = '🔴 wide open'
@@ -643,8 +678,10 @@ else:
         board.append({
             # Sort: live rows first, then by how UNDECIDED they are — a band
             # whose top outcome holds only 40% is more interesting than one
-            # holding 85%, even though both technically straddle.
-            '_sort': (1 if dead else 0, top_share if not dead else 9,
+            # holding 85%, even though both technically straddle. Closed rows
+            # sink below live ones, dead rows below those.
+            '_sort': (2 if dead else (1 if closed else 0),
+                      top_share if not (dead or closed) else 9,
                       -(fmax or 0)),
             'City': city,
             'Local': f'{lh:02d}:00' if lh is not None else '—',
@@ -652,7 +689,8 @@ else:
             'Most likely': likely,
             'Also possible': alts,
             'How close': closeness,
-            'Trend 30m': '—' if dead or trend is None else f'{trend:+.1f}',
+            'Trend 30m': ('—' if (dead or closed or trend is None)
+                          else f'{trend:+.1f}'),
             'Peak': peak,
             'Age': fmt_age(ra),
         })
@@ -660,11 +698,36 @@ else:
     for b in board:
         b.pop('_sort', None)
     st.dataframe(pd.DataFrame(board), use_container_width=True, hide_index=True)
+
     n_undec = sum(1 for b in board if b['How close'])
+    n_closed = sum(1 for b in board if b['Peak'] == '🔒 closed')
+    n_dead = sum(1 for b in board if b['Peak'] == '—')
+
+    # ⚠️ SAY WHY THE BOARD IS EMPTY. Twenty blank rows with no explanation look
+    # like a fault; the usual cause is simply that it is 10pm. The two cases
+    # need opposite responses, so they get different messages.
+    if not live_hours:
+        st.info(
+            f'🔒 **Poller window closed.** obs_live runs '
+            f'{POLLER_START_HOUR}:00–{POLLER_END_HOUR}:00 ET via cron-job.org '
+            f'→ obs_live.yml, so nothing has been written since about '
+            f'{POLLER_END_HOUR}:00 and nothing will until '
+            f'{POLLER_START_HOUR}:00 tomorrow. The figures above are each '
+            f'city\'s FINAL reading for the day, not a live one — shown rather '
+            f'than blanked because a settled number cannot mislead you into a '
+            f'trade.')
+    elif n_dead:
+        st.error(
+            f'⛔ **{n_dead} row(s) are stale DURING the poller window** — that '
+            f'is a fault, not the schedule. Check GitHub Actions → obs_live.yml '
+            f'for failed runs, and Supabase for PGRST204 column errors, which '
+            f'let the job exit green while writing nothing.')
+
     st.caption(
-        f'**{n_undec} of {len(board)} cities are still undecided.** Sorted by '
-        'how close, not alphabetically — the top row is the one the station '
-        'can tell you least about.\n\n'
+        f'**{n_undec} of {len(board)} cities are still undecided.**'
+        + (f' {n_closed} closed for the day.' if n_closed else '')
+        + ' Sorted by how close, not alphabetically — the top row is the one '
+          'the station can tell you least about.\n\n'
         '**Most likely** is the whole degree the reading is most likely to '
         'settle at, with its share of the quantization band. A 1.8°F band is '
         'wider than a 1.0°F rounding interval, so it always covers at least '
