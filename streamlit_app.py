@@ -184,50 +184,98 @@ SLOT_RANK = {name: rank for name, rank in SLOT_ORDER}
 # reading them as prices would drag any hour-vs-hour comparison.
 LIVE_SIGMA_MIN = 0.80
 
-# ⚠️ COORDINATES ARE THE SETTLEMENT STATION, NOT THE CITY CENTRE.
-# This is the Hobby-vs-Bush, Midway-vs-O'Hare trap in a different form: a
-# forecast link pointed at "Houston" gives you Bush, and Kalshi settles Hobby.
-# Several degrees apart on the same day. These are the stations Kalshi names.
+# ⚠️ THE LINK MUST POINT AT THE SETTLEMENT STATION, NOT THE CITY.
+# This is the Hobby-vs-Bush, Midway-vs-O'Hare trap in a different form. Proven
+# on 2026-09-14: the phone app pinned to Miami Intl Airport (KMIA) read 82F
+# with a forecast high of 90, while weather.com/us/florida/city/miami/today read
+# 84F with a high of 88. Same company, same minute, two degrees apart on both
+# numbers — because one is the station and one is downtown.
 #
-# ⚠️ weather.com resolves a lat/lon to its NEAREST forecast point, which is not
-# guaranteed to be the station itself. Close enough to be useful for a look at
-# the trend; NOT a settlement source. What settles is the recorded max The
-# Weather Company publishes for the station, which is a different product from
-# the forecast shown on that page.
-CITY_COORD = {
-    'Atlanta':       (33.64, -84.43),   # KATL
-    'Austin':        (30.19, -97.67),   # KAUS
-    'Boston':        (42.36, -71.01),   # KBOS
-    'Washington DC': (38.85, -77.04),   # KDCA
-    'Denver':        (39.86, -104.67),  # KDEN
-    'Dallas':        (32.90, -97.04),   # KDFW
-    'Houston':       (29.65, -95.28),   # KHOU — HOBBY, not Bush
-    'Las Vegas':     (36.08, -115.15),  # KLAS
-    'Los Angeles':   (33.94, -118.41),  # KLAX
-    'Chicago':       (41.79, -87.75),   # KMDW — MIDWAY, not O'Hare
-    'Miami':         (25.79, -80.29),   # KMIA
-    'Minneapolis':   (44.88, -93.22),   # KMSP
-    'New Orleans':   (29.99, -90.26),   # KMSY
-    'New York':      (40.78, -73.97),   # KNYC — Central Park
-    'Oklahoma City': (35.39, -97.60),   # KOKC
-    'Philadelphia':  (39.87, -75.24),   # KPHL
-    'Phoenix':       (33.43, -112.01),  # KPHX
-    'San Antonio':   (29.53, -98.47),   # KSAT
-    'Seattle':       (47.44, -122.31),  # KSEA
-    'San Francisco': (37.62, -122.37),  # KSFO
+# ⚠️ AN EARLIER BUILD USED weather.com/weather/today/l/{lat},{lon} AND WAS WRONG.
+# weather.com snaps a coordinate to its nearest NAMED PLACE, which for the
+# station's own lat/lon is usually the city, not the airport. Those links looked
+# authoritative and were off by a couple of degrees, which on a 2F bracket is
+# the entire question. Removed rather than left in.
+
+# NWS point forecast, keyed by ICAO. EXACT for every station, no guessing —
+# the code IS the identifier. Same forecast source the consensus table uses.
+CITY_STATION = {
+    'Atlanta': 'KATL',        'Austin': 'KAUS',
+    'Boston': 'KBOS',         'Washington DC': 'KDCA',
+    'Denver': 'KDEN',         'Dallas': 'KDFW',
+    'Houston': 'KHOU',        # HOBBY, not Bush
+    'Las Vegas': 'KLAS',      'Los Angeles': 'KLAX',
+    'Chicago': 'KMDW',        # MIDWAY, not O'Hare
+    'Miami': 'KMIA',          'Minneapolis': 'KMSP',
+    'New Orleans': 'KMSY',    'New York': 'KNYC',   # Central Park, not an airport
+    'Oklahoma City': 'KOKC',  'Philadelphia': 'KPHL',
+    'Phoenix': 'KPHX',        'San Antonio': 'KSAT',
+    'Seattle': 'KSEA',        'San Francisco': 'KSFO',
+}
+
+# ⚠️ VERIFIED TWC URLS. Every one of these was opened and confirmed to name the
+# settlement station, 2026-09-14. They are NOT generated and must not be.
+#
+# The slug is the airport's full formal name and it is unguessable. Three of
+# these would have been WRONG under any naming convention a machine would pick:
+#
+#   Houston       william-p-hobby-airport        NOT houston-hobby / Bush
+#   Chicago       chicago-midway-international   NOT O'Hare
+#   New York      /poi/central-park              NOT an airport at all
+#
+# And the city segment is often not the city the market is named for:
+#   Washington DC -> /us/virginia/arlington/       (Reagan National)
+#   Boston        -> /us/massachusetts/east-boston/ (Logan)
+#   Dallas        -> /us/texas/grapevine/           (DFW)
+#   New Orleans   -> /us/louisiana/kenner/          (Louis Armstrong)
+#   Seattle       -> /us/washington/seatac/         (Sea-Tac)
+#
+# Las Vegas is harry-reid-international, not McCarran — renamed in 2021.
+#
+# Store the BASE url with no view suffix; twc_url() appends /today,
+# /hourbyhour or /tenday.
+TWC_VERIFIED = {
+    'Atlanta':       'https://weather.com/us/georgia/atlanta/airport/hartsfield-jackson-atlanta-international-airport',
+    'Austin':        'https://weather.com/us/texas/austin/airport/austin-bergstrom-international-airport',
+    'Boston':        'https://weather.com/us/massachusetts/east-boston/airport/logan-international-airport',
+    'Chicago':       'https://weather.com/us/illinois/chicago/airport/chicago-midway-international-airport',
+    'Dallas':        'https://weather.com/us/texas/grapevine/airport/dallas-fort-worth-international-airport',
+    'Denver':        'https://weather.com/us/colorado/denver/airport/denver-international-airport',
+    'Houston':       'https://weather.com/us/texas/houston/airport/william-p-hobby-airport',
+    'Las Vegas':     'https://weather.com/us/nevada/las-vegas/airport/harry-reid-international-airport',
+    'Los Angeles':   'https://weather.com/us/california/los-angeles/airport/los-angeles-international-airport',
+    'Miami':         'https://weather.com/us/florida/miami/airport/miami-international-airport',
+    'Minneapolis':   'https://weather.com/us/minnesota/minneapolis/airport/minneapolis-saint-paul-international-airport-wold-chamberlain-field',
+    'New Orleans':   'https://weather.com/us/louisiana/kenner/airport/louis-armstrong-new-orleans-international-airport',
+    'New York':      'https://weather.com/us/new-york/new-york-city/poi/central-park',
+    'Oklahoma City': 'https://weather.com/us/oklahoma/oklahoma-city/airport/will-rogers-world-airport',
+    'Philadelphia':  'https://weather.com/us/pennsylvania/philadelphia/airport/philadelphia-international-airport',
+    'Phoenix':       'https://weather.com/us/arizona/phoenix/airport/phoenix-sky-harbor-international-airport',
+    'San Antonio':   'https://weather.com/us/texas/san-antonio/airport/san-antonio-international-airport',
+    'San Francisco': 'https://weather.com/us/california/san-francisco/airport/san-francisco-international-airport',
+    'Seattle':       'https://weather.com/us/washington/seatac/airport/seattle-tacoma-international-airport',
+    'Washington DC': 'https://weather.com/us/virginia/arlington/airport/ronald-reagan-washington-national-airport',
 }
 
 
-def twc_url(city, view='today'):
-    """weather.com link for a city's SETTLEMENT STATION coordinates.
-
-    view: 'today' | 'hourbyhour' | 'tenday'
-    Returns None for an unmapped city rather than a wrong link.
-    """
-    c = CITY_COORD.get(city)
-    if not c:
+def nws_url(city):
+    """NWS point forecast for the settlement station. Exact, via ICAO code."""
+    stn = CITY_STATION.get(city)
+    if not stn:
         return None
-    return f'https://weather.com/weather/{view}/l/{c[0]},{c[1]}'
+    return f'https://forecast.weather.gov/zipcity.php?inputstring={stn}'
+
+
+def twc_url(city, view='today'):
+    """weather.com link, ONLY for stations whose URL has been verified.
+
+    Returns None for anything unverified — a missing link is better than one
+    pointing at the wrong airport.
+    """
+    base = TWC_VERIFIED.get(city)
+    if not base:
+        return None
+    return f'{base}/{view}'
 
 
 KILL_LINE_N = 50
@@ -875,6 +923,7 @@ else:
                           else f'{trend:+.1f}'),
             'Peak': peak,
             'Age': fmt_age(ra),
+            'NWS': nws_url(city),
             'TWC': twc_url(city),
         })
     board.sort(key=lambda x: x['_sort'])
@@ -885,11 +934,18 @@ else:
         column_config={
             # ⚠️ Points at the SETTLEMENT STATION's coordinates, not the city.
             # A link to "Houston" gives Bush; Kalshi settles Hobby.
+            # ⚠️ Both point at the SETTLEMENT STATION. NWS is keyed by ICAO
+            # so it is exact everywhere; TWC only appears for stations whose
+            # URL has been verified by hand.
+            'NWS': st.column_config.LinkColumn(
+                'NWS', display_text='open', width='small',
+                help='NWS point forecast for this settlement station, by ICAO '
+                     'code. Exact station, no guessing.'),
             'TWC': st.column_config.LinkColumn(
                 'TWC', display_text='open', width='small',
-                help='The Weather Company forecast for this settlement '
-                     'station. FORECAST, not the settlement number — the '
-                     'recorded max TWC publishes is a different product.'),
+                help='The Weather Company forecast. Only shown for stations '
+                     'whose URL has been verified — blank means not yet '
+                     'added, NOT that it does not exist.'),
         })
 
     n_undec = sum(1 for b in board if b['How close'])
@@ -1141,42 +1197,56 @@ if obs_rows:
                         st.caption(f'{station} transmits Fahrenheit tenths — '
                                    f'this max is exact.')
 
-    with st.expander('Forecast links — The Weather Company', expanded=False):
-        # ⚠️ TWC SETTLES THESE MARKETS, BUT NOT VIA THIS PAGE.
-        # Confirmed 2026-09-14 from a live KXHIGH Rules tab: "according to The
-        # Weather Company. Outcome verified from The Weather Company." What
-        # settles is the RECORDED max for the station. What these links show is
-        # the FORECAST. Same company, different product — and forecasting is
-        # where this project has already found no edge: 205 losing paper bets,
-        # and naked market consensus beat the model 74.3% to 55.2% on 626
-        # city-days.
+    with st.expander('Forecast links — settlement stations', expanded=False):
+        # ⚠️ FORECAST, NOT SETTLEMENT. The Weather Company settles these markets
+        # on the RECORDED max for the station (confirmed 2026-09-14 from a live
+        # KXHIGH Rules tab). What these pages show is the FORECAST — same
+        # company, different product. And forecasting is where this project has
+        # already found no edge: 205 losing paper bets, with naked market
+        # consensus beating the model 74.3% to 55.2% on 626 city-days.
         lrows = []
-        for c in sorted(CITY_COORD):
+        for c in sorted(CITY_STATION):
             lrows.append({
                 'City': c,
-                'Today': twc_url(c, 'today'),
-                'Hourly': twc_url(c, 'hourbyhour'),
-                '10-day': twc_url(c, 'tenday'),
+                'Station': CITY_STATION[c],
+                'NWS': nws_url(c),
+                'TWC today': twc_url(c, 'today'),
+                'TWC hourly': twc_url(c, 'hourbyhour'),
             })
         st.dataframe(
             pd.DataFrame(lrows), use_container_width=True, hide_index=True,
             column_config={
-                'Today': st.column_config.LinkColumn('Today', display_text='open'),
-                'Hourly': st.column_config.LinkColumn('Hourly', display_text='open'),
-                '10-day': st.column_config.LinkColumn('10-day', display_text='open'),
+                'NWS': st.column_config.LinkColumn('NWS', display_text='open'),
+                'TWC today': st.column_config.LinkColumn('TWC today', display_text='open'),
+                'TWC hourly': st.column_config.LinkColumn('TWC hourly', display_text='open'),
             })
+        n_twc = len(TWC_VERIFIED)
         st.caption(
-            '⚠️ These point at each **settlement station\'s** coordinates, not '
-            'the city centre — Houston is HOBBY and Chicago is MIDWAY, and a '
-            'link to the city would give you Bush and O\'Hare, several degrees '
-            'apart on the same day. weather.com still resolves a lat/lon to '
-            'its nearest forecast point, so treat these as a look at the '
-            'trend, not as the station.\n\n'
-            '⚠️ **Forecast, not settlement.** The Weather Company settles these '
-            'markets on the recorded max, which is a different product from '
-            'the forecast on these pages. TWC\'s forecast has never been '
-            'scored against NWS or GFS in this project — it is not in the '
-            'consensus table.')
+            f'All {len(CITY_STATION)} stations, both sources. **NWS** is keyed '
+            'by ICAO code so it is exact by construction; **TWC** links were '
+            f'each opened and confirmed by hand ({n_twc}/{len(CITY_STATION)}).'
+            '\n\n'
+            '⚠️ **These are FORECASTS, not the settlement number.** The Weather '
+            'Company settles these markets on the RECORDED max for the station '
+            '(confirmed 2026-09-14 from a live KXHIGH Rules tab: "according to '
+            'The Weather Company"). The forecast on these pages is a different '
+            'product from the number that pays. TWC\'s forecast has never been '
+            'scored against NWS or GFS here — it is not in the consensus '
+            'table.\n\n'
+            '⚠️ **Never generate these URLs.** Three would be wrong under any '
+            'naming rule a machine would pick: Houston is '
+            '`william-p-hobby-airport` (not Bush), Chicago is '
+            '`chicago-midway-international-airport` (not O\'Hare), and New '
+            'York is `/poi/central-park` — not an airport at all. The city '
+            'segment often is not the market\'s city either: DC sits under '
+            'Arlington VA, Boston under East Boston, Dallas under Grapevine, '
+            'New Orleans under Kenner, Seattle under SeaTac.\n\n'
+            '⚠️ An earlier build generated these from station lat/lon and was '
+            'wrong — weather.com snaps a coordinate to its nearest named '
+            'place, which is the city, not the airport. Measured 2026-09-14: '
+            'the app pinned to KMIA read 82°F / high 90°, the city page read '
+            '84°F / high 88°. Two degrees on both, which on a 2°F bracket is '
+            'the whole question.')
 
     with st.expander('All cities — raw obs', expanded=False):
         tbl = []
