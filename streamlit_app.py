@@ -184,6 +184,52 @@ SLOT_RANK = {name: rank for name, rank in SLOT_ORDER}
 # reading them as prices would drag any hour-vs-hour comparison.
 LIVE_SIGMA_MIN = 0.80
 
+# ⚠️ COORDINATES ARE THE SETTLEMENT STATION, NOT THE CITY CENTRE.
+# This is the Hobby-vs-Bush, Midway-vs-O'Hare trap in a different form: a
+# forecast link pointed at "Houston" gives you Bush, and Kalshi settles Hobby.
+# Several degrees apart on the same day. These are the stations Kalshi names.
+#
+# ⚠️ weather.com resolves a lat/lon to its NEAREST forecast point, which is not
+# guaranteed to be the station itself. Close enough to be useful for a look at
+# the trend; NOT a settlement source. What settles is the recorded max The
+# Weather Company publishes for the station, which is a different product from
+# the forecast shown on that page.
+CITY_COORD = {
+    'Atlanta':       (33.64, -84.43),   # KATL
+    'Austin':        (30.19, -97.67),   # KAUS
+    'Boston':        (42.36, -71.01),   # KBOS
+    'Washington DC': (38.85, -77.04),   # KDCA
+    'Denver':        (39.86, -104.67),  # KDEN
+    'Dallas':        (32.90, -97.04),   # KDFW
+    'Houston':       (29.65, -95.28),   # KHOU — HOBBY, not Bush
+    'Las Vegas':     (36.08, -115.15),  # KLAS
+    'Los Angeles':   (33.94, -118.41),  # KLAX
+    'Chicago':       (41.79, -87.75),   # KMDW — MIDWAY, not O'Hare
+    'Miami':         (25.79, -80.29),   # KMIA
+    'Minneapolis':   (44.88, -93.22),   # KMSP
+    'New Orleans':   (29.99, -90.26),   # KMSY
+    'New York':      (40.78, -73.97),   # KNYC — Central Park
+    'Oklahoma City': (35.39, -97.60),   # KOKC
+    'Philadelphia':  (39.87, -75.24),   # KPHL
+    'Phoenix':       (33.43, -112.01),  # KPHX
+    'San Antonio':   (29.53, -98.47),   # KSAT
+    'Seattle':       (47.44, -122.31),  # KSEA
+    'San Francisco': (37.62, -122.37),  # KSFO
+}
+
+
+def twc_url(city, view='today'):
+    """weather.com link for a city's SETTLEMENT STATION coordinates.
+
+    view: 'today' | 'hourbyhour' | 'tenday'
+    Returns None for an unmapped city rather than a wrong link.
+    """
+    c = CITY_COORD.get(city)
+    if not c:
+        return None
+    return f'https://weather.com/weather/{view}/l/{c[0]},{c[1]}'
+
+
 KILL_LINE_N = 50
 
 # ⚠️ THE POLLER ONLY RUNS 9AM-9PM ET. Outside that window every row is stale by
@@ -829,11 +875,22 @@ else:
                           else f'{trend:+.1f}'),
             'Peak': peak,
             'Age': fmt_age(ra),
+            'TWC': twc_url(city),
         })
     board.sort(key=lambda x: x['_sort'])
     for b in board:
         b.pop('_sort', None)
-    st.dataframe(pd.DataFrame(board), use_container_width=True, hide_index=True)
+    st.dataframe(
+        pd.DataFrame(board), use_container_width=True, hide_index=True,
+        column_config={
+            # ⚠️ Points at the SETTLEMENT STATION's coordinates, not the city.
+            # A link to "Houston" gives Bush; Kalshi settles Hobby.
+            'TWC': st.column_config.LinkColumn(
+                'TWC', display_text='open', width='small',
+                help='The Weather Company forecast for this settlement '
+                     'station. FORECAST, not the settlement number — the '
+                     'recorded max TWC publishes is a different product.'),
+        })
 
     n_undec = sum(1 for b in board if b['How close'])
     n_closed = sum(1 for b in board if b['Peak'] == '🔒 closed')
@@ -1083,6 +1140,43 @@ if obs_rows:
                     elif native_tenths:
                         st.caption(f'{station} transmits Fahrenheit tenths — '
                                    f'this max is exact.')
+
+    with st.expander('Forecast links — The Weather Company', expanded=False):
+        # ⚠️ TWC SETTLES THESE MARKETS, BUT NOT VIA THIS PAGE.
+        # Confirmed 2026-09-14 from a live KXHIGH Rules tab: "according to The
+        # Weather Company. Outcome verified from The Weather Company." What
+        # settles is the RECORDED max for the station. What these links show is
+        # the FORECAST. Same company, different product — and forecasting is
+        # where this project has already found no edge: 205 losing paper bets,
+        # and naked market consensus beat the model 74.3% to 55.2% on 626
+        # city-days.
+        lrows = []
+        for c in sorted(CITY_COORD):
+            lrows.append({
+                'City': c,
+                'Today': twc_url(c, 'today'),
+                'Hourly': twc_url(c, 'hourbyhour'),
+                '10-day': twc_url(c, 'tenday'),
+            })
+        st.dataframe(
+            pd.DataFrame(lrows), use_container_width=True, hide_index=True,
+            column_config={
+                'Today': st.column_config.LinkColumn('Today', display_text='open'),
+                'Hourly': st.column_config.LinkColumn('Hourly', display_text='open'),
+                '10-day': st.column_config.LinkColumn('10-day', display_text='open'),
+            })
+        st.caption(
+            '⚠️ These point at each **settlement station\'s** coordinates, not '
+            'the city centre — Houston is HOBBY and Chicago is MIDWAY, and a '
+            'link to the city would give you Bush and O\'Hare, several degrees '
+            'apart on the same day. weather.com still resolves a lat/lon to '
+            'its nearest forecast point, so treat these as a look at the '
+            'trend, not as the station.\n\n'
+            '⚠️ **Forecast, not settlement.** The Weather Company settles these '
+            'markets on the recorded max, which is a different product from '
+            'the forecast on these pages. TWC\'s forecast has never been '
+            'scored against NWS or GFS in this project — it is not in the '
+            'consensus table.')
 
     with st.expander('All cities — raw obs', expanded=False):
         tbl = []
