@@ -432,16 +432,33 @@ def quantization_band(f):
 def fetch_calibration(days=60):
     """MEASURED (CLI actual − feed max), from this account's own history.
 
+    ⚠️ READS THE `max_vs_settled` VIEW. An earlier version did this join in
+    Python — obs_live keyed on (city, local_date), settlements on (city, date)
+    — and silently matched only 8 of 109 rows. `settlements.date` is TEXT
+    while `obs_live.local_date` is a DATE, so the string keys disagreed on
+    most rows and the board calibrated on eight observations. That produced
+    suspiciously round 50/50 and 62/38 splits, which is what gave it away.
+
+    Postgres casts the two correctly. Do the join there, not here:
+
+        create or replace view public.max_vs_settled as
+        select o.city, o.local_date, o.day_max_f, s.actual,
+               round((s.actual - o.day_max_f)::numeric, 1) as diff
+        from obs_live o
+        join settlements s
+          on s.city = o.city and s.date::date = o.local_date
+        where s.actual is not null and o.day_max_f is not null;
+
     ⚠️ THIS REPLACED A TEXTBOOK ASSUMPTION THAT WAS DEMONSTRABLY WRONG.
-    V6.4's first two cuts modelled the settle distribution as UNIFORM across
-    the 1.8F quantization band. Scored against 2026-09-13's settled column
-    that produced six misses LOW, one high, three exact:
+    V6.4's first cuts modelled the settle distribution as UNIFORM across the
+    1.8F quantization band. Scored against 2026-09-13's settled column that
+    produced six misses LOW, one high, three exact:
 
         Austin 100 -> settled 101      Denver 93 -> settled 94
         Dallas 100 -> settled 101      Miami  91 -> settled 92
         OKC    100 -> settled 101      N.O.   91 -> settled 92
 
-    The measured distribution over 108 city-days explains it. It is NOT
+    The measured distribution over 109 city-days explains it. It is NOT
     symmetric:
 
         left tail stops at -0.8   (pure quantization: a 37C feed max means the
@@ -451,37 +468,27 @@ def fetch_calibration(days=60):
                                    fall between 5-minute samples — nothing
                                    bounds this side)
 
-        mean +0.16, median ~0, and 50 of 108 days came in ABOVE the feed max
+        mean +0.15, median ~0, and 50 of 109 days came in ABOVE the feed max
         against 38 below.
 
-    A uniform band centres the estimate inside the reading. Reality skews it
-    upward. This function measures the skew from the account's own record
-    instead of assuming it, so it re-calibrates as the sample grows — and it
-    automatically absorbs both effects without either being modelled.
+    ⚠️ THE SAMPLE IS CAPPED BY obs_live, NOT settlements. As of 2026-09-13
+    settlements holds 1,094 rows back to 2026-07-16 but obs_live only 140 rows
+    back to 2026-09-07, so the join can never exceed ~140. It grows by 20/day.
+    Do not read a small n here as a bug.
 
-    Returns a list of diffs (floats). Empty list -> callers fall back to the
-    uniform band, which is wrong but better than nothing.
+    Returns a list of diffs (floats). Empty -> callers fall back to the uniform
+    band, which is known to skew LOW.
     """
     cutoff = (datetime.now(ET) - timedelta(days=days)).strftime('%Y-%m-%d')
-    obs = sb_get('obs_live', {'local_date': 'gte.' + cutoff,
-                              'select': 'city,local_date,day_max_f',
-                              'limit': '4000'})
-    setl = sb_get('settlements', {'date': 'gte.' + cutoff,
-                                  'actual': 'not.is.null',
-                                  'select': 'city,date,actual',
-                                  'limit': '4000'})
-    act = {}
-    for s in setl:
-        if s.get('city') and s.get('date') and s.get('actual') is not None:
-            act[(s['city'], str(s['date'])[:10])] = s['actual']
+    rows = sb_get('max_vs_settled', {'local_date': 'gte.' + cutoff,
+                                     'select': 'diff', 'limit': '5000'})
     diffs = []
-    for o in obs:
-        dm = o.get('day_max_f')
-        a = act.get((o.get('city'), str(o.get('local_date'))[:10]))
-        if dm is None or a is None:
+    for r in rows:
+        d = r.get('diff')
+        if d is None:
             continue
         try:
-            diffs.append(round(float(a) - float(dm), 1))
+            diffs.append(float(d))
         except Exception:
             continue
     return diffs
@@ -686,10 +693,19 @@ if not obs_rows:
                'cron-job.org → obs_live.yml.')
 else:
     live_hours = poller_should_be_running()
-    # ⚠️ Measured from this account's own obs_live vs settlements history.
-    # Empty until there is settled data, in which case settle_distribution
-    # falls back to the uniform band — which is known to skew LOW.
+    # ⚠️ Measured from this account's own obs_live vs settlements history, via
+    # the max_vs_settled view. Empty -> settle_distribution falls back to the
+    # uniform band, which is known to skew LOW.
     cal_diffs = fetch_calibration(60)
+    if len(cal_diffs) < 30:
+        st.warning(
+            f'⚠️ **Calibration is running on only {len(cal_diffs)} city-days.** '
+            f'Shares below are coarse and will look suspiciously round '
+            f'(50/50, 62/38) because a small sample can only produce a few '
+            f'distinct values. If this reads under ~20 when it should be over '
+            f'100, check that the `max_vs_settled` view exists — an earlier '
+            f'build did this join in Python and matched 8 of 109 rows because '
+            f'`settlements.date` is TEXT and `obs_live.local_date` is a DATE.')
     board = []
     for r in obs_rows:
         city = r.get('city')
