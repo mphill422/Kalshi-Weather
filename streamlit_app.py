@@ -691,23 +691,45 @@ def settle_text(dist, compact=True):
 
 
 def find_duplicate_cities(rows):
-    """⚠️ Cities whose readings are byte-identical to another city's.
+    """Cities whose rows look like the SAME row written twice, not two cities
+    that merely happen to read alike.
 
-    On 2026-09-09 San Antonio and Los Angeles both showed 81.0 / 80.1 / 17 obs
-    / 11 METARs. The city selector was correct, which means the DATABASE held
-    identical rows. The poller should never write that.
+    ⚠️ THE FIRST VERSION KEYED ON TEMPERATURES AND CRIED WOLF CONSTANTLY.
+    It flagged any two cities sharing (day_max_f, temp_f, n_obs_today,
+    n_metars_today). That fires on coincidence all day, because the feed
+    transmits whole degrees CELSIUS — there are only ~15 possible values across
+    a September afternoon and twenty cities to spread over them. Observed
+    2026-09-14 10:29: New Orleans and Oklahoma City both 84.20/84.20/121/4,
+    flagged as corrupt. On the same screen Minneapolis and San Francisco were
+    both 60.8/57.2, Houston and Miami both 86.0/86.0, Atlanta and Austin both
+    84.2/84.2. All four pairs were real, distinct, correctly-polled cities.
+
+    ⚠️ WHAT THE REAL BUG LOOKED LIKE. On 2026-09-09 San Antonio and Los Angeles
+    showed identical rows because the poller had FROZEN — one write, replayed.
+    The tell was never the temperature. It was that both rows carried the same
+    stale `updated_at` while the clock moved on, and both were hours old.
+
+    So the test is: same values AND the same write timestamp AND that timestamp
+    is already stale. A live run writes every city in the same pass, so a shared
+    fresh timestamp is normal and means nothing.
     """
     sig = {}
     for r in rows:
         key = (r.get('day_max_f'), r.get('temp_f'),
-               r.get('n_obs_today'), r.get('n_metars_today'))
-        if key == (None, None, None, None):
+               r.get('n_obs_today'), r.get('n_metars_today'),
+               str(r.get('updated_at')))
+        if key[:4] == (None, None, None, None):
             continue
-        sig.setdefault(key, []).append(r.get('city'))
+        sig.setdefault(key, []).append(r)
     dupes = set()
-    for _key, cities in sig.items():
-        if len(cities) > 1:
-            dupes.update(c for c in cities if c)
+    for key, group in sig.items():
+        if len(group) < 2:
+            continue
+        # Only suspicious once the shared row has gone stale. Identical values
+        # written in the same LIVE pass are a coincidence, not corruption.
+        age = age_seconds(group[0].get('updated_at'))
+        if age is None or age > STALE_HARD_SEC:
+            dupes.update(r.get('city') for r in group if r.get('city'))
     return dupes
 
 
@@ -788,10 +810,12 @@ favs_all = fetch_favorites()
 
 if dupe_cities:
     st.error(
-        f'⚠️ DUPLICATE ROWS IN obs_live — {len(dupe_cities)} cities are '
-        f'reporting identical readings: {", ".join(sorted(dupe_cities))}. '
-        f'That is a poller fault, not a display fault. Readings for these '
-        f'cities cannot be trusted.')
+        f'⚠️ DUPLICATE ROWS IN obs_live — {len(dupe_cities)} cities share an '
+        f'identical STALE row: {", ".join(sorted(dupe_cities))}. Same values '
+        f'AND the same write timestamp, already past '
+        f'{STALE_HARD_SEC // 60} minutes — the signature of a frozen poller '
+        f'replaying one write, not two cities that happen to read alike. '
+        f'Check GitHub Actions → obs_live.yml.')
 
 
 # ── 0. DECISION BOARD ────────────────────────────────────────────────────────
