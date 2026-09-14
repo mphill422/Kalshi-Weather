@@ -428,43 +428,61 @@ def quantization_band(f):
     return round(lo, 1), round(hi, 1), c_round, True
 
 
-def settle_distribution(feed_max):
+def settle_distribution(feed_max, station=None):
     """Every integer degree this reading could settle at, with its share.
 
     Returns [(degree, share), ...] sorted by share descending, or [].
 
-    ⚠️ THIS IS THE DECISION BOARD'S WHOLE JOB, AND V6.4 GOT IT WRONG AT FIRST.
-    The first version returned only the ENDPOINTS of the band — (lo, hi) — and
-    printed them as "lo or hi". That silently dropped the middle when a band
-    spans THREE integers, which is exactly when it matters most:
+    ⚠️ THIS IS THE DECISION BOARD'S WHOLE JOB, AND V6.4 GOT IT WRONG TWICE.
+
+    MISTAKE 1 — only the endpoints. The first version returned (lo, hi) and
+    printed "lo or hi", silently dropping the middle when a band spans THREE
+    integers, which is exactly when it matters most:
 
         Las Vegas 102.2F = 39.0C, band 101.3-103.1
             101 : 101.3-101.5 -> 0.2 wide -> 11%
-            102 : 101.5-102.5 -> 1.0 wide -> 56%   <- MOST LIKELY
+            102 : 101.5-102.5 -> 1.0 wide -> 56%   <- MOST LIKELY, omitted
             103 : 102.5-103.1 -> 0.6 wide -> 33%
 
-        The board printed "101 or 103" and omitted 102 entirely. Observed
-        2026-09-13; it was also hiding 106 for Phoenix, 93 for Houston and 84
-        for Philadelphia on the same screen.
+    MISTAKE 2 — OFF-GRID TREATED AS PRECISE. This is the identical inversion
+    V6.3 was written to kill, reintroduced in a new section. The board printed
+    "88 (100%) locked" for Washington DC on 2026-09-13. It settled 89.
 
-    A 1.8F band always straddles at least two integers and often three,
-    because 1.8 is wider than the 1.0 width of a rounding interval. The share
-    for degree k is the overlap between the band and [k-0.5, k+0.5).
+        88.0F is NOT on the Celsius grid (31C = 87.8, 32C = 89.6).
 
-    ⚠️ THE SHARES ASSUME THE TRUE VALUE IS UNIFORM INSIDE THE BAND. It is not.
+    V6.3's finding was that real ASOS values land ON the grid, so an off-grid
+    value is a SYMPTOM OF BAD DATA — stale, mixed-source or misparsed — not
+    evidence of precision. Only KBOS and KMSP genuinely transmit tenths.
+    Anywhere else, off-grid earns a WIDER band, not a narrower one.
+
+    ⚠️ AND THE FEED MAX IS A FLOOR EITHER WAY. CLI is built from the station's
+    own max, which catches peaks that fall between 5-minute samples. DC's feed
+    said 88.0 and CLI said 89. Nothing here can be 100%; the true peak is at
+    least this and possibly higher.
+
+    ⚠️ SHARES ASSUME A UNIFORM TRUE VALUE INSIDE THE BAND. It is not uniform.
     If the bracketing hourly METARs sit below the band, the peak most likely
-    clipped its BOTTOM. Read these as a starting point, not a probability —
-    San Antonio 2026-09-09: uniform said 44%, the market said 26%, and the
-    market was closer.
+    clipped its BOTTOM. San Antonio 2026-09-09: uniform said 44%, the market
+    said 26%, and the market was closer.
     """
     if feed_max is None:
         return []
     lo, hi, _c, on_grid = quantization_band(feed_max)
+
     if not on_grid:
         try:
-            return [(int(float(feed_max) + 0.5), 1.0)]
+            v = float(feed_max)
         except Exception:
             return []
+        if (station or '').upper() in NATIVE_TENTHS:
+            # Genuinely precise to a tenth. Still only the sampled max, so it
+            # is a floor — but the reading itself can be trusted.
+            return [(int(v + 0.5), 1.0)]
+        # Off-grid at a station that should be on the grid. Treat the value as
+        # no better than any other 1.8F-wide transmission and centre a band on
+        # it rather than pretending it is exact.
+        lo, hi = v - 0.9, v + 0.9
+
     width = hi - lo
     if width <= 0:
         return [(int(lo + 0.5), 1.0)]
@@ -630,12 +648,19 @@ else:
         trend = r.get('trend_30min')
         lh = local_hour(city)
 
-        dist = settle_distribution(fmax)
+        dist = settle_distribution(fmax, r.get('station'))
         straddles = len(dist) > 1
         # ⚠️ "Close" means the top outcome does not dominate. A band whose
         # most likely integer holds 56% is a coin flip with a lean; one that
         # holds 90% is effectively decided even though it technically straddles.
         top_share = dist[0][1] if dist else 0.0
+
+        # ⚠️ OFF-GRID AT A STATION THAT SHOULD BE ON IT IS A DATA SMELL.
+        # Flagged so a suspect reading is visible rather than silently
+        # widening the band. DC read 88.0 on 2026-09-13 and settled 89.
+        _lo, _hi, _cc, _og = quantization_band(fmax) if fmax is not None else (0, 0, None, False)
+        off_grid_suspect = (fmax is not None and not _og
+                            and (r.get('station') or '').upper() not in NATIVE_TENTHS)
 
         # ⚠️ PEAK STATUS IS A HEURISTIC, NOT A MEASUREMENT. It reads the local
         # clock and the 30-minute trend. A flat trend does NOT mean flat
@@ -662,11 +687,22 @@ else:
             likely, alts, closeness = '—', '—', ''
         else:
             likely = f'{dist[0][0]}  ({dist[0][1]*100:.0f}%)'
-            alts = (' · '.join(f'{d}={s*100:.0f}%' for d, s in dist[1:])
-                    if len(dist) > 1 else 'locked')
+            # ⚠️ NEVER SAY "LOCKED". The feed max is the max of what was
+            # SAMPLED; CLI is built from the station's own max and can come in
+            # higher. DC: feed 88.0, CLI 89.
+            if len(dist) > 1:
+                alts = ' · '.join(f'{d}={s*100:.0f}%' for d, s in dist[1:])
+            elif off_grid_suspect:
+                alts = '⚠️ off-grid'
+            else:
+                alts = 'or higher'
             # Closeness flag: how much room the runner-up has. Suppressed once
             # the day is closed — nothing is undecided about a finished day.
-            if closed or len(dist) == 1:
+            if closed:
+                closeness = ''
+            elif off_grid_suspect:
+                closeness = '⚠️ suspect'
+            elif len(dist) == 1:
                 closeness = ''
             elif dist[0][1] < 0.45:
                 closeness = '🔴 wide open'
@@ -733,6 +769,17 @@ else:
         'wider than a 1.0°F rounding interval, so it always covers at least '
         'two integers and often THREE: Las Vegas at 102.2°F is 39.0°C, band '
         '101.3–103.1, which settles 101 (11%), **102 (56%)** or 103 (33%).\n\n'
+        '⚠️ **The feed max is a FLOOR, never a ceiling.** It is the max of what '
+        'was SAMPLED every five minutes; CLI is built from the station\'s own '
+        'max and catches peaks that fall between samples. Washington DC read '
+        '88.0 on 2026-09-13 and settled **89**. Nothing on this board is ever '
+        '100% — "or higher" means exactly that.\n\n'
+        '⚠️ **off-grid / suspect** means the reading does not sit on the '
+        'station\'s Celsius transmission grid, at a station that is not KBOS '
+        'or KMSP. Real ASOS values land ON the grid, so off-grid is a sign of '
+        'stale, mixed or misparsed data — it earns a WIDER band, not a '
+        'narrower one. Treating off-grid as precise is what printed "88 '
+        '(100%) locked" for DC the day it settled 89.\n\n'
         '⚠️ Shares assume the true value is spread evenly across the band. It '
         'is not. If the hourly METARs either side sit below the band, the peak '
         'most likely clipped its BOTTOM and the low end is underweighted here. '
@@ -857,8 +904,8 @@ if obs_rows:
         # ⚠️ V6.4: STEPS, NOT DEGREES. "2.9F to go" is not actionable, because
         # the station cannot transmit 2.9F of change — it moves in 1.8F jumps.
         if not untrustworthy and nxt is not None and feed_max is not None:
-            cur_d = settle_distribution(feed_max)
-            nxt_d = settle_distribution(nxt)
+            cur_d = settle_distribution(feed_max, station)
+            nxt_d = settle_distribution(nxt, station)
             st.caption(
                 f'Feed steps 1.8°F — nothing exists between **{feed_max:.1f}** '
                 f'and **{nxt:.1f}**.\n\n'
