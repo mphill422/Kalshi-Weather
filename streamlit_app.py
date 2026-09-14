@@ -410,24 +410,70 @@ def quantization_band(f):
     return round(lo, 1), round(hi, 1), c_round, True
 
 
-def settle_span(feed_max):
-    """The integer degrees this reading could settle at. Returns (lo, hi).
+def settle_distribution(feed_max):
+    """Every integer degree this reading could settle at, with its share.
 
-    ⚠️ THIS IS THE DECISION BOARD'S WHOLE JOB. CLI rounds to a whole degree, so
-    what matters is not the reading but which INTEGERS its band can round to.
-    98.6F is 37C, band 97.7-99.5, which rounds to 98 OR 99 — two brackets, and
-    the station cannot say which. 93.9F is off-grid and rounds to 94 only.
+    Returns [(degree, share), ...] sorted by share descending, or [].
+
+    ⚠️ THIS IS THE DECISION BOARD'S WHOLE JOB, AND V6.4 GOT IT WRONG AT FIRST.
+    The first version returned only the ENDPOINTS of the band — (lo, hi) — and
+    printed them as "lo or hi". That silently dropped the middle when a band
+    spans THREE integers, which is exactly when it matters most:
+
+        Las Vegas 102.2F = 39.0C, band 101.3-103.1
+            101 : 101.3-101.5 -> 0.2 wide -> 11%
+            102 : 101.5-102.5 -> 1.0 wide -> 56%   <- MOST LIKELY
+            103 : 102.5-103.1 -> 0.6 wide -> 33%
+
+        The board printed "101 or 103" and omitted 102 entirely. Observed
+        2026-09-13; it was also hiding 106 for Phoenix, 93 for Houston and 84
+        for Philadelphia on the same screen.
+
+    A 1.8F band always straddles at least two integers and often three,
+    because 1.8 is wider than the 1.0 width of a rounding interval. The share
+    for degree k is the overlap between the band and [k-0.5, k+0.5).
+
+    ⚠️ THE SHARES ASSUME THE TRUE VALUE IS UNIFORM INSIDE THE BAND. It is not.
+    If the bracketing hourly METARs sit below the band, the peak most likely
+    clipped its BOTTOM. Read these as a starting point, not a probability —
+    San Antonio 2026-09-09: uniform said 44%, the market said 26%, and the
+    market was closer.
     """
     if feed_max is None:
-        return None, None
+        return []
     lo, hi, _c, on_grid = quantization_band(feed_max)
     if not on_grid:
         try:
-            v = int(float(feed_max) + 0.5)
+            return [(int(float(feed_max) + 0.5), 1.0)]
         except Exception:
-            return None, None
-        return v, v
-    return int(lo + 0.5), int(hi + 0.5 - 1e-9)
+            return []
+    width = hi - lo
+    if width <= 0:
+        return [(int(lo + 0.5), 1.0)]
+    out = []
+    k = int(lo + 0.5)
+    k_hi = int(hi + 0.5 - 1e-9)
+    while k <= k_hi:
+        # rounding interval for integer k is [k-0.5, k+0.5)
+        overlap = min(hi, k + 0.5) - max(lo, k - 0.5)
+        if overlap > 1e-9:
+            out.append((k, overlap / width))
+        k += 1
+    out.sort(key=lambda x: (-x[1], x[0]))
+    return out
+
+
+def settle_text(dist, compact=True):
+    """Render a settle distribution. Most likely first, share in parentheses."""
+    if not dist:
+        return '—'
+    if len(dist) == 1:
+        return f'{dist[0][0]}'
+    if compact:
+        head = f'{dist[0][0]} ({dist[0][1]*100:.0f}%)'
+        rest = ' · '.join(f'{d}={s*100:.0f}%' for d, s in dist[1:])
+        return f'{head} · {rest}'
+    return ' · '.join(f'{d}={s*100:.0f}%' for d, s in dist)
 
 
 def find_duplicate_cities(rows):
@@ -552,8 +598,12 @@ else:
         trend = r.get('trend_30min')
         lh = local_hour(city)
 
-        s_lo, s_hi = settle_span(fmax)
-        straddles = (s_lo is not None and s_hi is not None and s_hi > s_lo)
+        dist = settle_distribution(fmax)
+        straddles = len(dist) > 1
+        # ⚠️ "Close" means the top outcome does not dominate. A band whose
+        # most likely integer holds 56% is a coin flip with a lean; one that
+        # holds 90% is effectively decided even though it technically straddles.
+        top_share = dist[0][1] if dist else 0.0
 
         # ⚠️ PEAK STATUS IS A HEURISTIC, NOT A MEASUREMENT. It reads the local
         # clock and the 30-minute trend. A flat trend does NOT mean flat
@@ -574,16 +624,34 @@ else:
         else:
             peak = '🔺 mid-day'
 
+        if dead or not dist:
+            likely, alts, closeness = '—', '—', ''
+        else:
+            likely = f'{dist[0][0]}  ({dist[0][1]*100:.0f}%)'
+            alts = (' · '.join(f'{d}={s*100:.0f}%' for d, s in dist[1:])
+                    if len(dist) > 1 else 'locked')
+            # Closeness flag: how much room the runner-up has.
+            if len(dist) == 1:
+                closeness = ''
+            elif dist[0][1] < 0.45:
+                closeness = '🔴 wide open'
+            elif dist[0][1] < 0.62:
+                closeness = '🟠 close'
+            else:
+                closeness = '🟡 leaning'
+
         board.append({
-            '_sort': (0 if (straddles and not dead) else 1,
-                      0 if not dead else 1,
+            # Sort: live rows first, then by how UNDECIDED they are — a band
+            # whose top outcome holds only 40% is more interesting than one
+            # holding 85%, even though both technically straddle.
+            '_sort': (1 if dead else 0, top_share if not dead else 9,
                       -(fmax or 0)),
             'City': city,
             'Local': f'{lh:02d}:00' if lh is not None else '—',
             'Day Max': '⛔' if dead else (f'{fmax:.1f}' if fmax is not None else '—'),
-            'Settles': ('—' if dead or s_lo is None else
-                        (f'{s_lo} or {s_hi}' if straddles else f'{s_lo}')),
-            'Undecided': '🔴 YES' if (straddles and not dead) else '',
+            'Most likely': likely,
+            'Also possible': alts,
+            'How close': closeness,
             'Trend 30m': '—' if dead or trend is None else f'{trend:+.1f}',
             'Peak': peak,
             'Age': fmt_age(ra),
@@ -592,15 +660,24 @@ else:
     for b in board:
         b.pop('_sort', None)
     st.dataframe(pd.DataFrame(board), use_container_width=True, hide_index=True)
-    n_undec = sum(1 for b in board if b['Undecided'])
+    n_undec = sum(1 for b in board if b['How close'])
     st.caption(
-        f'**{n_undec} of {len(board)} cities are undecided right now.** '
-        '"Settles" is which whole degree the reading can round to. When the '
-        'quantization band straddles two integers the station CANNOT tell you '
-        'which bracket wins: 98.6°F is 37°C, band 97.7–99.5, so it settles 98 '
-        'or 99 and both are live. ⚠️ Peak status reads the local clock and the '
-        '30-minute trend — a +0.0 trend is normal between 1.8°F steps and does '
-        'NOT mean the temperature is flat.')
+        f'**{n_undec} of {len(board)} cities are still undecided.** Sorted by '
+        'how close, not alphabetically — the top row is the one the station '
+        'can tell you least about.\n\n'
+        '**Most likely** is the whole degree the reading is most likely to '
+        'settle at, with its share of the quantization band. A 1.8°F band is '
+        'wider than a 1.0°F rounding interval, so it always covers at least '
+        'two integers and often THREE: Las Vegas at 102.2°F is 39.0°C, band '
+        '101.3–103.1, which settles 101 (11%), **102 (56%)** or 103 (33%).\n\n'
+        '⚠️ Shares assume the true value is spread evenly across the band. It '
+        'is not. If the hourly METARs either side sit below the band, the peak '
+        'most likely clipped its BOTTOM and the low end is underweighted here. '
+        'San Antonio 2026-09-09: uniform said 44%, the market said 26%, and '
+        'the market was closer.\n\n'
+        '⚠️ Peak status reads the local clock and the 30-minute trend. A +0.0 '
+        'trend is normal between 1.8°F steps and does NOT mean the temperature '
+        'is flat.')
 
 
 # ── 1. LIVE OBS ──────────────────────────────────────────────────────────────
@@ -717,11 +794,13 @@ if obs_rows:
         # ⚠️ V6.4: STEPS, NOT DEGREES. "2.9F to go" is not actionable, because
         # the station cannot transmit 2.9F of change — it moves in 1.8F jumps.
         if not untrustworthy and nxt is not None and feed_max is not None:
-            nxt_lo, nxt_hi = settle_span(nxt)
-            nxt_txt = (f'{nxt_lo}' if nxt_hi == nxt_lo else f'{nxt_lo} or {nxt_hi}')
+            cur_d = settle_distribution(feed_max)
+            nxt_d = settle_distribution(nxt)
             st.caption(
-                f'Feed steps 1.8°F. Nothing exists between **{feed_max:.1f}** '
-                f'and **{nxt:.1f}**. One more step settles **{nxt_txt}**.')
+                f'Feed steps 1.8°F — nothing exists between **{feed_max:.1f}** '
+                f'and **{nxt:.1f}**.\n\n'
+                f'· As it stands: {settle_text(cur_d)}\n\n'
+                f'· One more step: {settle_text(nxt_d)}')
 
         # ── BRACKET CHECK ───────────────────────────────────────────────
         st.markdown('<div class="sub">Bracket check — enter the ceiling you '
