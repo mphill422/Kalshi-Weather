@@ -428,61 +428,122 @@ def quantization_band(f):
     return round(lo, 1), round(hi, 1), c_round, True
 
 
-def settle_distribution(feed_max, station=None):
+@st.cache_data(ttl=900)
+def fetch_calibration(days=60):
+    """MEASURED (CLI actual − feed max), from this account's own history.
+
+    ⚠️ THIS REPLACED A TEXTBOOK ASSUMPTION THAT WAS DEMONSTRABLY WRONG.
+    V6.4's first two cuts modelled the settle distribution as UNIFORM across
+    the 1.8F quantization band. Scored against 2026-09-13's settled column
+    that produced six misses LOW, one high, three exact:
+
+        Austin 100 -> settled 101      Denver 93 -> settled 94
+        Dallas 100 -> settled 101      Miami  91 -> settled 92
+        OKC    100 -> settled 101      N.O.   91 -> settled 92
+
+    The measured distribution over 108 city-days explains it. It is NOT
+    symmetric:
+
+        left tail stops at -0.8   (pure quantization: a 37C feed max means the
+                                   true value can sit 0.9F below the reading)
+        right tail runs to +1.9   (the FLOOR effect: CLI is built from the
+                                   station's own max and catches peaks that
+                                   fall between 5-minute samples — nothing
+                                   bounds this side)
+
+        mean +0.16, median ~0, and 50 of 108 days came in ABOVE the feed max
+        against 38 below.
+
+    A uniform band centres the estimate inside the reading. Reality skews it
+    upward. This function measures the skew from the account's own record
+    instead of assuming it, so it re-calibrates as the sample grows — and it
+    automatically absorbs both effects without either being modelled.
+
+    Returns a list of diffs (floats). Empty list -> callers fall back to the
+    uniform band, which is wrong but better than nothing.
+    """
+    cutoff = (datetime.now(ET) - timedelta(days=days)).strftime('%Y-%m-%d')
+    obs = sb_get('obs_live', {'local_date': 'gte.' + cutoff,
+                              'select': 'city,local_date,day_max_f',
+                              'limit': '4000'})
+    setl = sb_get('settlements', {'date': 'gte.' + cutoff,
+                                  'actual': 'not.is.null',
+                                  'select': 'city,date,actual',
+                                  'limit': '4000'})
+    act = {}
+    for s in setl:
+        if s.get('city') and s.get('date') and s.get('actual') is not None:
+            act[(s['city'], str(s['date'])[:10])] = s['actual']
+    diffs = []
+    for o in obs:
+        dm = o.get('day_max_f')
+        a = act.get((o.get('city'), str(o.get('local_date'))[:10]))
+        if dm is None or a is None:
+            continue
+        try:
+            diffs.append(round(float(a) - float(dm), 1))
+        except Exception:
+            continue
+    return diffs
+
+
+def settle_distribution(feed_max, station=None, diffs=None):
     """Every integer degree this reading could settle at, with its share.
 
     Returns [(degree, share), ...] sorted by share descending, or [].
 
-    ⚠️ THIS IS THE DECISION BOARD'S WHOLE JOB, AND V6.4 GOT IT WRONG TWICE.
+    ⚠️ V6.4 GOT THIS WRONG THREE TIMES. Each fix is worth keeping written down
+    because each mistake looked reasonable.
 
-    MISTAKE 1 — only the endpoints. The first version returned (lo, hi) and
-    printed "lo or hi", silently dropping the middle when a band spans THREE
-    integers, which is exactly when it matters most:
+    MISTAKE 1 — only the endpoints. Returned (lo, hi) and printed "lo or hi",
+    silently dropping the middle when a band spans THREE integers:
 
         Las Vegas 102.2F = 39.0C, band 101.3-103.1
-            101 : 101.3-101.5 -> 0.2 wide -> 11%
-            102 : 101.5-102.5 -> 1.0 wide -> 56%   <- MOST LIKELY, omitted
-            103 : 102.5-103.1 -> 0.6 wide -> 33%
+            101 : 11%      102 : 56%  <- omitted      103 : 33%
 
-    MISTAKE 2 — OFF-GRID TREATED AS PRECISE. This is the identical inversion
-    V6.3 was written to kill, reintroduced in a new section. The board printed
-    "88 (100%) locked" for Washington DC on 2026-09-13. It settled 89.
+    MISTAKE 2 — OFF-GRID TREATED AS PRECISE. The identical inversion V6.3 was
+    written to kill. The board printed "88 (100%) locked" for Washington DC on
+    2026-09-13; it settled 89. 88.0F is NOT on the Celsius grid (31C = 87.8,
+    32C = 89.6), and V6.3's finding is that real ASOS values land ON the grid,
+    so off-grid means stale or misparsed — a WIDER band, not a narrower one.
+    Only KBOS and KMSP genuinely transmit tenths.
 
-        88.0F is NOT on the Celsius grid (31C = 87.8, 32C = 89.6).
+    MISTAKE 3 — ASSUMING THE BAND IS UNIFORM. It is not, and the error has a
+    direction: six of ten cities settled ABOVE the board's estimate on
+    2026-09-13. See fetch_calibration() for the measured distribution.
 
-    V6.3's finding was that real ASOS values land ON the grid, so an off-grid
-    value is a SYMPTOM OF BAD DATA — stale, mixed-source or misparsed — not
-    evidence of precision. Only KBOS and KMSP genuinely transmit tenths.
-    Anywhere else, off-grid earns a WIDER band, not a narrower one.
-
-    ⚠️ AND THE FEED MAX IS A FLOOR EITHER WAY. CLI is built from the station's
-    own max, which catches peaks that fall between 5-minute samples. DC's feed
-    said 88.0 and CLI said 89. Nothing here can be 100%; the true peak is at
-    least this and possibly higher.
-
-    ⚠️ SHARES ASSUME A UNIFORM TRUE VALUE INSIDE THE BAND. It is not uniform.
-    If the bracketing hourly METARs sit below the band, the peak most likely
-    clipped its BOTTOM. San Antonio 2026-09-09: uniform said 44%, the market
-    said 26%, and the market was closer.
+    When `diffs` is supplied, the distribution is built by applying every
+    historically observed (actual − feed max) to this reading and tallying
+    where it rounds. That absorbs quantization AND the floor effect at once,
+    measured rather than assumed.
     """
     if feed_max is None:
         return []
-    lo, hi, _c, on_grid = quantization_band(feed_max)
+    try:
+        fv = float(feed_max)
+    except Exception:
+        return []
 
+    # ── Preferred path: the account's own measured error distribution ──
+    if diffs:
+        tally = {}
+        for d in diffs:
+            k = int(fv + d + 0.5)
+            tally[k] = tally.get(k, 0) + 1
+        tot = sum(tally.values())
+        out = [(k, c / tot) for k, c in tally.items() if c / tot >= 0.01]
+        rescale = sum(s for _, s in out)
+        out = [(k, s / rescale) for k, s in out]
+        out.sort(key=lambda x: (-x[1], x[0]))
+        return out
+
+    # ── Fallback: uniform across the quantization band ──
+    # ⚠️ Known to skew LOW. Used only before any settled history exists.
+    lo, hi, _c, on_grid = quantization_band(fv)
     if not on_grid:
-        try:
-            v = float(feed_max)
-        except Exception:
-            return []
         if (station or '').upper() in NATIVE_TENTHS:
-            # Genuinely precise to a tenth. Still only the sampled max, so it
-            # is a floor — but the reading itself can be trusted.
-            return [(int(v + 0.5), 1.0)]
-        # Off-grid at a station that should be on the grid. Treat the value as
-        # no better than any other 1.8F-wide transmission and centre a band on
-        # it rather than pretending it is exact.
-        lo, hi = v - 0.9, v + 0.9
-
+            return [(int(fv + 0.5), 1.0)]
+        lo, hi = fv - 0.9, fv + 0.9
     width = hi - lo
     if width <= 0:
         return [(int(lo + 0.5), 1.0)]
@@ -490,7 +551,6 @@ def settle_distribution(feed_max, station=None):
     k = int(lo + 0.5)
     k_hi = int(hi + 0.5 - 1e-9)
     while k <= k_hi:
-        # rounding interval for integer k is [k-0.5, k+0.5)
         overlap = min(hi, k + 0.5) - max(lo, k - 0.5)
         if overlap > 1e-9:
             out.append((k, overlap / width))
@@ -626,6 +686,10 @@ if not obs_rows:
                'cron-job.org → obs_live.yml.')
 else:
     live_hours = poller_should_be_running()
+    # ⚠️ Measured from this account's own obs_live vs settlements history.
+    # Empty until there is settled data, in which case settle_distribution
+    # falls back to the uniform band — which is known to skew LOW.
+    cal_diffs = fetch_calibration(60)
     board = []
     for r in obs_rows:
         city = r.get('city')
@@ -648,7 +712,7 @@ else:
         trend = r.get('trend_30min')
         lh = local_hour(city)
 
-        dist = settle_distribution(fmax, r.get('station'))
+        dist = settle_distribution(fmax, r.get('station'), cal_diffs)
         straddles = len(dist) > 1
         # ⚠️ "Close" means the top outcome does not dominate. A band whose
         # most likely integer holds 56% is a coin flip with a lean; one that
@@ -658,7 +722,10 @@ else:
         # ⚠️ OFF-GRID AT A STATION THAT SHOULD BE ON IT IS A DATA SMELL.
         # Flagged so a suspect reading is visible rather than silently
         # widening the band. DC read 88.0 on 2026-09-13 and settled 89.
-        _lo, _hi, _cc, _og = quantization_band(fmax) if fmax is not None else (0, 0, None, False)
+        # Off-grid is still worth surfacing as a data smell even when the
+        # empirical model is in use — it flags a reading that should not exist.
+        _lo, _hi, _cc, _og = (quantization_band(fmax) if fmax is not None
+                              else (0, 0, None, False))
         off_grid_suspect = (fmax is not None and not _og
                             and (r.get('station') or '').upper() not in NATIVE_TENTHS)
 
@@ -765,21 +832,27 @@ else:
         + ' Sorted by how close, not alphabetically — the top row is the one '
           'the station can tell you least about.\n\n'
         '**Most likely** is the whole degree the reading is most likely to '
-        'settle at, with its share of the quantization band. A 1.8°F band is '
-        'wider than a 1.0°F rounding interval, so it always covers at least '
-        'two integers and often THREE: Las Vegas at 102.2°F is 39.0°C, band '
-        '101.3–103.1, which settles 101 (11%), **102 (56%)** or 103 (33%).\n\n'
-        '⚠️ **The feed max is a FLOOR, never a ceiling.** It is the max of what '
-        'was SAMPLED every five minutes; CLI is built from the station\'s own '
-        'max and catches peaks that fall between samples. Washington DC read '
-        '88.0 on 2026-09-13 and settled **89**. Nothing on this board is ever '
-        '100% — "or higher" means exactly that.\n\n'
+        'settle at. Shares come from **this account\'s own measured error** — '
+        f'every (CLI actual − feed max) over the last 60 days ({len(cal_diffs)} '
+        'city-days) applied to today\'s reading, not from a textbook '
+        'assumption.\n\n'
+        '⚠️ **The error is not symmetric, and that matters.** Measured over 108 '
+        'city-days the left tail stops at −0.8°F while the right runs to '
+        '+1.9°F, and 50 days came in ABOVE the feed max against 38 below. Two '
+        'effects stacked: quantization can put the true value up to 0.9°F '
+        'BELOW a reading, while CLI is built from the station\'s own max and '
+        'catches peaks that fall between 5-minute samples — nothing bounds '
+        'that side.\n\n'
+        '⚠️ An earlier version assumed a uniform band and was wrong in a '
+        'direction: on 2026-09-13 it missed LOW on six of ten cities (Austin, '
+        'Dallas, OKC, Denver, Miami, New Orleans all settled one degree above '
+        'its estimate). The empirical model absorbs that skew instead of '
+        'modelling it.\n\n'
         '⚠️ **off-grid / suspect** means the reading does not sit on the '
         'station\'s Celsius transmission grid, at a station that is not KBOS '
         'or KMSP. Real ASOS values land ON the grid, so off-grid is a sign of '
-        'stale, mixed or misparsed data — it earns a WIDER band, not a '
-        'narrower one. Treating off-grid as precise is what printed "88 '
-        '(100%) locked" for DC the day it settled 89.\n\n'
+        'stale, mixed or misparsed data. Treating off-grid as precise is what '
+        'printed "88 (100%) locked" for DC the day it settled 89.\n\n'
         '⚠️ Shares assume the true value is spread evenly across the band. It '
         'is not. If the hourly METARs either side sit below the band, the peak '
         'most likely clipped its BOTTOM and the low end is underweighted here. '
@@ -904,8 +977,8 @@ if obs_rows:
         # ⚠️ V6.4: STEPS, NOT DEGREES. "2.9F to go" is not actionable, because
         # the station cannot transmit 2.9F of change — it moves in 1.8F jumps.
         if not untrustworthy and nxt is not None and feed_max is not None:
-            cur_d = settle_distribution(feed_max, station)
-            nxt_d = settle_distribution(nxt, station)
+            cur_d = settle_distribution(feed_max, station, fetch_calibration(60))
+            nxt_d = settle_distribution(nxt, station, fetch_calibration(60))
             st.caption(
                 f'Feed steps 1.8°F — nothing exists between **{feed_max:.1f}** '
                 f'and **{nxt:.1f}**.\n\n'
