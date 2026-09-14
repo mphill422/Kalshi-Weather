@@ -1,109 +1,138 @@
 """
-app.py — MPH Weather, V6.3
+app.py — MPH Weather, V6.4
 
-V6.3 — THE GREEN BOX THAT LIED (2026-09-09 night)
-==================================================
-At 5:19pm ET the panel showed San Antonio:
+V6.4 — FROM LOOKUP TOOL TO DECISION TOOL (2026-09-13)
+======================================================
+V6.3 was accurate and nearly useless. It answered "what has this station done
+today?" for one city at a time — and by the time you read it, the market had
+already priced the same observation. Reviewing four days of actual use, the app
+got opened at one recurring moment: a bracket boundary was live and the question
+was whether the peak was in.
 
-    DAY MAX — 5-MIN FEED   81.0°F
-    17 obs today · obs 24m ago
+Everything V6.4 adds serves that moment, or removes work being done by hand.
 
-in a green box. The station had actually reached the 98.6F step at ~4pm local.
-The row on screen had been written at about 13:24Z — 8:24am local — and had not
-moved in nine hours. At 8:39pm the SAME numbers (81.0 / 80.1 / 17 obs / 11
-METARs) appeared under **Los Angeles**.
+1. DECISION BOARD — all 20 cities at once, ranked by undecidedness.
+   The old flow was: pick a city from a dropdown, read one number, repeat
+   twenty times. The board computes, for every city, whether the quantization
+   band STRADDLES a settlement boundary — whether today's number is still
+   genuinely undecided — and sorts those to the top.
 
-Two separate defects produced that, and V6.2 had no defence against either.
+   ⚠️ STRADDLE IS THE WHOLE POINT. A feed max of 98.6F is 37C exactly, so the
+   true peak is 97.7-99.5F. That spans 98 AND 99: two different brackets, and
+   the station cannot tell you which. A max of 93.9 sits inside one integer and
+   is not straddling anything. The board makes that distinction visible without
+   twenty clicks.
+
+2. MARKET TIMELINE — what the favorite did, hour by hour.
+   favorites_snapshots has collected since 2026-09-11 at 11:00, 12:00, 13:00,
+   14:00, 15:00 and 17:00, plus the three bet windows. That data produced the
+   most interesting result in a fortnight and it took hand-written SQL to see.
+   Now it is a table: bracket and ask at each hour, with the row marked where
+   the favorite CHANGED.
+
+   Observed 2026-09-12, which is why this exists: San Antonio flipped from
+   101-102 to 99-100 between 11:00 and 13:00 and then sat at 63c for three
+   straight hours. Atlanta flipped at 14:00 and was still 56c. Miami flipped at
+   14:00 and was ALREADY 84c. Same event, completely different tradeability,
+   invisible without the timeline.
+
+3. DAILY SCORECARD — replaces counting wins by hand off a photograph.
+   The paper Daily Capture Grid was being photographed each night and scored by
+   eye. That produced at least two errors, both the same mistake:
+
+   ⚠️ TAIL BRACKETS ARE NOT RANGES. `bracket_lo`/`bracket_hi` are null on one
+   side for "X or below" and "X or above". Read off a photo, "63↓" looks like a
+   63-64 RANGE and gets scored backwards — that turned a Seattle WIN into a
+   loss on 2026-09-13 (settled 60, bracket was 63-or-below) and did the same to
+   New Orleans on 2026-09-11. score_bracket() handles all three shapes
+   explicitly and falls back to parsing the label when the bound columns are
+   null, which they are on every row written before 2026-09-08.
+
+4. KILL-LINE STATUS — the number that actually governs what happens next.
+   Each window against its OWN break-even at n=50. This lived in an occasional
+   query while morning sat near the line for a week.
+
+⚠️ WHAT V6.4 DELIBERATELY DOES NOT DO. No recommendation, no edge score, no
+"BET THIS" panel, no probability of any kind. The 3,356-line version that did
+all of that produced 205 losing paper bets across four tags, and naked
+consensus beat its own bracket picks by 19 points on 626 city-days. Every
+filter tested since has failed: per-city four separate times, bracket-change
+under price control, price bands on the daily split, dominance for lack of any
+variation to test. This file shows what is true. It does not say what to do.
+
+--- V6.3 documentation below, unchanged and still true ---
+
+THE GREEN BOX THAT LIED (2026-09-09 night)
+At 5:19pm ET the panel showed San Antonio 81.0F in a green box. The station had
+reached the 98.6F step at ~4pm local. The row had been written at about 13:24Z
+— 8:24am local — and had not moved in nine hours. At 8:39pm the SAME numbers
+(81.0 / 80.1 / 17 obs / 11 METARs) appeared under Los Angeles.
 
 1. NOTHING IN THIS FILE MEASURED FRESHNESS.
-   `feed_age = row.get('obs_age_min')` is stamped by the poller at WRITE time.
-   A row written at 13:24Z saying "obs_age_min: 4.2" still says 4.2 at 22:00Z.
-   The header clock, meanwhile, renders `datetime.now(ET)` — so the page showed
-   8:39pm above a reading from breakfast and called it live.
+   `obs_age_min` is stamped by the poller at WRITE time. A row written at
+   13:24Z saying "obs_age_min: 4.2" still says 4.2 at 22:00Z. The header clock
+   meanwhile rendered datetime.now(ET), so the page showed 8:39pm above a
+   reading from breakfast and called it live.
 
    ⚠️ THE .hero CLASS HARDCODED `border:2px solid #00ff88`. There was no code
    path in V6.2 that could produce a non-green headline. The box was green
    because it is always green, not because the data was good.
 
    V6.3 computes age from `updated_at` against now, EVERY RENDER. Past
-   STALE_HARD_SEC the headline number is replaced by the word STALE. It is not
+   STALE_HARD_SEC the headline number is REPLACED by the word STALE. Not
    dimmed, not caveated — replaced. A number you cannot trust is worse than no
    number, because you will act on it.
 
 2. THE OFF-GRID TEST WAS BACKWARDS — and it is why a corrupt value produced
-   the app's MOST confident output.
-   V6.2 said: on the Celsius grid -> quantized, show a 1.8F window. Off the
-   grid -> `st.caption('This station reports native Fahrenheit tenths — the max
-   is exact, no quantization window.')`
+   the app's MOST confident output. V6.2 said: on the grid -> quantized, show a
+   window; off the grid -> "native Fahrenheit tenths, the max is exact".
 
    Real ASOS values land ON the grid. 81.0F is not on it (27C = 80.6). So a
    stale, duplicated or corrupt value is EXACTLY the kind that reads as
    off-grid — and V6.2 responded by dropping its error bars and printing a flat
    red BROKEN. Off-grid is a symptom of bad data, not evidence of precision.
+   Only KBOS and KMSP genuinely transmit tenths.
 
-   V6.3 treats off-grid as SUSPICIOUS unless the station is on the known
-   native-tenths list (Boston, Minneapolis). Otherwise it warns and withholds
-   the verdict.
+3. DUPLICATE-ROW DETECTOR. The city selector was correct — it filters on city —
+   so identical numbers under two cities means the DATABASE holds identical
+   rows. This file cannot fix the poller but it refuses to pretend.
 
-3. NEW: DUPLICATE-ROW DETECTOR.
-   The city selector in V6.2 is correct — it filters `r['city'] == sel`. So
-   identical numbers under two different cities means the DATABASE holds
-   identical rows, which the poller should never write. This file cannot fix
-   the poller, but it can refuse to pretend. If two or more cities share the
-   same day_max_f AND n_obs_today AND n_metars_today, every affected row is
-   flagged and the bracket check is disabled for all of them.
+4. TIMEZONE BUG IN THE DATE FILTER. `local_date = eq. today_et()` filtered
+   every city by the EASTERN date while the poller writes each row under the
+   STATION's local date. Between 9pm ET and midnight PT the Pacific cities
+   silently disappeared.
 
-4. TIMEZONE BUG IN THE DATE FILTER.
-   `local_date = eq. today_et()` filtered every city by the EASTERN date. The
-   poller writes each row under the STATION's local date. Between 9pm ET and
-   midnight PT the Pacific cities' rows silently disappear from the dashboard.
-   V6.3 queries today AND yesterday and keeps the newest row per city.
-
---- V6.2 documentation below, unchanged and still true ---
-
-THE QUANTIZATION BUG
+THE QUANTIZATION BUG (V6.2)
 V6.1 shipped a bracket check that read a feed value as a measurement. On
-Atlanta it said "BROKEN — max 89.6 is already above 89." That was false. 89.6F
-is EXACTLY 32C. The station transmits whole degrees Celsius between hourly
-METARs, so "89.6" means "somewhere that rounds to 32C", which is 88.7F to
-90.5F. Roughly 44% of that window settles 89, 56% settles 90. The Kalshi ladder
-at that moment: 88-89 at 51%, 90-91 at 49%. The market had it right and the app
+Atlanta it said "BROKEN — max 89.6 is already above 89." False. 89.6F is
+EXACTLY 32C, so the true peak was anywhere in 88.7-90.5F. The Kalshi ladder at
+that moment: 88-89 at 51%, 90-91 at 49%. The market had it right and the app
 was calling a coin flip a certainty.
 
 ⚠️ EVERY VALUE THAT LOOKED PRECISE WAS ON THE GRID.
     95.0 = 35C    96.8 = 36C    98.6 = 37C
     73.4 = 23C    75.2 = 24C    89.6 = 32C
 
-So the bracket check returns one of three answers:
-    BROKEN     — even the LOW end of the window settles above your ceiling
-    SAFE       — even the HIGH end settles at or below it
-    UNRESOLVED — the window straddles the boundary, with the share of it that
-                 settles at or below your ceiling
-
 ⚠️ THE UNRESOLVED SHARE ASSUMES A UNIFORM DISTRIBUTION INSIDE THE BAND.
 It is not uniform. If the bracketing hourly METARs both sit below the band, the
-true peak almost certainly clipped the BOTTOM of it rather than running to the
-top, and the uniform figure overstates the upside. Read the share as an upper
-bound on the bad outcome, not a probability. Observed live on San Antonio
-2026-09-09: this panel said 44%, the market said 26%.
+peak almost certainly clipped the BOTTOM of it rather than running to the top.
+Read the share as an upper bound on the bad outcome, not a probability. San
+Antonio 2026-09-09: this panel said 44%, the market said 26%, and the market
+was closer.
 
 THE FEED MAX LEADS
-Boston, 2026-09-09: feed max 73.4F (201 obs) vs precise max 69.98F (9 METARs).
+Boston 2026-09-09: feed max 73.4F on 201 obs vs precise max 69.98F on 9 METARs.
 Nine hourly samples cannot catch a peak between :51 reports.
 
-    day_max_f      every ~5 min, 200+ samples. CATCHES THE PEAK.
-                   Quantized to whole degrees Celsius on most stations.
+    day_max_f      every ~5 min, 200+ samples. CATCHES THE PEAK. Quantized to
+                   whole degrees Celsius on most stations.
     precise_max_f  exact to a tenth, 9-14 samples a day. MISSES PEAKS.
                    It is a FLOOR, never the answer.
-
-WHAT THIS FILE DOES NOT DO
-It places no bets, picks no brackets, computes no probabilities, and has no
-gates or trust scores. The 3,356-line version that did all of that produced 205
-losing paper bets. FAV V1 places the bets; this reads the tables.
 
 Secrets: supabase.url, supabase.key, app_password (optional).
 """
 
+import re
 import requests
 import pandas as pd
 import streamlit as st
@@ -115,14 +144,47 @@ st.set_page_config(page_title='MPH Weather', layout='wide', page_icon='🌡️')
 ET = pytz.timezone('America/New_York')
 
 # ── Freshness thresholds ─────────────────────────────────────────────────────
-# The poller runs every 5 minutes. Anything past SOFT is worth flagging;
-# anything past HARD is not a number, it is a memory.
+# The poller runs every 5 minutes. Past SOFT is worth flagging; past HARD it is
+# not a number, it is a memory.
 STALE_SOFT_SEC = 8 * 60
 STALE_HARD_SEC = 15 * 60
 
-# Stations that genuinely transmit Fahrenheit tenths. Everything else that
-# lands off the Celsius grid is suspect, not precise.
+# Stations that genuinely transmit Fahrenheit tenths. Everything else landing
+# off the Celsius grid is suspect, not precise.
 NATIVE_TENTHS = {'KBOS', 'KMSP'}
+
+# ⚠️ LOCAL TIME, NOT EASTERN. Peak is a local-clock phenomenon: the 17:00 ET
+# snapshot is 2pm in Seattle and 5pm in Miami, and those are nothing alike.
+# On 2026-09-11 the 17:00 snapshot caught five Eastern cities already resolved.
+CITY_TZ = {
+    'Atlanta': 'America/New_York',        'Austin': 'America/Chicago',
+    'Boston': 'America/New_York',         'Washington DC': 'America/New_York',
+    'Denver': 'America/Denver',           'Dallas': 'America/Chicago',
+    'Houston': 'America/Chicago',         'Las Vegas': 'America/Los_Angeles',
+    'Los Angeles': 'America/Los_Angeles', 'Chicago': 'America/Chicago',
+    'Miami': 'America/New_York',          'Minneapolis': 'America/Chicago',
+    'New Orleans': 'America/Chicago',     'New York': 'America/New_York',
+    'Oklahoma City': 'America/Chicago',   'Philadelphia': 'America/New_York',
+    'Phoenix': 'America/Phoenix',         'San Antonio': 'America/Chicago',
+    'Seattle': 'America/Los_Angeles',     'San Francisco': 'America/Los_Angeles',
+}
+
+# Clock order for merging the two tables into one timeline. The three bet
+# windows come from favorites_bets, the six T-labels from favorites_snapshots.
+SLOT_ORDER = [
+    ('MORNING', 1030), ('T1100', 1100), ('MIDDAY', 1200), ('T1200', 1201),
+    ('T1300', 1300), ('T1400', 1400), ('T1500', 1500),
+    ('AFTERNOON', 1600), ('T1700', 1700),
+]
+SLOT_RANK = {name: rank for name, rank in SLOT_ORDER}
+
+# ⚠️ A LADDER SUMMING FAR BELOW 1.0 IS A DEAD MARKET, NOT A CHEAP ONE.
+# 2026-09-11 T1700: Houston, Atlanta, Miami, New York and New Orleans all came
+# back with sigma_p 0.05 and a 1c favorite. Those are resolved markets, and
+# reading them as prices would drag any hour-vs-hour comparison.
+LIVE_SIGMA_MIN = 0.80
+
+KILL_LINE_N = 50
 
 
 def today_et():
@@ -134,7 +196,6 @@ def yesterday_et():
 
 
 def parse_ts(s):
-    """Supabase timestamptz -> aware datetime, or None."""
     if not s:
         return None
     try:
@@ -146,9 +207,8 @@ def parse_ts(s):
 def age_seconds(ts):
     """⚠️ READ-TIME age. This is the whole point of V6.3.
 
-    obs_age_min in the row is computed when the poller WRITES. It does not age.
-    A row written at 13:24Z claiming to be 4 minutes old still claims that at
-    22:00Z. Only this function knows what time it actually is.
+    obs_age_min in the row is computed when the poller WRITES and does not age.
+    Only this function knows what time it actually is now.
     """
     dtv = parse_ts(ts)
     if dtv is None:
@@ -164,6 +224,17 @@ def fmt_age(sec):
     if sec < 5400:
         return f'{sec/60:.0f}m ago'
     return f'{sec/3600:.1f}h ago'
+
+
+def local_hour(city):
+    """Local clock hour for a city, or None if unmapped."""
+    tzname = CITY_TZ.get(city)
+    if not tzname:
+        return None
+    try:
+        return datetime.now(pytz.timezone(tzname)).hour
+    except Exception:
+        return None
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -249,18 +320,13 @@ def sb_get(table, params, timeout=15):
 
 
 # ⚠️ 10s, not 60s. A tab left open since morning served an 81.0F reading that
-# was hours stale and it read as live. If you are watching a position, cache is
-# risk. NOTE: a short cache does NOT make data fresh — it only makes the app
-# re-read a possibly-frozen row more often. Freshness is age_seconds().
+# was hours stale and it read as live. A short cache does NOT make data fresh —
+# it only re-reads a possibly-frozen row more often. Freshness is age_seconds().
 @st.cache_data(ttl=10)
 def fetch_obs_live():
-    """⚠️ TWO DATES, NOT ONE.
-
-    V6.2 filtered `local_date = eq. today_et()`. The poller writes each row
-    under the STATION's local date, so between 9pm ET and midnight PT every
-    Pacific city vanished from the dashboard. Query both days, keep the newest
-    row per city.
-    """
+    """⚠️ TWO DATES, NOT ONE. The poller writes each row under the STATION's
+    local date, so a single Eastern-date filter loses the Pacific cities
+    between 9pm ET and midnight PT."""
     rows = sb_get('obs_live', {
         'local_date': f'in.({yesterday_et()},{today_et()})',
         'order': 'city.asc', 'limit': '100'})
@@ -297,14 +363,22 @@ def fetch_settled(days=30):
 
 @st.cache_data(ttl=60)
 def fetch_favorites():
-    return sb_get('favorites_bets', {'order': 'date.desc', 'limit': '1000'})
+    return sb_get('favorites_bets', {'order': 'date.desc', 'limit': '2000'})
+
+
+@st.cache_data(ttl=60)
+def fetch_snapshots(days=10):
+    """⚠️ SEPARATE TABLE, NEVER POOLED WITH BETS. Snapshots carry no stake, no
+    fee and no band filter. They are observations, not trades."""
+    cutoff = (datetime.now(ET) - timedelta(days=days)).strftime('%Y-%m-%d')
+    return sb_get('favorites_snapshots', {'date': 'gte.' + cutoff,
+                                          'order': 'date.desc', 'limit': '4000'})
 
 
 def kalshi_fee_cents(price_cents):
     """Per-contract fee in cents, per Kalshi's published schedule:
         fee = round up(M x 0.07 x C x P x (1-P)),  M defaults to 1
-    Confirmed 2026-09-08 against a real fill (30 contracts @ 65c -> $0.48).
-    Weather series are not in the non-standard multiplier table, so M = 1."""
+    Confirmed 2026-09-08 against a real fill (30 contracts @ 65c -> $0.48)."""
     p = price_cents / 100.0
     return 0.07 * p * (1 - p) * 100
 
@@ -318,9 +392,8 @@ def quantization_band(f):
     """What a 5-minute feed reading ACTUALLY tells you.
 
     Most ASOS stations transmit whole degrees CELSIUS between the hourly :51
-    METARs. So a feed value of 89.6F is not a measurement of 89.6 — it is the
-    station saying "32C", and the true temperature was anywhere that rounds to
-    32C: 88.7 to 90.5F. A 1.8F window.
+    METARs. 89.6F is not a measurement of 89.6 — it is the station saying
+    "32C", so the true temperature was anywhere in 88.7 to 90.5F.
 
     Returns (lo_f, hi_f, celsius_int, is_on_grid).
     """
@@ -337,13 +410,32 @@ def quantization_band(f):
     return round(lo, 1), round(hi, 1), c_round, True
 
 
+def settle_span(feed_max):
+    """The integer degrees this reading could settle at. Returns (lo, hi).
+
+    ⚠️ THIS IS THE DECISION BOARD'S WHOLE JOB. CLI rounds to a whole degree, so
+    what matters is not the reading but which INTEGERS its band can round to.
+    98.6F is 37C, band 97.7-99.5, which rounds to 98 OR 99 — two brackets, and
+    the station cannot say which. 93.9F is off-grid and rounds to 94 only.
+    """
+    if feed_max is None:
+        return None, None
+    lo, hi, _c, on_grid = quantization_band(feed_max)
+    if not on_grid:
+        try:
+            v = int(float(feed_max) + 0.5)
+        except Exception:
+            return None, None
+        return v, v
+    return int(lo + 0.5), int(hi + 0.5 - 1e-9)
+
+
 def find_duplicate_cities(rows):
     """⚠️ Cities whose readings are byte-identical to another city's.
 
     On 2026-09-09 San Antonio and Los Angeles both showed 81.0 / 80.1 / 17 obs
-    / 11 METARs. The selector in V6.2 was correct — it filters on city — which
-    means the DATABASE held identical rows. The poller should never write that.
-    This cannot fix it, but it refuses to display it as if it were real.
+    / 11 METARs. The city selector was correct, which means the DATABASE held
+    identical rows. The poller should never write that.
     """
     sig = {}
     for r in rows:
@@ -353,10 +445,58 @@ def find_duplicate_cities(rows):
             continue
         sig.setdefault(key, []).append(r.get('city'))
     dupes = set()
-    for key, cities in sig.items():
+    for _key, cities in sig.items():
         if len(cities) > 1:
             dupes.update(c for c in cities if c)
     return dupes
+
+
+def score_bracket(lo, hi, label, actual):
+    """Did this bracket win? True / False / None (unscoreable).
+
+    ⚠️ TAIL BRACKETS ARE NOT RANGES, AND THIS IS WHERE HAND-SCORING FAILS.
+    Kalshi's ladder has three shapes and only one of them is a range:
+
+        "97 to 98"     -> lo=97,   hi=98    win if 97 <= actual <= 98
+        "63 or below"  -> lo=None, hi=63    win if actual <= 63
+        "103 or above" -> lo=103,  hi=None  win if actual >= 103
+
+    Read by eye off a photographed grid, "63↓" looks like a 63-64 range and
+    gets scored backwards. That turned a Seattle WIN into a loss on 2026-09-13
+    (settled 60) and did the same to New Orleans on 2026-09-11.
+
+    Falls back to parsing the label when bracket_lo/bracket_hi are null — those
+    columns only exist on rows written from 2026-09-08 onward, so most of the
+    early record has neither.
+    """
+    if actual is None:
+        return None
+    try:
+        a = float(actual)
+    except Exception:
+        return None
+
+    if lo is None and hi is None and label:
+        s = str(label).replace('\u00b0', '').strip().lower()
+        nums = [int(x) for x in re.findall(r'\d+', s)]
+        if not nums:
+            return None
+        if 'below' in s or 'under' in s:
+            lo, hi = None, nums[0]
+        elif 'above' in s or 'over' in s:
+            lo, hi = nums[0], None
+        elif len(nums) >= 2:
+            lo, hi = nums[0], nums[1]
+        else:
+            return None
+
+    if lo is None and hi is None:
+        return None
+    if lo is None:
+        return a <= float(hi)
+    if hi is None:
+        return a >= float(lo)
+    return float(lo) <= a <= float(hi)
 
 
 # ── Header ───────────────────────────────────────────────────────────────────
@@ -370,7 +510,7 @@ with h1:
     <span style="font-size:11px;color:#00ff88;border:1px solid #00ff8840;
                  background:#00ff8820;padding:2px 9px;border-radius:20px;
                  margin-left:8px;vertical-align:middle;
-                 font-family:'JetBrains Mono',monospace;">V6.3</span></div>
+                 font-family:'JetBrains Mono',monospace;">V6.4</span></div>
   <div style="font-size:12px;color:#64748b;font-family:'JetBrains Mono',monospace;">
     {now_et:%Y-%m-%d %I:%M:%S %p ET} · settles on Iowa State CLI</div>
 </div>
@@ -382,24 +522,93 @@ with h2:
         st.rerun()
 
 
-# ── 1. LIVE OBS ──────────────────────────────────────────────────────────────
-st.markdown('<div class="sec">📡 Live Obs — Settlement Station</div>',
-            unsafe_allow_html=True)
-
 obs_rows = fetch_obs_live()
 dupe_cities = find_duplicate_cities(obs_rows)
+favs_all = fetch_favorites()
 
 if dupe_cities:
     st.error(
         f'⚠️ DUPLICATE ROWS IN obs_live — {len(dupe_cities)} cities are '
         f'reporting identical readings: {", ".join(sorted(dupe_cities))}. '
         f'That is a poller fault, not a display fault. Readings for these '
-        f'cities cannot be trusted and the bracket check is disabled for them.')
+        f'cities cannot be trusted.')
+
+
+# ── 0. DECISION BOARD ────────────────────────────────────────────────────────
+# ⚠️ V6.4. Exists because the old flow was twenty clicks to answer one question.
+st.markdown('<div class="sec">🎯 Decision Board — who is still undecided</div>',
+            unsafe_allow_html=True)
 
 if not obs_rows:
-    st.caption('No obs_live rows today. The poller runs every 5 min, 9am–9pm ET '
-               'via cron-job.org → obs_live.yml.')
+    st.caption('No obs_live rows. The poller runs every 5 min, 9am–9pm ET via '
+               'cron-job.org → obs_live.yml.')
 else:
+    board = []
+    for r in obs_rows:
+        city = r.get('city')
+        ra = age_seconds(r.get('updated_at'))
+        dead = (ra is None or ra > STALE_HARD_SEC or city in dupe_cities)
+        fmax = r.get('day_max_f')
+        trend = r.get('trend_30min')
+        lh = local_hour(city)
+
+        s_lo, s_hi = settle_span(fmax)
+        straddles = (s_lo is not None and s_hi is not None and s_hi > s_lo)
+
+        # ⚠️ PEAK STATUS IS A HEURISTIC, NOT A MEASUREMENT. It reads the local
+        # clock and the 30-minute trend. A flat trend does NOT mean flat
+        # weather — the feed steps 1.8F at a time and sits still in between, so
+        # +0.0 is the normal reading for most of any given hour.
+        if dead:
+            peak = '—'
+        elif lh is None:
+            peak = 'unknown tz'
+        elif lh < 12:
+            peak = '🔺 early'
+        elif trend is not None and trend > 0:
+            peak = '🔺 climbing'
+        elif lh >= 17:
+            peak = '✅ peak likely in'
+        elif lh >= 15:
+            peak = '🟡 near peak'
+        else:
+            peak = '🔺 mid-day'
+
+        board.append({
+            '_sort': (0 if (straddles and not dead) else 1,
+                      0 if not dead else 1,
+                      -(fmax or 0)),
+            'City': city,
+            'Local': f'{lh:02d}:00' if lh is not None else '—',
+            'Day Max': '⛔' if dead else (f'{fmax:.1f}' if fmax is not None else '—'),
+            'Settles': ('—' if dead or s_lo is None else
+                        (f'{s_lo} or {s_hi}' if straddles else f'{s_lo}')),
+            'Undecided': '🔴 YES' if (straddles and not dead) else '',
+            'Trend 30m': '—' if dead or trend is None else f'{trend:+.1f}',
+            'Peak': peak,
+            'Age': fmt_age(ra),
+        })
+    board.sort(key=lambda x: x['_sort'])
+    for b in board:
+        b.pop('_sort', None)
+    st.dataframe(pd.DataFrame(board), use_container_width=True, hide_index=True)
+    n_undec = sum(1 for b in board if b['Undecided'])
+    st.caption(
+        f'**{n_undec} of {len(board)} cities are undecided right now.** '
+        '"Settles" is which whole degree the reading can round to. When the '
+        'quantization band straddles two integers the station CANNOT tell you '
+        'which bracket wins: 98.6°F is 37°C, band 97.7–99.5, so it settles 98 '
+        'or 99 and both are live. ⚠️ Peak status reads the local clock and the '
+        '30-minute trend — a +0.0 trend is normal between 1.8°F steps and does '
+        'NOT mean the temperature is flat.')
+
+
+# ── 1. LIVE OBS ──────────────────────────────────────────────────────────────
+st.markdown('<div class="sec">📡 Live Obs — Settlement Station</div>',
+            unsafe_allow_html=True)
+
+sel = None
+if obs_rows:
     cities = sorted(r['city'] for r in obs_rows if r.get('city'))
     default = cities.index('New York') if 'New York' in cities else 0
     sel = st.selectbox('City', cities, index=default, key='_obs_city')
@@ -416,7 +625,6 @@ else:
         station = (row.get('station') or '').upper()
 
         # ⚠️ AGE IS COMPUTED HERE, FROM updated_at, AGAINST NOW.
-        # Never from obs_age_min — that is a write-time stamp and does not age.
         row_age = age_seconds(row.get('updated_at'))
         poller_says_stale = bool(row.get('is_stale'))
         stale_reason = row.get('stale_reason')
@@ -427,9 +635,9 @@ else:
         untrustworthy = hard_stale or is_dupe
 
         # ── THE HEADLINE ────────────────────────────────────────────────
-        # If the row is untrustworthy the NUMBER IS NOT SHOWN. Not greyed,
-        # not asterisked — replaced. V6.2 rendered 81.0 in green at 5:19pm
-        # from a row written at 8:24am, and it drove a real decision.
+        # If the row is untrustworthy the NUMBER IS NOT SHOWN. V6.2 rendered
+        # 81.0 in green at 5:19pm from a row written at 8:24am, and it drove a
+        # real decision.
         if untrustworthy:
             why = []
             if hard_stale:
@@ -458,8 +666,7 @@ else:
             st.markdown(
                 f'<div class="hero {klass}">'
                 f'<div class="hero-l">Day Max — 5-min feed</div>'
-                f'<div class="hero-v {vklass}">'
-                f'{feed_max:.1f}°F</div>'
+                f'<div class="hero-v {vklass}">{feed_max:.1f}°F</div>'
                 f'<div class="sub">{n_obs or 0} obs today · '
                 f'written {fmt_age(row_age)}{_band_note}</div></div>',
                 unsafe_allow_html=True)
@@ -469,12 +676,14 @@ else:
             if poller_says_stale and stale_reason:
                 st.warning(f'Poller flagged this row: {stale_reason}')
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric('Now', '—' if untrustworthy or feed_now is None else f'{feed_now:.1f}')
         c2.metric('Next possible', '—' if untrustworthy or nxt is None else f'{nxt:.1f}')
         c3.metric('Trend 30m',
                   '—' if untrustworthy or row.get('trend_30min') is None
                   else f"{row.get('trend_30min'):+.1f}")
+        _lh = local_hour(sel)
+        c4.metric('Local time', '—' if _lh is None else f'{_lh:02d}:00')
 
         # ── SECONDARY: the exact hourly reading ─────────────────────────
         met_age = age_seconds(row.get('metar_time_utc'))
@@ -505,18 +714,20 @@ else:
                        f'{n_obs or 0} feed obs, the peak fell between :51 reports. '
                        f'Trust the feed max.')
 
+        # ⚠️ V6.4: STEPS, NOT DEGREES. "2.9F to go" is not actionable, because
+        # the station cannot transmit 2.9F of change — it moves in 1.8F jumps.
         if not untrustworthy and nxt is not None and feed_max is not None:
-            st.caption(f'Feed steps 1.8°F. Nothing exists between '
-                       f'**{feed_max:.1f}** and **{nxt:.1f}**.')
+            nxt_lo, nxt_hi = settle_span(nxt)
+            nxt_txt = (f'{nxt_lo}' if nxt_hi == nxt_lo else f'{nxt_lo} or {nxt_hi}')
+            st.caption(
+                f'Feed steps 1.8°F. Nothing exists between **{feed_max:.1f}** '
+                f'and **{nxt:.1f}**. One more step settles **{nxt_txt}**.')
 
         # ── BRACKET CHECK ───────────────────────────────────────────────
         st.markdown('<div class="sub">Bracket check — enter the ceiling you '
                     'care about</div>', unsafe_allow_html=True)
 
         if untrustworthy:
-            # ⚠️ V6.2 computed a verdict from whatever was in the row. With a
-            # stale 81.0 and an 80 ceiling it printed a flat red BROKEN, with
-            # no hedge, because 81.0 is off the Celsius grid — see below.
             st.info('Bracket check disabled — the underlying row is not live. '
                     'A verdict computed from a stale reading is worse than no '
                     'verdict.')
@@ -534,18 +745,14 @@ else:
 
                     if not on_grid and not native_tenths:
                         # ⚠️ THE INVERSION THAT MADE A BAD ROW LOOK CERTAIN.
-                        # V6.2 said off-grid -> "native Fahrenheit tenths, the
-                        # max is exact, no quantization window", and then
-                        # printed a hard verdict. But real ASOS values land ON
-                        # the grid. 81.0F is not on it (27C = 80.6). Off-grid
-                        # is a SYMPTOM OF BAD DATA at every station except the
-                        # two that genuinely send tenths.
+                        # Real ASOS values land ON the grid. Off-grid is a
+                        # symptom of bad data, not evidence of precision.
                         st.warning(
                             f'⚠️ {feed_max:.1f}°F does not sit on this '
-                            f'station\'s transmission grid, and {station or "this station"} '
-                            f'is not one of the native-tenths sites. That is a '
-                            f'sign of a bad or stale reading, not a precise '
-                            f'one. No verdict given.')
+                            f'station\'s transmission grid, and '
+                            f'{station or "this station"} is not one of the '
+                            f'native-tenths sites. That is a sign of a bad or '
+                            f'stale reading, not a precise one. No verdict.')
                     else:
                         settle_lo = int(lo + 0.5)
                         settle_hi = int(hi + 0.5 - 1e-9)
@@ -572,7 +779,7 @@ else:
                                 'the real odds are better than this figure. '
                                 'Treat it as an upper bound on the bad outcome. '
                                 '(San Antonio 2026-09-09: this said 44%, the '
-                                'market said 26%.)')
+                                'market said 26%, and the market was closer.)')
 
                     if on_grid:
                         st.caption(f'{feed_max:.1f}°F is a quantized '
@@ -582,7 +789,7 @@ else:
                         st.caption(f'{station} transmits Fahrenheit tenths — '
                                    f'this max is exact.')
 
-    with st.expander('All cities', expanded=False):
+    with st.expander('All cities — raw obs', expanded=False):
         tbl = []
         for r in sorted(obs_rows,
                         key=lambda x: (x.get('day_max_f') is None,
@@ -610,7 +817,358 @@ else:
                    '⚠️ Preliminary, pre-QC. Kalshi settles on official CLI.')
 
 
-# ── 2. TODAY'S CONSENSUS ─────────────────────────────────────────────────────
+# ── 2. MARKET TIMELINE ───────────────────────────────────────────────────────
+# ⚠️ V6.4. Turns favorites_snapshots from a table you query by hand into
+# something you glance at.
+st.markdown('<div class="sec">🕐 Market Timeline — what the favorite did, '
+            'hour by hour</div>', unsafe_allow_html=True)
+
+snaps = fetch_snapshots(10)
+
+if not snaps:
+    st.caption('No snapshot rows yet. favorites_snapshots fills at 11:00, 12:00, '
+               '13:00, 14:00, 15:00 and 17:00 ET via cron-job.org → '
+               'favorites.yml. Collection began 2026-09-11.')
+else:
+    snap_dates = sorted({s.get('date') for s in snaps if s.get('date')},
+                        reverse=True)
+    tl1, tl2 = st.columns([1, 2])
+    with tl1:
+        tl_date = st.selectbox('Date', snap_dates, index=0, key='_tl_date')
+    day_snaps = [s for s in snaps if s.get('date') == tl_date]
+    day_bets = [b for b in favs_all if b.get('date') == tl_date]
+    tl_cities = sorted({s.get('city') for s in day_snaps if s.get('city')})
+    with tl2:
+        _idx = tl_cities.index(sel) if (sel and sel in tl_cities) else 0
+        tl_city = st.selectbox('City', tl_cities, index=_idx, key='_tl_city')
+
+    # Merge both tables into one clock-ordered timeline.
+    merged = []
+    for s in day_snaps:
+        if s.get('city') != tl_city:
+            continue
+        merged.append({
+            'slot': s.get('snap_label'),
+            'rank': SLOT_RANK.get(s.get('snap_label'), 9999),
+            'bracket': s.get('bracket'),
+            'ask': s.get('yes_ask_cents'),
+            'sigma': s.get('sigma_p'),
+            'src': 'snap',
+            'in_band': bool(s.get('in_band')),
+        })
+    for b in day_bets:
+        if b.get('city') != tl_city:
+            continue
+        merged.append({
+            'slot': b.get('window_label'),
+            'rank': SLOT_RANK.get(b.get('window_label'), 9999),
+            'bracket': b.get('bracket'),
+            'ask': b.get('yes_ask_cents'),
+            'sigma': b.get('sigma_p'),
+            'src': 'BET',
+            'in_band': True,
+        })
+    merged.sort(key=lambda x: x['rank'])
+
+    if not merged:
+        st.caption('No rows for that city and date.')
+    else:
+        tbl = []
+        prev_bracket = None
+        n_changes = 0
+        for m in merged:
+            changed = (prev_bracket is not None and m['bracket'] != prev_bracket)
+            if changed:
+                n_changes += 1
+            sig = m.get('sigma')
+            dead_mkt = False
+            try:
+                dead_mkt = (sig is not None and float(sig) < LIVE_SIGMA_MIN)
+            except Exception:
+                dead_mkt = False
+            tbl.append({
+                'Slot': m['slot'],
+                'Bracket': m['bracket'] or '—',
+                'Ask': ('⛔ dead' if dead_mkt else
+                        (f"{m['ask']}c" if m['ask'] is not None else '—')),
+                'Σp': f"{float(sig):.2f}" if sig is not None else '—',
+                'In band': '✅' if m.get('in_band') else '',
+                'Source': m['src'],
+                'Changed': '🔄 CHANGED' if changed else '',
+            })
+            prev_bracket = m['bracket']
+        st.dataframe(pd.DataFrame(tbl), use_container_width=True, hide_index=True)
+        if n_changes:
+            st.caption(
+                f'**{n_changes} bracket change(s) on this city-day.** The 🔄 row '
+                'is where the market revised. What matters is the ASK on that '
+                'row and the next: a revision that arrives already priced at '
+                '84c is not tradeable, one that sits at 56c for an hour is. '
+                '(2026-09-12: Miami flipped at 14:00 already at 84c; Atlanta '
+                'flipped at 14:00 at 56c; San Antonio flipped by 13:00 and held '
+                '63c for three hours.) ⛔ dead means the ladder summed below '
+                f'{LIVE_SIGMA_MIN:.2f} — a resolved market, not a cheap one.')
+        else:
+            st.caption('No bracket change on this city-day — the market picked '
+                       'one bracket and kept it.')
+
+    with st.expander('Bracket changes — all cities, this date', expanded=False):
+        rows = []
+        for c in tl_cities:
+            seq = sorted([s for s in day_snaps if s.get('city') == c],
+                         key=lambda x: SLOT_RANK.get(x.get('snap_label'), 9999))
+            brs = [x.get('bracket') for x in seq if x.get('bracket')]
+            uniq = len(set(brs))
+            first_change = ''
+            for i in range(1, len(seq)):
+                if seq[i].get('bracket') != seq[i - 1].get('bracket'):
+                    first_change = (f"{seq[i].get('snap_label')} "
+                                    f"@ {seq[i].get('yes_ask_cents')}c")
+                    break
+            rows.append({
+                'City': c,
+                'Obs': len(seq),
+                'Distinct brackets': uniq,
+                'Changed': '🔄' if uniq > 1 else '',
+                'First change': first_change or '—',
+            })
+        rows.sort(key=lambda x: (-x['Distinct brackets'], x['City']))
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption(
+            '⚠️ Read this as description, not signal. Bracket-change as a BET '
+            'filter was tested and REVERSED under price control. Pooled across '
+            '170 settled bets, city-days where the bracket never moved won '
+            '70.8% (n=154) against 43.8% where it did (n=16) — but you only '
+            'know a day was stable after it ends, and n=16 cannot support a '
+            '27-point claim.')
+
+
+# ── 3. DAILY SCORECARD ───────────────────────────────────────────────────────
+# ⚠️ V6.4. Replaces counting wins by hand off a photograph of the paper grid.
+st.markdown('<div class="sec">✅ Daily Scorecard — in-band results by pass</div>',
+            unsafe_allow_html=True)
+
+settled_all = fetch_settled(30)
+actual_by = {}
+for s in settled_all:
+    if s.get('actual') is not None and s.get('city') and s.get('date'):
+        actual_by[(str(s['date'])[:10], s['city'])] = s['actual']
+
+bet_dates = sorted({b.get('date') for b in favs_all if b.get('date')},
+                   reverse=True)
+if not bet_dates:
+    st.caption('No bets logged yet.')
+else:
+    sc_date = st.selectbox('Date', bet_dates, index=0, key='_sc_date')
+    day = [b for b in favs_all if b.get('date') == sc_date]
+
+    rows = []
+    unscored = 0
+    for w in ('MORNING', 'MIDDAY', 'AFTERNOON'):
+        g = [b for b in day if b.get('window_label') == w]
+        if not g:
+            continue
+        n = wins = 0
+        net = 0.0
+        asks = []
+        for b in g:
+            # Kalshi's own result field takes precedence — it is what the
+            # contract actually settled at. Fall back to scoring the bracket
+            # against the settled temperature when the bet is still Pending.
+            res = b.get('result')
+            if res in ('Won', 'Lost'):
+                ok = (res == 'Won')
+            else:
+                ok = score_bracket(b.get('bracket_lo'), b.get('bracket_hi'),
+                                   b.get('bracket'),
+                                   actual_by.get((sc_date, b.get('city'))))
+            if ok is None:
+                unscored += 1
+                continue
+            n += 1
+            wins += 1 if ok else 0
+            if b.get('yes_ask_cents'):
+                asks.append(float(b['yes_ask_cents']))
+            net += float(b.get('net_profit') or 0)
+        if not n:
+            continue
+        avg_ask = sum(asks) / len(asks) if asks else 0
+        wp = 100.0 * wins / n
+        be = break_even(avg_ask) if avg_ask else 0
+        rows.append({
+            'Pass': w, 'n': n, 'Wins': wins,
+            'Win %': f'{wp:.1f}',
+            'Avg Ask': f'{avg_ask:.1f}c',
+            'Break-even': f'{be:.1f}%',
+            'Margin': f'{wp - be:+.1f}',
+            'Net': f'${net:+.2f}',
+        })
+
+    if rows:
+        tn = sum(r['n'] for r in rows)
+        tw = sum(r['Wins'] for r in rows)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.metric('Day total', f'{tw}/{tn}  ({100.0*tw/tn:.1f}%)')
+    else:
+        st.caption('Nothing scoreable for that date yet.')
+    if unscored:
+        st.caption(f'⚠️ {unscored} bet(s) not scoreable — no settled temperature '
+                   f'and no Kalshi result yet.')
+    st.caption(
+        '⚠️ Scored from bracket bounds against the settled temperature, with '
+        'Kalshi\'s own `result` field taking precedence. Tail brackets '
+        '("63 or below", "103 or above") are handled explicitly — read by eye '
+        'off the paper grid they look like ranges and get scored BACKWARDS, '
+        'which turned a Seattle win into a loss on 2026-09-13 and a New '
+        'Orleans win into a loss on 2026-09-11.')
+
+
+# ── 4. RESULTS ───────────────────────────────────────────────────────────────
+st.markdown('<div class="sec">📊 Results</div>', unsafe_allow_html=True)
+
+settled_fav = [b for b in favs_all if b.get('result') in ('Won', 'Lost')]
+
+tab_kill, tab_win, tab_day, tab_acc = st.tabs(
+    ['Kill line', 'By window', 'By day', 'Consensus accuracy'])
+
+with tab_kill:
+    # ⚠️ V6.4. The kill line is the only number that governs what happens next,
+    # and it was living in a query run occasionally.
+    if not settled_fav:
+        st.caption('No settled FAV V1 bets yet.')
+    else:
+        cols = st.columns(3)
+        for i, w in enumerate(('MORNING', 'MIDDAY', 'AFTERNOON')):
+            g = [b for b in settled_fav if b.get('window_label') == w]
+            with cols[i]:
+                if not g:
+                    st.metric(w, '—')
+                    continue
+                n = len(g)
+                wins = sum(1 for b in g if b['result'] == 'Won')
+                asks = [float(b['yes_ask_cents']) for b in g
+                        if b.get('yes_ask_cents')]
+                avg_ask = sum(asks) / len(asks) if asks else 0
+                wp = 100.0 * wins / n
+                be = break_even(avg_ask) if avg_ask else 0
+                margin = wp - be
+                st.metric(w, f'{margin:+.1f} pts',
+                          delta=f'n={n} of {KILL_LINE_N}', delta_color='off')
+                if n >= KILL_LINE_N and margin < 0:
+                    st.error(f'⛔ AT THE LINE — {wp:.1f}% against a '
+                             f'{be:.1f}% break-even on n={n}.')
+                elif n >= KILL_LINE_N:
+                    st.success(f'✅ Clears its break-even at n={n}.')
+                else:
+                    st.info(f'{KILL_LINE_N - n} more settled bets to the '
+                            f'decision point.')
+        st.caption(
+            '**A window retires when its win rate sits below its OWN average '
+            'break-even at n=50 settled.** Break-even is entry price plus '
+            'Kalshi\'s fee at that price — a curve, not a number: 58c needs '
+            '59.7%, 69c needs 70.5%, 79c needs 80.2%. A 79c bet winning 75% of '
+            'the time is LOSING; a 58c bet winning 62% is WINNING. One fee at '
+            'entry; holding a winner to settlement costs nothing extra.')
+
+with tab_win:
+    if not settled_fav:
+        st.caption('No settled FAV V1 bets yet.')
+    else:
+        rows = []
+        for w in ('MORNING', 'MIDDAY', 'AFTERNOON'):
+            g = [b for b in settled_fav if b.get('window_label') == w]
+            if not g:
+                continue
+            n = len(g)
+            wins = sum(1 for b in g if b['result'] == 'Won')
+            asks = [float(b['yes_ask_cents']) for b in g if b.get('yes_ask_cents')]
+            avg_ask = sum(asks) / len(asks) if asks else 0
+            net = sum(float(b.get('net_profit') or 0) for b in g)
+            wp = 100.0 * wins / n
+            be = break_even(avg_ask)
+            rows.append({
+                'Window': w, 'n': n, 'Wins': wins,
+                'Win %': f'{wp:.1f}',
+                'Avg Ask': f'{avg_ask:.1f}c',
+                'Break-even': f'{be:.1f}%',
+                'Margin': f'{wp - be:+.1f}',
+                'Net': f'${net:+.2f}',
+            })
+        tot_n = len(settled_fav)
+        tot_w = sum(1 for b in settled_fav if b['result'] == 'Won')
+        tot_net = sum(float(b.get('net_profit') or 0) for b in settled_fav)
+        all_asks = [float(b['yes_ask_cents']) for b in settled_fav
+                    if b.get('yes_ask_cents')]
+        tot_ask = sum(all_asks) / len(all_asks) if all_asks else 0
+        tot_wp = 100.0 * tot_w / tot_n
+        tot_be = break_even(tot_ask)
+        rows.append({'Window': 'TOTAL', 'n': tot_n, 'Wins': tot_w,
+                     'Win %': f'{tot_wp:.1f}', 'Avg Ask': f'{tot_ask:.1f}c',
+                     'Break-even': f'{tot_be:.1f}%',
+                     'Margin': f'{tot_wp - tot_be:+.1f}',
+                     'Net': f'${tot_net:+.2f}'})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+with tab_day:
+    if not settled_fav:
+        st.caption('No settled bets yet.')
+    else:
+        by_day = {}
+        for b in settled_fav:
+            by_day.setdefault(b.get('date'), []).append(b)
+        rows = []
+        for d in sorted(by_day, reverse=True):
+            g = by_day[d]
+            n = len(g)
+            wins = sum(1 for x in g if x['result'] == 'Won')
+            net = sum(float(x.get('net_profit') or 0) for x in g)
+            late = max((x.get('minutes_late') or 0) for x in g)
+            rows.append({
+                'Date': d, 'n': n, 'Wins': wins,
+                'Win %': f'{100.0*wins/n:.1f}',
+                'Net': f'${net:+.2f}',
+                'Worst late': f'{late}m',
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption('Worst late should read 0m — that is the cron-job.org dispatch '
+                   'landing on time. If it climbs, entry prices are not what the '
+                   'band was measured on.')
+
+with tab_acc:
+    if not settled_all:
+        st.caption('No settled rows in the last 30 days.')
+    else:
+        errs = [float(r['actual']) - float(r['consensus']) for r in settled_all
+                if r.get('actual') is not None and r.get('consensus') is not None]
+        if errs:
+            mae = sum(abs(e) for e in errs) / len(errs)
+            mean = sum(errs) / len(errs)
+            a1, a2, a3 = st.columns(3)
+            a1.metric('MAE', f'{mae:.2f} F')
+            a2.metric('Mean Error', f'{mean:+.2f} F')
+            a3.metric('N', str(len(errs)))
+            st.caption('error = actual − consensus. **POSITIVE means settlement '
+                       'came in WARMER than predicted — the model runs COLD.**')
+
+        by_city = {}
+        for r in settled_all:
+            if r.get('actual') is None or r.get('consensus') is None:
+                continue
+            by_city.setdefault(r['city'], []).append(
+                float(r['actual']) - float(r['consensus']))
+        rows = []
+        for city, e in sorted(by_city.items(),
+                              key=lambda kv: sum(abs(x) for x in kv[1]) / len(kv[1])):
+            rows.append({
+                'City': city, 'n': len(e),
+                'MAE': f'{sum(abs(x) for x in e)/len(e):.2f}',
+                'Mean Err': f'{sum(e)/len(e):+.2f}',
+                'Worst': f'{max(e, key=abs):+.1f}',
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+# ── 5. TODAY'S CONSENSUS ─────────────────────────────────────────────────────
 st.markdown('<div class="sec">🎯 Today\'s Consensus</div>', unsafe_allow_html=True)
 
 cons_rows = fetch_today_consensus()
@@ -640,125 +1198,17 @@ else:
             '⚠️': '⚠️' if r.get('high_uncertainty') else '',
         })
     st.dataframe(pd.DataFrame(tbl), use_container_width=True, hide_index=True)
-    st.caption('**To Go** = consensus minus the day\'s feed max. Negative means '
-               'the station has already passed the forecast. ⛔ means the obs '
-               'row is stale so To Go cannot be computed. ⚠️ = NWS and GFS '
-               'disagree by more than 5°F. Consensus has never picked a '
-               'profitable bracket — this is for seeing where the day stands, '
-               'not for betting.')
-
-
-# ── 3. RESULTS ───────────────────────────────────────────────────────────────
-st.markdown('<div class="sec">📊 Results</div>', unsafe_allow_html=True)
-
-fav = fetch_favorites()
-settled_fav = [b for b in fav if b.get('result') in ('Won', 'Lost')]
-
-tab_win, tab_day, tab_acc = st.tabs(['By window', 'By day', 'Consensus accuracy'])
-
-with tab_win:
-    if not settled_fav:
-        st.caption('No settled FAV V1 bets yet.')
-    else:
-        rows = []
-        for w in ('MORNING', 'MIDDAY', 'AFTERNOON'):
-            g = [b for b in settled_fav if b.get('window_label') == w]
-            if not g:
-                continue
-            n = len(g)
-            wins = sum(1 for b in g if b['result'] == 'Won')
-            asks = [float(b['yes_ask_cents']) for b in g if b.get('yes_ask_cents')]
-            avg_ask = sum(asks) / len(asks) if asks else 0
-            net = sum(float(b.get('net_profit') or 0) for b in g)
-            wp = 100.0 * wins / n
-            be = break_even(avg_ask)
-            rows.append({
-                'Window': w, 'n': n, 'Wins': wins,
-                'Win %': f'{wp:.1f}',
-                'Avg Ask': f'{avg_ask:.1f}c',
-                'Break-even': f'{be:.1f}%',
-                'Margin': f'{wp - be:+.1f}',
-                'Net': f'${net:+.2f}',
-            })
-        tot_n = len(settled_fav)
-        tot_w = sum(1 for b in settled_fav if b['result'] == 'Won')
-        tot_net = sum(float(b.get('net_profit') or 0) for b in settled_fav)
-        all_asks = [float(b['yes_ask_cents']) for b in settled_fav if b.get('yes_ask_cents')]
-        tot_ask = sum(all_asks) / len(all_asks) if all_asks else 0
-        tot_wp = 100.0 * tot_w / tot_n
-        tot_be = break_even(tot_ask)
-        rows.append({'Window': 'TOTAL', 'n': tot_n, 'Wins': tot_w,
-                     'Win %': f'{tot_wp:.1f}', 'Avg Ask': f'{tot_ask:.1f}c',
-                     'Break-even': f'{tot_be:.1f}%',
-                     'Margin': f'{tot_wp - tot_be:+.1f}',
-                     'Net': f'${tot_net:+.2f}'})
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.caption('Break-even is entry price + Kalshi\'s fee at that price — it is '
-                   'a curve, not a number (58c needs 59.7%, 79c needs 80.2%). '
-                   '**Kill line: a window retires when its win rate sits below its '
-                   'own break-even at n=50.** One fee at entry; holding a winner '
-                   'to settlement costs nothing extra.')
-
-with tab_day:
-    if not settled_fav:
-        st.caption('No settled bets yet.')
-    else:
-        by_day = {}
-        for b in settled_fav:
-            by_day.setdefault(b.get('date'), []).append(b)
-        rows = []
-        for d in sorted(by_day, reverse=True):
-            g = by_day[d]
-            n = len(g)
-            wins = sum(1 for x in g if x['result'] == 'Won')
-            net = sum(float(x.get('net_profit') or 0) for x in g)
-            late = max((x.get('minutes_late') or 0) for x in g)
-            rows.append({
-                'Date': d, 'n': n, 'Wins': wins,
-                'Win %': f'{100.0*wins/n:.1f}',
-                'Net': f'${net:+.2f}',
-                'Worst late': f'{late}m',
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.caption('Worst late should read 0m — that is the cron-job.org dispatch '
-                   'landing on time. If it climbs, entry prices are not what the '
-                   'band was measured on.')
-
-with tab_acc:
-    settled = fetch_settled(30)
-    if not settled:
-        st.caption('No settled rows in the last 30 days.')
-    else:
-        errs = [float(r['actual']) - float(r['consensus']) for r in settled
-                if r.get('actual') is not None and r.get('consensus') is not None]
-        if errs:
-            mae = sum(abs(e) for e in errs) / len(errs)
-            mean = sum(errs) / len(errs)
-            a1, a2, a3 = st.columns(3)
-            a1.metric('MAE', f'{mae:.2f} F')
-            a2.metric('Mean Error', f'{mean:+.2f} F')
-            a3.metric('N', str(len(errs)))
-            st.caption('error = actual − consensus. **POSITIVE means settlement '
-                       'came in WARMER than predicted — the model runs COLD.**')
-
-        by_city = {}
-        for r in settled:
-            if r.get('actual') is None or r.get('consensus') is None:
-                continue
-            by_city.setdefault(r['city'], []).append(
-                float(r['actual']) - float(r['consensus']))
-        rows = []
-        for city, e in sorted(by_city.items(),
-                              key=lambda kv: sum(abs(x) for x in kv[1]) / len(kv[1])):
-            rows.append({
-                'City': city, 'n': len(e),
-                'MAE': f'{sum(abs(x) for x in e)/len(e):.2f}',
-                'Mean Err': f'{sum(e)/len(e):+.2f}',
-                'Worst': f'{max(e, key=abs):+.1f}',
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption(
+        '**To Go** = consensus minus the day\'s feed max. Negative means the '
+        'station has already passed the forecast. ⛔ means the obs row is stale '
+        'so To Go cannot be computed. ⚠️ = NWS and GFS disagree by more than '
+        '5°F. **Consensus has never picked a profitable bracket** — 205 paper '
+        'bets, all negative, and naked consensus beat the model\'s own pick '
+        '74.3% to 55.2% on 626 city-days. This is for seeing where the day '
+        'stands, not for betting.')
 
 st.markdown('---')
-st.caption('V6.3 — freshness measured at read time, off-grid treated as suspect, '
-           'duplicate rows surfaced. No gates, no trust scores, no bet '
+st.caption('V6.4 — decision board, market timeline, auto-scored grid, kill-line '
+           'status. Freshness measured at read time, off-grid treated as '
+           'suspect, duplicate rows surfaced. No gates, no trust scores, no bet '
            'selection. FAV V1 places the bets; this reads the tables.')
