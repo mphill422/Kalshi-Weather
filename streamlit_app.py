@@ -432,6 +432,23 @@ def quantization_band(f):
 def fetch_calibration(days=60):
     """MEASURED (CLI actual − feed max), from this account's own history.
 
+    ⚠️ THE YARDSTICK IS NWS CLI; KALSHI SETTLES ON THE WEATHER COMPANY.
+    Confirmed 2026-09-14 by reading a live KXHIGH market's Rules tab: "the
+    maximum temperature recorded at Miami (CLIMIA) ... according to The Weather
+    Company. Outcome verified from The Weather Company." Kalshi's own help
+    centre still said NWS Daily Climate Report, so it was out of date. Note the
+    station identifier is CLIMIA, Kalshi's code, not KMIA.
+
+    `settlements.actual` still comes from Iowa State CLI — i.e. NWS — so this
+    calibration measures the feed against NWS, not against what actually pays.
+    That was checked rather than assumed: across all 155 settled bets where a
+    comparison was possible, Kalshi's own `result` field and an NWS-CLI scoring
+    of the same bracket AGREED 155 times and disagreed ZERO times. The two
+    sources are interchangeable for bracket outcomes, so this yardstick stands.
+
+    ⚠️ Re-check if that ever stops being true. A source change that moved a
+    bracket would silently corrupt every share on the board.
+
     ⚠️ READS THE `max_vs_settled` VIEW. An earlier version did this join in
     Python — obs_live keyed on (city, local_date), settlements on (city, date)
     — and silently matched only 8 of 109 rows. `settlements.date` is TEXT
@@ -661,7 +678,7 @@ with h1:
                  margin-left:8px;vertical-align:middle;
                  font-family:'JetBrains Mono',monospace;">V6.4</span></div>
   <div style="font-size:12px;color:#64748b;font-family:'JetBrains Mono',monospace;">
-    {now_et:%Y-%m-%d %I:%M:%S %p ET} · settles on Iowa State CLI</div>
+    {now_et:%Y-%m-%d %I:%M:%S %p ET} · settles on The Weather Company</div>
 </div>
 """, unsafe_allow_html=True)
 with h2:
