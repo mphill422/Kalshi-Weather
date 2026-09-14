@@ -572,8 +572,28 @@ WINDOWS = [
 # Observed 2026-09-12: Miami's favorite sat at 53c at noon and San Antonio's at
 # 52c, both out of band, so neither produced a row. Both later revised brackets
 # and both revisions won. The hour that mattered was invisible.
+# ⚠️ T0900 IS THE EARLIEST OBSERVATION AND IT MAY COME BACK THIN.
+# 9:00 ET is 6:00 AM in Seattle, San Francisco, Los Angeles and Las Vegas.
+# Those ladders may be unopened or barely quoted, which shows up as a low
+# sigma_p and a 1c favorite — the same dead-market signature the 17:00 snapshot
+# produced for the EASTERN cities on 2026-09-11 (Houston, Atlanta, Miami, New
+# York and New Orleans all came back sigma_p 0.05). Filter on sigma_p before
+# comparing T0900 against the other hours or the Pacific cities will drag it.
+#
+# It exists because there is a real gap in the record. The stale exact-minute
+# analysis put 09:30 at +7.61 and 10:30 at +18.45 — if that jump is genuine,
+# something happens in that hour and nothing has ever observed it. Those
+# figures carry the ladder bug and are NOT to be trusted; this collects the
+# question properly instead of arguing about it.
+#
+# ⚠️ DO NOT READ THIS AS PERMISSION TO ADD AN EARLY BETTING WINDOW. V1.3's
+# standing note: "The count of qualifying picks is FLAT across all of these —
+# the same picks are available at 8am and are simply wrong more often. Do not
+# add an earlier window." T0900 places no bets and tests that claim rather
+# than assuming it.
 #   (hour, minute, label)
 SNAPSHOT_HOURS = [
+    (9, 0, "T0900"),
     (11, 0, "T1100"),
     (12, 0, "T1200"),
     (13, 0, "T1300"),
