@@ -591,6 +591,34 @@ WINDOWS = [
 # the same picks are available at 8am and are simply wrong more often. Do not
 # add an earlier window." T0900 places no bets and tests that claim rather
 # than assuming it.
+# ⚠️ T1800 / T1900 / T2000 EXIST TO CATCH THE WESTERN CITIES DECIDING.
+# A city's market resolves in practice when the station passes its peak and the
+# next hourly observation confirms it. That is a LOCAL-clock event, so it lands
+# at a different ET hour for every time zone:
+#
+#     Eastern   peak 3-5pm local  -> decides ~4-6pm ET
+#     Central                     -> decides ~5-7pm ET
+#     Mountain                    -> decides ~6-8pm ET
+#     Pacific                     -> decides ~7-9pm ET
+#
+# Observed 2026-09-16: Denver sat on two equally-priced brackets (81-82 and
+# 83-84) all afternoon and resolved at 6:17pm ET — 4:17pm local, right at peak —
+# when 81-82 was cut to 2%. Collection stopped at 17:00, so the single hour that
+# actually mattered for that city was never recorded.
+#
+# Corroborating the Eastern end: the 17:00 snapshot on 2026-09-11 caught
+# Houston, Atlanta, Miami, New York and New Orleans ALREADY resolved — sigma_p
+# 0.05 with a 1c favorite. Those five were done before the collector looked.
+#
+# ⚠️ EXPECT DEAD ROWS, AND FILTER THEM. At 18:00-20:00 ET the Eastern and most
+# Central cities are settled, so they return a near-zero sigma_p and a 1c
+# favorite. That is a resolved market, not a cheap one. Filtering on sigma_p is
+# mandatory before comparing these hours against the midday ones, or the dead
+# East will drag every evening average down.
+#
+# The question these are collecting for: does each city have a repeatable
+# DECISION HOUR — the hour its favorite crosses ~90% and stays there? If so it
+# is a per-city constant set by longitude, measurable rather than guessed.
 #   (hour, minute, label)
 SNAPSHOT_HOURS = [
     (9, 0, "T0900"),
@@ -600,6 +628,9 @@ SNAPSHOT_HOURS = [
     (14, 0, "T1400"),
     (15, 0, "T1500"),
     (17, 0, "T1700"),
+    (18, 0, "T1800"),
+    (19, 0, "T1900"),
+    (20, 0, "T2000"),
 ]
 
 # Band used ONLY to tag snapshots as in_band for comparison with the bets.
