@@ -1,5 +1,5 @@
 """
-Live Desk — V1.1 (2026-09-19)  ·  V1.1: 📊 Mac / 📱 iPhone toggle; Celsius straddle cards
+Live Desk — V1.2 (2026-09-19)  ·  V1.2: KBOS/KMSP on-grid readings shown as ranges  ·  V1.1: 📊 Mac / 📱 iPhone toggle; Celsius straddle cards
 
 What this page is for: the last hour of a bet. Hold, or cash out?
 
@@ -158,10 +158,12 @@ def parse_reading(stn, ts, c, raw):
         cc = int(m.group(2)) / 10.0 * (-1 if m.group(1) == "1" else 1)
         f = c_to_f(cc)
         return dict(ts=ts, f=f, lo=f, hi=f, exact=True, kind="hourly — exact")
-    if stn in TENTHS_F:
+    ci = round(c)
+    # KBOS/KMSP can send real tenths — but a value sitting exactly on a whole
+    # Celsius step (62.6 = 17C) is treated as rounded. Safer to show a range.
+    if stn in TENTHS_F and abs(c - ci) >= 0.05:
         f = c_to_f(c)
         return dict(ts=ts, f=f, lo=f, hi=f, exact=True, kind="exact")
-    ci = round(c)
     if abs(c - ci) < 0.05:
         f = c_to_f(ci)
         return dict(ts=ts, f=f, lo=c_to_f(ci - 0.5), hi=c_to_f(ci + 0.5),
