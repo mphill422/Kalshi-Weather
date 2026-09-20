@@ -687,6 +687,10 @@ def local_hm(ts, tz):
 
 
 # ── Page ─────────────────────────────────────────────────────────────────────
+try:
+    st.page_link("streamlit_app.py", label="← Decision board")
+except Exception:
+    st.markdown("[← Decision board](/)")
 st.markdown("## 🌡️ Live Desk")
 st.caption("Settlement stations · °F only · refreshes every 60 seconds · "
            "public NWS data runs ~5-15 min behind the sensor")
