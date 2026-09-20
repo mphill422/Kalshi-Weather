@@ -1,5 +1,5 @@
 """
-Live Desk — V1.2 (2026-09-19)  ·  V1.2: KBOS/KMSP on-grid readings shown as ranges  ·  V1.1: 📊 Mac / 📱 iPhone toggle; Celsius straddle cards
+Live Desk — V1.4 (2026-09-19)  ·  V1.4: Synoptic + aviationweather fast feeds, STEPPED UP / NEW HIGH flash, :51 countdown  ·  V1.3: official NWS high (whole °F) card; locks the call when posted  ·  V1.2: KBOS/KMSP on-grid readings shown as ranges  ·  V1.1: 📊 Mac / 📱 iPhone toggle; Celsius straddle cards
 
 What this page is for: the last hour of a bet. Hold, or cash out?
 
@@ -189,14 +189,27 @@ def six_hour_max(ts, raw, day_start):
     return None
 
 
-def fetch_obs(stn, day_start):
+def fetch_obs(stn, day_start, now_utc):
+    """NWS observations for today. ⚠️ start + end + explicit limit + paging —
+    start-only returns the OLDEST rows under a default cap (obs_live V2.1 bug:
+    San Antonio's afternoon peak never came back)."""
     url = f"https://api.weather.gov/stations/{stn}/observations"
-    start_iso = day_start.strftime("%Y-%m-%dT%H:%M:%SZ")
-    r = requests.get(url, params={"start": start_iso, "limit": 500},
-                     headers=NWS_HDR, timeout=15)
-    r.raise_for_status()
+    params = {"start": day_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "end": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), "limit": 500}
+    feats, pages = [], 0
+    while url and pages < 4:
+        r = requests.get(url, params=params if pages == 0 else None,
+                         headers=NWS_HDR, timeout=15)
+        r.raise_for_status()
+        body = r.json() or {}
+        got = body.get("features") or []
+        feats.extend(got)
+        pages += 1
+        url = (body.get("pagination") or {}).get("next")
+        if not got:
+            break
     rows, max6 = [], []
-    for feat in r.json().get("features", []):
+    for feat in feats:
         p = feat.get("properties", {})
         c = (p.get("temperature") or {}).get("value")
         tsr = p.get("timestamp")
@@ -206,12 +219,111 @@ def fetch_obs(stn, day_start):
         if ts < day_start:
             continue
         raw = p.get("rawMessage")
-        rows.append(parse_reading(stn, ts, float(c), raw))
+        rd = parse_reading(stn, ts, float(c), raw)
+        rd["src"] = "NWS"
+        rows.append(rd)
         m6 = six_hour_max(ts, raw, day_start)
         if m6 is not None:
             max6.append(m6)
-    rows.sort(key=lambda x: x["ts"])
     return rows, max6
+
+
+# ── Fast feeds ───────────────────────────────────────────────────────────────
+# NWS runs 5-15 min behind. These two close most of that gap:
+#   Synoptic         — the 5-minute readings, usually within a few minutes
+#   aviationweather  — the hourly report, usually within 1-2 min of :51-:53
+def synoptic_token():
+    for path in (("SYNOPTIC_TOKEN",), ("synoptic_token",), ("synoptic", "token")):
+        try:
+            v = st.secrets
+            for k in path:
+                v = v[k]
+            if v:
+                return str(v)
+        except Exception:
+            continue
+    return None
+
+
+def fetch_synoptic(stids, token):
+    """One call, every station, last 3 hours. {stid: [(ts, °F)]} or None."""
+    r = requests.get("https://api.synopticdata.com/v2/stations/timeseries",
+                     params={"stid": ",".join(stids), "vars": "air_temp",
+                             "recent": 180, "units": "english",
+                             "obtimezone": "utc", "qc": "on", "token": token},
+                     timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if (data.get("SUMMARY") or {}).get("RESPONSE_CODE") != 1:
+        return None
+    out = {}
+    for ent in data.get("STATION") or []:
+        ob = ent.get("OBSERVATIONS") or {}
+        times = ob.get("date_time") or []
+        temps = ob.get("air_temp_set_1") or ob.get("air_temp_set_1d") or []
+        rows = []
+        for tsr, f in zip(times, temps):
+            if f is None:
+                continue
+            try:
+                rows.append((dt.datetime.fromisoformat(tsr.replace("Z", "+00:00")),
+                             float(f)))
+            except Exception:
+                continue
+        out[ent.get("STID")] = rows
+    return out
+
+
+def fetch_awc(stids):
+    """Hourly reports straight from aviationweather.gov. {stid: [(ts, raw)]}."""
+    r = requests.get("https://aviationweather.gov/api/data/metar",
+                     params={"ids": ",".join(stids), "format": "json",
+                             "hours": 30},
+                     headers={"User-Agent": NWS_HDR["User-Agent"]}, timeout=15)
+    r.raise_for_status()
+    out = {}
+    for m in r.json() or []:
+        raw = m.get("rawOb") or ""
+        ot = m.get("obsTime")
+        try:
+            ts = (dt.datetime.fromtimestamp(int(ot), pytz.utc) if ot is not None
+                  else dt.datetime.fromisoformat(
+                      str(m.get("reportTime")).replace("Z", "+00:00")
+                      .replace(" ", "T")))
+        except Exception:
+            continue
+        if ts.tzinfo is None:
+            ts = pytz.utc.localize(ts)
+        out.setdefault(m.get("icaoId"), []).append((ts, raw))
+    return out
+
+
+def merge_rows(stn, day_start, nws_rows, nws_max6, syn, awc):
+    """One timeline. Same minute from two sources -> keep the exact one."""
+    rows = list(nws_rows)
+    max6 = list(nws_max6)
+    for ts, f in (syn or []):
+        if ts >= day_start:
+            rd = parse_reading(stn, ts, (f - 32) / 1.8, "")
+            rd["src"] = "Synoptic"
+            rows.append(rd)
+    for ts, raw in (awc or []):
+        if ts < day_start or not TGROUP.search(raw or ""):
+            continue
+        rd = parse_reading(stn, ts, 0.0, raw)
+        rd["src"] = "AWC"
+        rows.append(rd)
+        m6 = six_hour_max(ts, raw, day_start)
+        if m6 is not None:
+            max6.append(m6)
+    best = {}
+    for r in rows:
+        k = r["ts"].replace(second=0, microsecond=0)
+        cur = best.get(k)
+        if cur is None or (r["exact"] and not cur["exact"]):
+            best[k] = r
+    out = sorted(best.values(), key=lambda x: x["ts"])
+    return out, sorted(set(round(v, 1) for v in max6))
 
 
 def summarize(rows, max6, now_utc):
@@ -232,12 +344,105 @@ def summarize(rows, max6, now_utc):
     trend = last["f"] - hour_ago[-1]["f"] if hour_ago else None
     mins_since_max = (now_utc - first_at_max).total_seconds() / 60.0
     past_peak = (mins_since_max >= 60 and last["f"] <= feed_max - 1.5)
+    prior = [r for r in rows[:-1] if not r["exact"]]
+    stepped_up = bool(prior and not last["exact"]
+                      and last["f"] - prior[-1]["f"] >= 1.5
+                      and (now_utc - last["ts"]).total_seconds() <= 20 * 60)
+    new_high = bool(len(rows) > 1 and last["f"] >= feed_max - 0.01
+                    and last["f"] > max(r["f"] for r in rows[:-1]) + 0.01
+                    and (now_utc - last["ts"]).total_seconds() <= 20 * 60)
     return dict(last=last, feed_max=feed_max, base=base, exact_max=exact_max,
                 max_row=max_row, first_at_max=first_at_max, true_lo=true_lo,
                 true_hi=true_hi, floor_settle=floor_settle, trend=trend,
                 mins_since_max=mins_since_max, past_peak=past_peak,
+                stepped_up=stepped_up, new_high=new_high,
+                prev_f=(prior[-1]["f"] if prior else None),
                 age_min=(now_utc - last["ts"]).total_seconds() / 60.0,
                 n=len(rows))
+
+
+# ── Official high: the NWS climate report (CLI) ─────────────────────────────
+# The station's own daily max in whole °F — the number Kalshi settles on.
+# Most offices post a preliminary "high so far" in the late afternoon and the
+# final one after midnight. When it is posted, it replaces every range above.
+CLI_LOC = {"KNYC": "NYC", "KMIA": "MIA", "KATL": "ATL", "KPHL": "PHL",
+           "KDCA": "DCA", "KBOS": "BOS", "KMDW": "MDW", "KAUS": "AUS",
+           "KDFW": "DFW", "KHOU": "HOU", "KOKC": "OKC", "KMSP": "MSP",
+           "KSAT": "SAT", "KMSY": "MSY", "KDEN": "DEN", "KPHX": "PHX",
+           "KLAS": "LAS", "KLAX": "LAX", "KSEA": "SEA", "KSFO": "SFO"}
+MONTHS = {m: i for i, m in enumerate(
+    ["JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
+     "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"], 1)}
+_CLI_CACHE = {}
+
+
+def parse_cli(text, tz_name):
+    """-> dict(date, max_f, prelim, asof_utc) or None."""
+    t = (text or "").upper()
+    m = re.search(r"CLIMATE SUMMARY FOR\s+([A-Z]+)\s+(\d{1,2})\s+(\d{4})", t)
+    if not m or m.group(1) not in MONTHS:
+        return None
+    day = dt.date(int(m.group(3)), MONTHS[m.group(1)], int(m.group(2)))
+    mx = re.search(r"TEMPERATURE \(F\).*?MAXIMUM\s+(-?\d+)", t, re.S)
+    if not mx:
+        return None
+    prelim = "VALID TODAY AS OF" in t
+    asof_utc = None
+    a = re.search(r"VALID TODAY AS OF\s+(\d{1,2})(\d{2})\s*(AM|PM)", t)
+    if a:
+        hh = int(a.group(1)) % 12 + (12 if a.group(3) == "PM" else 0)
+        tz = pytz.timezone(tz_name)
+        # CLI times are local STANDARD time
+        noon = tz.localize(dt.datetime(day.year, day.month, day.day, 12))
+        std = noon.utcoffset() - (noon.dst() or dt.timedelta(0))
+        naive = dt.datetime(day.year, day.month, day.day, hh, int(a.group(2)))
+        asof_utc = pytz.utc.localize(naive - std)
+    return dict(date=day, max_f=int(mx.group(1)), prelim=prelim,
+                asof_utc=asof_utc)
+
+
+def fetch_official(stn, tz_name, local_date):
+    """Latest CLI for today's date, cached 5 minutes. None if not posted."""
+    key = (stn, local_date)
+    hit = _CLI_CACHE.get(key)
+    if hit and (dt.datetime.now(pytz.utc) - hit[0]).total_seconds() < 300:
+        return hit[1]
+    loc = CLI_LOC.get(stn)
+    found = None
+    try:
+        r = requests.get(
+            f"https://api.weather.gov/products/types/CLI/locations/{loc}",
+            headers=NWS_HDR, timeout=12)
+        r.raise_for_status()
+        for prod in (r.json().get("@graph") or [])[:3]:
+            pr = requests.get(f"https://api.weather.gov/products/{prod['id']}",
+                              headers=NWS_HDR, timeout=12)
+            pr.raise_for_status()
+            c = parse_cli(pr.json().get("productText", ""), tz_name)
+            if c and c["date"] == local_date:
+                found = c
+                break
+    except Exception:
+        found = None
+    _CLI_CACHE[key] = (dt.datetime.now(pytz.utc), found)
+    return found
+
+
+def apply_official(s, off):
+    """Fold the official high into the summary. Once it's posted and the
+    station is past peak after the as-of time, the answer is locked."""
+    s["official"] = off
+    s["locked"] = False
+    if not off:
+        return s
+    M = off["max_f"]
+    s["floor_settle"] = max(s["floor_settle"], M)
+    if not off["prelim"]:
+        s["locked"] = True
+    elif (s["past_peak"] and off["asof_utc"] is not None
+          and off["asof_utc"] >= s["first_at_max"]):
+        s["locked"] = True
+    return s
 
 
 # ── Settle odds from this account's own calibration ─────────────────────────
@@ -266,6 +471,8 @@ def calibration_diffs():
 
 def settle_odds(s, diffs):
     """{whole degree: probability} for where CLI prints, IF the high is in."""
+    if s.get("locked"):
+        return {s["official"]["max_f"]: 1.0}
     counts = {}
     for d in diffs:
         k = max(settle_round(s["base"] + d), s["floor_settle"])
@@ -394,6 +601,13 @@ def verdict(b, s, odds):
         return ("v-sell", "DEAD — SELL FOR ANY BID",
                 f"The high is already at least {s['floor_settle']}°, above "
                 f"this bracket. It cannot win.")
+    if s.get("locked"):
+        won = in_bracket(s["official"]["max_f"], b)
+        return (("v-hold", "WINNER — HOLD TO SETTLE",
+                 f"Official high {s['official']['max_f']}° is in this bracket.")
+                if won else
+                ("v-sell", "LOST — SELL FOR ANY BID",
+                 f"Official high {s['official']['max_f']}° is outside this bracket."))
     if not s["past_peak"]:
         if b["lo"] is not None and b["lo"] > s["true_hi"]:
             return ("v-wait", "STILL WARMING — NEEDS MORE HEAT",
@@ -418,15 +632,24 @@ def verdict(b, s, odds):
 
 
 # ── Fetch everything, in parallel, once a minute ─────────────────────────────
-def load_city(city, now_utc):
+def load_city(city, now_utc, syn_all, awc_all):
     stn, series, tz = CITIES[city]
     day_start, local_date = climate_day_start(tz, now_utc)
     out = dict(city=city, stn=stn, tz=tz, rows=[], s=None, ladder=[],
                obs_err=None, k_err=None)
     try:
-        rows, max6 = fetch_obs(stn, day_start)
+        try:
+            nws_rows, nws_max6 = fetch_obs(stn, day_start, now_utc)
+        except Exception as e:
+            nws_rows, nws_max6 = [], []
+            out["obs_err"] = "NWS: " + str(e)[:80]
+        rows, max6 = merge_rows(stn, day_start, nws_rows, nws_max6,
+                                (syn_all or {}).get(stn), (awc_all or {}).get(stn))
         out["rows"] = rows
         out["s"] = summarize(rows, max6, now_utc)
+        if out["s"]:
+            out["obs_err"] = None
+            apply_official(out["s"], fetch_official(stn, tz, local_date))
     except Exception as e:
         out["obs_err"] = str(e)[:120]
     try:
@@ -439,9 +662,24 @@ def load_city(city, now_utc):
 @st.cache_data(ttl=55, show_spinner=False)
 def load_all(minute_key):
     now_utc = dt.datetime.now(pytz.utc)
+    stids = [v[0] for v in CITIES.values()]
+    feeds = {"Synoptic": "no token in secrets", "AWC": "ok"}
+    syn_all, awc_all = None, None
+    tok = synoptic_token()
+    if tok:
+        try:
+            syn_all = fetch_synoptic(stids, tok)
+            feeds["Synoptic"] = "ok" if syn_all is not None else "error"
+        except Exception as e:
+            feeds["Synoptic"] = "error: " + str(e)[:60]
+    try:
+        awc_all = fetch_awc(stids)
+    except Exception as e:
+        feeds["AWC"] = "error: " + str(e)[:60]
     with ThreadPoolExecutor(max_workers=10) as ex:
-        res = list(ex.map(lambda c: load_city(c, now_utc), CITIES))
-    return {r["city"]: r for r in res}, now_utc
+        res = list(ex.map(lambda c: load_city(c, now_utc, syn_all, awc_all),
+                          CITIES))
+    return {r["city"]: r for r in res}, now_utc, feeds
 
 
 def local_hm(ts, tz):
@@ -467,7 +705,7 @@ if "desk_city" not in st.session_state:
 @st.fragment(run_every=60)
 def desk():
     minute_key = dt.datetime.now(pytz.utc).strftime("%Y%m%d%H%M")
-    data, now_utc = load_all(minute_key)
+    data, now_utc, feeds = load_all(minute_key)
     diffs, diff_src = calibration_diffs()
 
     city = st.selectbox("City", list(CITIES), key="desk_city")
@@ -479,6 +717,31 @@ def desk():
         return
 
     last = s["last"]
+    tzl = pytz.timezone(d["tz"])
+    nowl = now_utc.astimezone(tzl)
+    nxt = nowl.replace(minute=51, second=0, microsecond=0)
+    if nowl.minute >= 51:
+        nxt += dt.timedelta(hours=1)
+    mins_to = int((nxt - nowl).total_seconds() // 60)
+    if s.get("new_high") and not s.get("locked"):
+        st.markdown(
+            f"<div class='verdict v-wait'>⬆ NEW HIGH — {last['f']:.1f}° at "
+            f"{local_hm(last['ts'], d['tz'])}"
+            f"<div class='v-why'>High is now {last['lo']:.1f}–{last['hi']:.1f}°. "
+            f"Brackets above just got more likely.</div></div>",
+            unsafe_allow_html=True)
+    elif s.get("stepped_up") and not s.get("locked"):
+        st.markdown(
+            f"<div class='verdict v-wait'>⬆ STEPPED UP — {s['prev_f']:.1f}° → "
+            f"{last['f']:.1f}° at {local_hm(last['ts'], d['tz'])}"
+            f"<div class='v-why'>Now {last['lo']:.1f}–{last['hi']:.1f}°.</div></div>",
+            unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='sm'>⏱ next hourly report in <b style='color:#fff'>{mins_to} min</b> "
+        f"({nxt.strftime('%-I:%M%p').lower()} local, exact reading usually posts "
+        f"by :55) · latest reading via {last.get('src', 'NWS')}, "
+        f"{s['age_min']:.0f} min old · feeds: Synoptic {feeds['Synoptic']}, "
+        f"aviationweather {feeds['AWC']}</div>", unsafe_allow_html=True)
     odds = settle_odds(s, diffs)
     top = [kv for kv in sorted(odds.items(), key=lambda kv: -kv[1])[:3]
            if kv[1] >= 0.01]
@@ -493,6 +756,25 @@ def desk():
     peak_txt = ("PAST PEAK" if s["past_peak"] else "STILL IN PLAY")
     peak_col = "#00ff88" if s["past_peak"] else "#fbbf24"
     stale = s["age_min"] > 25
+
+    off = s.get("official")
+    if off:
+        state = ("FINAL" if not off["prelim"] else
+                 "LOCKED — this is the settle" if s["locked"] else
+                 "can still go up if it warms again")
+        asof = (f" · as of {local_hm(off['asof_utc'], d['tz'])} local"
+                if off.get("asof_utc") else "")
+        st.markdown(
+            f"<div class='card' style='border:2px solid #00ff88'>"
+            f"<div class='lbl'>Official high so far · NWS climate report{asof}</div>"
+            f"<div class='big' style='color:#00ff88'>{off['max_f']}°F</div>"
+            f"<div class='sm'>{state}</div></div>", unsafe_allow_html=True)
+    else:
+        st.markdown(
+            "<div class='card'><div class='lbl'>Official high so far</div>"
+            "<div class='sm'>Not posted yet — NWS usually posts it late afternoon. "
+            "Until then, the ranges below are the best available.</div></div>",
+            unsafe_allow_html=True)
 
     if is_mobile:
         r1 = st.columns(2)
@@ -532,11 +814,12 @@ def desk():
 
     # ── Celsius straddle: which brackets the readings can really be in ──
     ladder = d["ladder"]
-    sc1, sc2 = (st.container(), st.container()) if is_mobile else st.columns(2)
-    sc1.markdown(straddle_html("High so far can be", s["true_lo"], s["true_hi"],
-                               ladder), unsafe_allow_html=True)
-    sc2.markdown(straddle_html("Right now can be", last["lo"], last["hi"],
-                               ladder), unsafe_allow_html=True)
+    if not s.get("locked"):       # once the official high locks, ranges are moot
+        sc1, sc2 = (st.container(), st.container()) if is_mobile else st.columns(2)
+        sc1.markdown(straddle_html("High so far can be", s["true_lo"],
+                                   s["true_hi"], ladder), unsafe_allow_html=True)
+        sc2.markdown(straddle_html("Right now can be", last["lo"], last["hi"],
+                                   ladder), unsafe_allow_html=True)
 
     # ── Position call ──
     if d["k_err"] or not ladder:
@@ -577,7 +860,7 @@ def desk():
                         "°F": f"{r['f']:.1f}",
                         "True temp": ("exact" if r["exact"]
                                       else f"{r['lo']:.1f}–{r['hi']:.1f}"),
-                        "Type": r["kind"]})
+                        "Type": r["kind"], "Source": r.get("src", "")})
         st.dataframe(rec, hide_index=True)
         if s["exact_max"]:
             st.caption(f"Highest exact reading today: {s['exact_max']:.1f}°")
@@ -598,13 +881,15 @@ def desk():
             "City": c,
             "Now": f"{ss['last']['f']:.0f}°",
             "High": f"{ss['base']:.0f}° ({ss['true_lo']:.0f}–{ss['true_hi']:.0f})",
+            "Official": (f"{ss['official']['max_f']}°" if ss.get("official")
+                         else "—"),
             "At least": f"{ss['floor_settle']}°",
             "Peak": "past" if ss["past_peak"] else "in play",
             "Favorite": f"{fav['label']} @ {fav['ask']}¢" if fav else "—",
             "Updated": f"{ss['age_min']:.0f}m ago",
         })
     if is_mobile:
-        board = [{k: r.get(k, "—") for k in ("City", "Now", "High", "Peak")}
+        board = [{k: r.get(k, "—") for k in ("City", "Now", "Official", "Peak")}
                  for r in board]
     st.dataframe(board, hide_index=True)
     st.caption(f"Last refresh {now_utc.astimezone(pytz.timezone('America/New_York')).strftime('%-I:%M:%S %p')} ET")
