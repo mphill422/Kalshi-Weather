@@ -818,6 +818,14 @@ if dupe_cities:
         f'Check GitHub Actions → obs_live.yml.')
 
 
+# ── Live Desk link ───────────────────────────────────────────────────────────
+# The header (and with it the sidebar arrow) is hidden above, so the page
+# switcher is unreachable on desktop. This button is the way in.
+try:
+    st.page_link("pages/1_Live_Desk.py", label="🌡️  OPEN LIVE DESK — last-hour hold / cash-out")
+except Exception:
+    st.markdown("[🌡️ OPEN LIVE DESK](/Live_Desk)")
+
 # ── 0. DECISION BOARD ────────────────────────────────────────────────────────
 # ⚠️ V6.4. Exists because the old flow was twenty clicks to answer one question.
 st.markdown('<div class="sec">🎯 Decision Board — who is still undecided</div>',
