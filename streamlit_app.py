@@ -199,6 +199,13 @@ LIVE_SIGMA_MIN = 0.80
 
 # NWS point forecast, keyed by ICAO. EXACT for every station, no guessing —
 # the code IS the identifier. Same forecast source the consensus table uses.
+# Display order for the decision board — matches the Live Desk.
+CITY_ORDER = ['New York', 'Miami', 'Atlanta', 'Philadelphia', 'Washington DC',
+              'Boston', 'Chicago', 'Austin', 'Dallas', 'Houston',
+              'Oklahoma City', 'Minneapolis', 'San Antonio', 'New Orleans',
+              'Denver', 'Phoenix', 'Las Vegas', 'Los Angeles', 'Seattle',
+              'San Francisco']
+
 CITY_STATION = {
     'Atlanta': 'KATL',        'Austin': 'KAUS',
     'Boston': 'KBOS',         'Washington DC': 'KDCA',
@@ -958,7 +965,11 @@ else:
             'NWS': nws_url(city),
             'TWC': twc_url(city),
         })
-    board.sort(key=lambda x: x['_sort'])
+    # V6.5: fixed city order, same as the Live Desk (East -> Central ->
+    # Mountain -> West), per Mike 2026-09-20. The old undecided-first ranking
+    # is still computed in _sort; it now only breaks ties for unlisted cities.
+    board.sort(key=lambda x: (CITY_ORDER.index(x['City'])
+                              if x['City'] in CITY_ORDER else 99, x['_sort']))
     for b in board:
         b.pop('_sort', None)
     st.dataframe(
