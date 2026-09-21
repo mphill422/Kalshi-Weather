@@ -1519,8 +1519,8 @@ st.markdown('<div class="sec">📊 Results</div>', unsafe_allow_html=True)
 
 settled_fav = [b for b in favs_all if b.get('result') in ('Won', 'Lost')]
 
-tab_kill, tab_win, tab_day, tab_acc = st.tabs(
-    ['Kill line', 'By window', 'By day', 'Consensus accuracy'])
+tab_kill, tab_win, tab_day, tab_acc, tab_leads = st.tabs(
+    ['Kill line', 'By window', 'By day', 'Consensus accuracy', 'Leads'])
 
 with tab_kill:
     # ⚠️ V6.4. The kill line is the only number that governs what happens next,
@@ -1660,6 +1660,127 @@ with tab_acc:
 
 
 # ── 5. TODAY'S CONSENSUS ─────────────────────────────────────────────────────
+# ── LEADS — candidate edges tracked automatically (added 2026-09-20) ─────────
+# A lead is a pattern that survived a first half-split but is not proven.
+# Each one is tested the way the dead ones died: ONE ROW PER CITY-DAY (the
+# snapshot hours double-count), a first-half / second-half split by DATE, a
+# by-day check (price bands died because one Tuesday carried $18.59 of
+# $23.09), and a 20-DAY minimum. Snapshots only — never pooled with bets.
+LEADS = [
+    dict(name='Midday 60-69c favorite',
+         labels=('T1200', 'T1300'), lo=60, hi=69,
+         action='raise the MIDDAY floor from 58c to 60c',
+         note='2026-09-20 first look: +11.5 then +3.8 (fading). Same family as '
+              'the dead "price bands within 58-79" — the by-day check is the one '
+              'that killed that, so it gates this.'),
+]
+LEAD_MIN_DAYS = 20
+
+
+@st.cache_data(ttl=900)
+def fetch_lead_rows(labels, lo, hi):
+    rows, off = [], 0
+    while off < 20000:
+        page = sb_get('favorites_snapshots', {
+            'select': 'date,city,snap_label,yes_ask_cents,result,sigma_p',
+            'snap_label': 'in.(' + ','.join(labels) + ')',
+            'and': f'(yes_ask_cents.gte.{lo},yes_ask_cents.lte.{hi})',
+            'result': 'in.(Won,Lost)',
+            'sigma_p': 'gte.0.80',
+            'order': 'date.asc',
+            'limit': '1000', 'offset': str(off)})
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        off += 1000
+    return rows
+
+
+def lead_report(rows):
+    """One row per city-day (latest hour wins), then halves + by-day."""
+    best = {}
+    for r in rows:
+        k = (r.get('date'), r.get('city'))
+        if k not in best or (r.get('snap_label') or '') > (best[k].get('snap_label') or ''):
+            best[k] = r
+    picks = list(best.values())
+    for p in picks:
+        ask = int(p.get('yes_ask_cents') or 0)
+        p['_won'] = 1 if p.get('result') == 'Won' else 0
+        p['_pnl'] = (100 if p['_won'] else 0) - ask - kalshi_fee_cents(ask)
+    days = sorted({p['date'] for p in picks})
+    if not days:
+        return None
+    mid = days[len(days) // 2] if len(days) > 1 else days[0]
+
+    def stats(sub):
+        if not sub:
+            return dict(n=0, days=0, win=0.0, ask=0.0, margin=0.0)
+        n = len(sub)
+        win = 100.0 * sum(p['_won'] for p in sub) / n
+        ask = sum(int(p['yes_ask_cents']) for p in sub) / n
+        fee = sum(kalshi_fee_cents(int(p['yes_ask_cents'])) for p in sub) / n
+        return dict(n=n, days=len({p['date'] for p in sub}), win=win, ask=ask,
+                    margin=win - ask - fee)
+
+    h1 = stats([p for p in picks if p['date'] < mid])
+    h2 = stats([p for p in picks if p['date'] >= mid])
+    allm = stats(picks)
+    by_day = {}
+    for p in picks:
+        d = by_day.setdefault(p['date'], dict(n=0, won=0, pnl=0.0))
+        d['n'] += 1
+        d['won'] += p['_won']
+        d['pnl'] += p['_pnl']
+    total = sum(d['pnl'] for d in by_day.values())
+    top_day = max(by_day.items(), key=lambda kv: kv[1]['pnl'])
+    top_share = (top_day[1]['pnl'] / total) if total > 0 else None
+    return dict(days=days, mid=mid, h1=h1, h2=h2, all=allm, by_day=by_day,
+                total=total, top_day=top_day, top_share=top_share)
+
+
+with tab_leads:
+    st.caption('Candidate edges from the snapshot table, tested one row per '
+               'city-day, split in half by date, checked day by day, and held '
+               f'until {LEAD_MIN_DAYS} days. Margins are AFTER the entry fee. '
+               'Nothing here changes a bet until it says PASSES.')
+    for L in LEADS:
+        rep = lead_report(fetch_lead_rows(L['labels'], L['lo'], L['hi']))
+        st.markdown(f"**{L['name']}**")
+        if not rep:
+            st.caption('No settled rows yet.')
+            continue
+        nd = len(rep['days'])
+        h1, h2 = rep['h1'], rep['h2']
+        if h1['n'] and h2['n'] and (h1['margin'] <= 0 or h2['margin'] <= 0):
+            verdict, box = ('❌ FAILING — one half is at or below zero after fees.',
+                            st.error)
+        elif rep['top_share'] is not None and rep['top_share'] > 0.5:
+            verdict, box = (f"⚠️ ONE DAY CARRIES IT — {rep['top_day'][0]} is "
+                            f"{rep['top_share']*100:.0f}% of the profit.", st.warning)
+        elif rep['total'] <= 0:
+            verdict, box = ('❌ FAILING — losing money overall after fees.', st.error)
+        elif nd < LEAD_MIN_DAYS:
+            verdict, box = (f'⏳ HOLDING — {nd} of {LEAD_MIN_DAYS} days. Both halves '
+                            'positive so far.', st.info)
+        else:
+            verdict, box = (f"✅ PASSES at {nd} days — candidate: {L['action']}.",
+                            st.success)
+        box(verdict)
+        c1, c2, c3 = st.columns(3)
+        for col, lab, m in ((c1, f"1st half (before {rep['mid']})", h1),
+                            (c2, f"2nd half ({rep['mid']} on)", h2),
+                            (c3, 'All', rep['all'])):
+            col.metric(lab, f"{m['margin']:+.1f} pts",
+                       f"n={m['n']} · {m['days']}d · {m['win']:.0f}% @ {m['ask']:.0f}c",
+                       delta_color='off')
+        st.dataframe(pd.DataFrame([
+            {'date': d, 'n': v['n'], 'won': v['won'],
+             'P&L per contract (c)': round(v['pnl'], 1)}
+            for d, v in sorted(rep['by_day'].items())]),
+            use_container_width=True, hide_index=True)
+        st.caption(L['note'])
+
 st.markdown('<div class="sec">🎯 Today\'s Consensus</div>', unsafe_allow_html=True)
 
 cons_rows = fetch_today_consensus()
