@@ -9,7 +9,14 @@ It checks the exact things that died unnoticed:
   CHECK 2  obs_high feed     — is wethr authenticating? (the dead-key catcher)
   CHECK 3  ensemble feed     — is Open-Meteo GFS coming back?
   CHECK 4  settlement lag    — are settlements getting actuals from Iowa CLI?
-  CHECK 5  bet settlement lag — are paper bets resolving?
+  CHECK 5  bet settlement lag — are FAV bets resolving? (favorites_bets)
+  CHECK 6  bets written       — did yesterday's FAV runs actually write rows?
+  CHECK 7  snapshots written  — did yesterday's snapshot hours write rows?
+
+  V2 (2026-09-20): CHECK 5 pointed at the retired V5 `bets` table, which
+  nothing settles any more — it failed every night on 29 dead rows. It now
+  reads favorites_bets. CHECKS 6-7 catch the silent PGRST204 failure mode
+  (job exits green, writes nothing) that cost 09-09, 09-10 and 09-19 morning.
 
 If ANY hard check fails, the script exits non-zero. A failed GitHub Actions run
 emails you automatically (no SMTP setup needed) — that's the alert. Green days
@@ -120,15 +127,47 @@ def main():
                     f'{len(stale_settles)} settlement row(s) older than {SETTLE_LAG_DAYS}d still have no actual',
                     'CLI settlement pass not resolving — check fetch_cli_max_temp / run_settlement_pass.' if not ok4 else ''))
 
-    # CHECK 5 — bet settlement lag
+    # CHECK 5 — bet settlement lag (live FAV table, not the retired `bets`)
     bet_cutoff = (today - timedelta(days=BET_LAG_DAYS)).strftime('%Y-%m-%d')
-    stale_bets = sb_get('bets', {'or': '(result.eq.Pending,result.is.null)',
-                                 'date': 'lt.' + bet_cutoff,
-                                 'select': 'date,city', 'limit': '500'})
-    ok5 = len(stale_bets) == 0
-    results.append((ok5, 'bet settlement lag',
-                    f'{len(stale_bets)} bet(s) older than {BET_LAG_DAYS}d still Pending',
-                    'Bet settlement not resolving — check settlement pass bet-matching.' if not ok5 else ''))
+    try:
+        stale_bets = sb_get('favorites_bets',
+                            {'or': '(result.is.null,result.ilike.pending)',
+                             'date': 'lt.' + bet_cutoff,
+                             'select': 'date,city', 'limit': '500'})
+        ok5 = len(stale_bets) == 0
+        results.append((ok5, 'bet settlement lag (favorites_bets)',
+                        f'{len(stale_bets)} bet(s) older than {BET_LAG_DAYS}d still Pending',
+                        'FAV bet settlement not resolving — check the settle step in fetch_favorites.py.' if not ok5 else ''))
+    except Exception as e:
+        results.append((False, 'bet settlement lag (favorites_bets)',
+                        f'could not read favorites_bets: {str(e)[:80]}',
+                        'Check SUPABASE_KEY can read favorites_bets.'))
+
+    yday = (today - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    # CHECK 6 — did yesterday's bet runs write anything? (PGRST204 catcher)
+    try:
+        yb = sb_get('favorites_bets', {'date': 'eq.' + yday, 'select': 'id', 'limit': '500'})
+        ok6 = len(yb) > 0
+        results.append((ok6, 'bets written yesterday',
+                        f'{len(yb)} favorites_bets row(s) on {yday}',
+                        'Zero bets logged — almost always a missing Supabase column (PGRST204). '
+                        'Open the Favorites run log and search for PGRST204.' if not ok6 else ''))
+    except Exception as e:
+        results.append((False, 'bets written yesterday', f'read failed: {str(e)[:80]}', ''))
+
+    # CHECK 7 — did yesterday's snapshot hours write? 20 rows per hour expected
+    try:
+        ys = sb_get('favorites_snapshots', {'date': 'eq.' + yday, 'select': 'snap_label', 'limit': '1000'})
+        hours = sorted({r.get('snap_label') for r in ys if r.get('snap_label')})
+        ok7 = len(hours) >= 8
+        results.append((ok7, 'snapshots written yesterday',
+                        f'{len(ys)} rows across {len(hours)} of 10 hours on {yday} '
+                        f'({", ".join(hours) if hours else "none"})',
+                        'Snapshot hours missing — check cron-job.org history for the missing hours, '
+                        'then the Favorites run log for PGRST204.' if not ok7 else ''))
+    except Exception as e:
+        results.append((False, 'snapshots written yesterday', f'read failed: {str(e)[:80]}', ''))
 
     # ── report ────────────────────────────────────────────────────────────────
     any_fail = False
