@@ -1,5 +1,5 @@
 """
-Live Desk — V1.4 (2026-09-19)  ·  V1.4: Synoptic + aviationweather fast feeds, STEPPED UP / NEW HIGH flash, :51 countdown  ·  V1.3: official NWS high (whole °F) card; locks the call when posted  ·  V1.2: KBOS/KMSP on-grid readings shown as ranges  ·  V1.1: 📊 Mac / 📱 iPhone toggle; Celsius straddle cards
+Live Desk — V1.6 (2026-09-20)  ·  V1.6: CLI as-of stamp is local clock time, not standard (was an hour ahead)  ·  V1.5: official-high fix — overnight partial report no longer read as FINAL  ·  V1.4: Synoptic + aviationweather fast feeds, STEPPED UP / NEW HIGH flash, :51 countdown  ·  V1.3: official NWS high (whole °F) card; locks the call when posted  ·  V1.2: KBOS/KMSP on-grid readings shown as ranges  ·  V1.1: 📊 Mac / 📱 iPhone toggle; Celsius straddle cards
 
 What this page is for: the last hour of a bet. Hold, or cash out?
 
@@ -386,46 +386,51 @@ def parse_cli(text, tz_name):
     mx = re.search(r"TEMPERATURE \(F\).*?MAXIMUM\s+(-?\d+)", t, re.S)
     if not mx:
         return None
-    prelim = "VALID TODAY AS OF" in t
+    # ⚠️ Any "VALID ... AS OF" wording means partial. The overnight report says
+    # "VALID AS OF 1259 AM" and carries a max of whatever it hit by midnight —
+    # reading that as final locked San Antonio to 79 on a 94-degree day.
+    prelim = "AS OF" in t
     asof_utc = None
-    a = re.search(r"VALID TODAY AS OF\s+(\d{1,2})(\d{2})\s*(AM|PM)", t)
+    a = re.search(r"VALID(?:\s+TODAY)?\s+AS OF\s+(\d{1,2})(\d{2})\s*(AM|PM)", t)
     if a:
         hh = int(a.group(1)) % 12 + (12 if a.group(3) == "PM" else 0)
         tz = pytz.timezone(tz_name)
-        # CLI times are local STANDARD time
-        noon = tz.localize(dt.datetime(day.year, day.month, day.day, 12))
-        std = noon.utcoffset() - (noon.dst() or dt.timedelta(0))
+        # ⚠️ "VALID TODAY AS OF ... LOCAL TIME" is the local CLOCK time. Only
+        # the observation-time column inside the report is standard time.
+        # Shifting this by the DST hour put the as-of stamp in the future.
         naive = dt.datetime(day.year, day.month, day.day, hh, int(a.group(2)))
-        asof_utc = pytz.utc.localize(naive - std)
+        asof_utc = tz.localize(naive).astimezone(pytz.utc)
     return dict(date=day, max_f=int(mx.group(1)), prelim=prelim,
                 asof_utc=asof_utc)
 
 
 def fetch_official(stn, tz_name, local_date):
-    """Latest CLI for today's date, cached 5 minutes. None if not posted."""
+    """Best CLI for today: read the recent products, keep the HIGHEST max for
+    today's date (a later report can only be equal or warmer). Cached 5 min."""
     key = (stn, local_date)
     hit = _CLI_CACHE.get(key)
     if hit and (dt.datetime.now(pytz.utc) - hit[0]).total_seconds() < 300:
         return hit[1]
     loc = CLI_LOC.get(stn)
-    found = None
+    best = None
     try:
         r = requests.get(
             f"https://api.weather.gov/products/types/CLI/locations/{loc}",
             headers=NWS_HDR, timeout=12)
         r.raise_for_status()
-        for prod in (r.json().get("@graph") or [])[:3]:
+        for prod in (r.json().get("@graph") or [])[:4]:
             pr = requests.get(f"https://api.weather.gov/products/{prod['id']}",
                               headers=NWS_HDR, timeout=12)
             pr.raise_for_status()
             c = parse_cli(pr.json().get("productText", ""), tz_name)
-            if c and c["date"] == local_date:
-                found = c
-                break
+            if not c or c["date"] != local_date:
+                continue
+            if best is None or c["max_f"] > best["max_f"]:
+                best = c
     except Exception:
-        found = None
-    _CLI_CACHE[key] = (dt.datetime.now(pytz.utc), found)
-    return found
+        best = None
+    _CLI_CACHE[key] = (dt.datetime.now(pytz.utc), best)
+    return best
 
 
 def apply_official(s, off):
@@ -433,9 +438,16 @@ def apply_official(s, off):
     station is past peak after the as-of time, the answer is locked."""
     s["official"] = off
     s["locked"] = False
+    s["official_stale"] = False
     if not off:
         return s
     M = off["max_f"]
+    # ⚠️ An official high BELOW what the station has already measured is a
+    # partial report, not the answer. Never lock on it.
+    if M < settle_round(s["true_lo"]):
+        s["official_stale"] = True
+        s["official"] = None
+        return s
     s["floor_settle"] = max(s["floor_settle"], M)
     if not off["prelim"]:
         s["locked"] = True
@@ -774,11 +786,15 @@ def desk():
             f"<div class='big' style='color:#00ff88'>{off['max_f']}°F</div>"
             f"<div class='sm'>{state}</div></div>", unsafe_allow_html=True)
     else:
+        note = ("Latest NWS report is an earlier partial one, already below "
+                "what the station has measured — ignoring it until the "
+                "afternoon report posts."
+                if s.get("official_stale") else
+                "Not posted yet — NWS usually posts it late afternoon. "
+                "Until then, the ranges below are the best available.")
         st.markdown(
-            "<div class='card'><div class='lbl'>Official high so far</div>"
-            "<div class='sm'>Not posted yet — NWS usually posts it late afternoon. "
-            "Until then, the ranges below are the best available.</div></div>",
-            unsafe_allow_html=True)
+            f"<div class='card'><div class='lbl'>Official high so far</div>"
+            f"<div class='sm'>{note}</div></div>", unsafe_allow_html=True)
 
     if is_mobile:
         r1 = st.columns(2)
