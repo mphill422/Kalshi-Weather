@@ -133,6 +133,7 @@ Secrets: supabase.url, supabase.key, app_password (optional).
 """
 
 import re
+import math
 import requests
 import pandas as pd
 import streamlit as st
@@ -1530,8 +1531,9 @@ st.markdown('<div class="sec">📊 Results</div>', unsafe_allow_html=True)
 
 settled_fav = [b for b in favs_all if b.get('result') in ('Won', 'Lost')]
 
-tab_kill, tab_win, tab_day, tab_acc, tab_leads = st.tabs(
-    ['Kill line', 'By window', 'By day', 'Consensus accuracy', 'Leads'])
+tab_kill, tab_win, tab_day, tab_acc, tab_leads, tab_cal = st.tabs(
+    ['Kill line', 'By window', 'By day', 'Consensus accuracy', 'Leads',
+     'Model calibration'])
 
 with tab_kill:
     # ⚠️ V6.4. The kill line is the only number that governs what happens next,
@@ -1791,6 +1793,159 @@ with tab_leads:
             for d, v in sorted(rep['by_day'].items())]),
             use_container_width=True, hide_index=True)
         st.caption(L['note'])
+
+# ── MODEL CALIBRATION (added 2026-09-23) ────────────────────────────────────
+# Does the Live Desk's "97 (56%)" actually land 56% of the time?
+#
+# Nothing extra is logged for this. Every settled city-day already has the two
+# numbers the model uses: obs_live.day_max_f (the feed max) and
+# settlements.actual (what CLI printed) — the max_vs_settled view.
+#
+# ⚠️ LEAVE ONE OUT. A day's own error is never allowed into the distribution
+# used to predict it, or the model is being graded on an answer sheet it was
+# handed. That inflates every score and is the classic way a calibration
+# check comes back looking perfect.
+CAL_MIN_N = 40
+
+
+@st.cache_data(ttl=900)
+def fetch_calibration_rows():
+    rows, off = [], 0
+    while off < 20000:
+        page = sb_get('max_vs_settled',
+                      {'select': 'city,local_date,day_max_f,actual,diff',
+                       'order': 'local_date.asc', 'limit': '1000',
+                       'offset': str(off)})
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        off += 1000
+    return [r for r in rows
+            if r.get('day_max_f') is not None and r.get('actual') is not None]
+
+
+def cal_predict(day_max, diffs):
+    """The Live Desk's distribution: feed max + this account's measured error."""
+    out = {}
+    for d in diffs:
+        k = int(math.floor(day_max + d + 0.5))
+        out[k] = out.get(k, 0) + 1
+    n = float(len(diffs))
+    return {k: v / n for k, v in out.items()}
+
+
+def cal_score(rows):
+    if len(rows) < 10:
+        return None
+    all_diff = [float(r['diff']) for r in rows]
+    recs = []
+    for i, r in enumerate(rows):
+        diffs = all_diff[:i] + all_diff[i + 1:]          # leave one out
+        dist = cal_predict(float(r['day_max_f']), diffs)
+        actual = int(round(float(r['actual'])))
+        top_k, top_p = max(dist.items(), key=lambda kv: kv[1])
+        p_actual = dist.get(actual, 0.0)
+        brier = sum((p - (1.0 if k == actual else 0.0)) ** 2
+                    for k, p in dist.items())
+        brier += sum(1.0 for k in [actual] if k not in dist)   # missed outcome
+        naive = int(math.floor(float(r['day_max_f']) + 0.5))
+        recs.append(dict(date=r['local_date'], city=r['city'], actual=actual,
+                         top_k=top_k, top_p=top_p, hit=int(top_k == actual),
+                         p_actual=p_actual, brier=brier,
+                         naive_hit=int(naive == actual)))
+    return recs
+
+
+def cal_summary(recs):
+    n = len(recs)
+    return dict(n=n,
+                claimed=100.0 * sum(r['top_p'] for r in recs) / n,
+                actual=100.0 * sum(r['hit'] for r in recs) / n,
+                naive=100.0 * sum(r['naive_hit'] for r in recs) / n,
+                brier=sum(r['brier'] for r in recs) / n,
+                p_actual=100.0 * sum(r['p_actual'] for r in recs) / n)
+
+
+with tab_cal:
+    st.caption("Grades the model's own percentages against what settled, "
+               "leave-one-out so no day helps predict itself. The question is "
+               "whether a printed 56% really lands 56% of the time — if it "
+               "does not, the duel panel and the hold/cash-out call are "
+               "reading from a broken ruler.")
+    cal_rows = fetch_calibration_rows()
+    recs = cal_score(cal_rows)
+    if not recs:
+        st.info('Not enough settled city-days with a feed max yet. '
+                'obs_live starts 2026-09-07 and adds ~20 rows a day.')
+    else:
+        S = cal_summary(recs)
+        gap = S['actual'] - S['claimed']
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric('Top pick says', f"{S['claimed']:.1f}%", f"n={S['n']}",
+                  delta_color='off')
+        c2.metric('Top pick lands', f"{S['actual']:.1f}%", f"{gap:+.1f} pts",
+                  delta_color='normal' if abs(gap) < 5 else 'inverse')
+        c3.metric('Plain rounding lands', f"{S['naive']:.1f}%",
+                  f"{S['actual'] - S['naive']:+.1f} vs model", delta_color='off')
+        c4.metric('Brier (lower better)', f"{S['brier']:.3f}",
+                  f"{S['p_actual']:.0f}% on the true value", delta_color='off')
+        if S['n'] < CAL_MIN_N:
+            st.info(f"⏳ {S['n']} city-days. Read nothing into this below "
+                    f"{CAL_MIN_N}.")
+        elif abs(gap) <= 4:
+            st.success('✅ Calibrated — the stated odds match what happens.')
+        elif gap < 0:
+            st.error(f'❌ OVERCONFIDENT by {-gap:.1f} points. The model claims '
+                     f'more certainty than it earns; shade the duel panel and '
+                     f'the hold call toward the market.')
+        else:
+            st.warning(f'⚠️ UNDERCONFIDENT by {gap:.1f} points — real edges are '
+                       f'being passed up.')
+        if S['actual'] <= S['naive']:
+            st.warning('⚠️ The calibration adds nothing over plain rounding of '
+                       'the feed max. The measured-error step is not earning '
+                       'its place.')
+
+        st.markdown('**Reliability — does a stated confidence hold up?**')
+        buckets = [(0, 40), (40, 50), (50, 60), (60, 70), (70, 85), (85, 101)]
+        rel = []
+        for lo, hi in buckets:
+            sub = [r for r in recs if lo <= r['top_p'] * 100 < hi]
+            if not sub:
+                continue
+            says = 100.0 * sum(r['top_p'] for r in sub) / len(sub)
+            does = 100.0 * sum(r['hit'] for r in sub) / len(sub)
+            rel.append({'stated confidence': f'{lo}-{hi - 1}%', 'n': len(sub),
+                        'says': round(says, 1), 'lands': round(does, 1),
+                        'gap': round(does - says, 1)})
+        st.dataframe(pd.DataFrame(rel), use_container_width=True,
+                     hide_index=True)
+
+        dates = sorted({r['date'] for r in recs})
+        if len(dates) > 3:
+            mid = dates[len(dates) // 2]
+            halves = []
+            for lab, sub in (('1st half', [r for r in recs if r['date'] < mid]),
+                             ('2nd half', [r for r in recs if r['date'] >= mid])):
+                if sub:
+                    h = cal_summary(sub)
+                    halves.append({'half': lab, 'n': h['n'],
+                                   'says': round(h['claimed'], 1),
+                                   'lands': round(h['actual'], 1),
+                                   'gap': round(h['actual'] - h['claimed'], 1),
+                                   'brier': round(h['brier'], 3)})
+            st.markdown('**Split by date** — a model that only works in one '
+                        'stretch is not working.')
+            st.dataframe(pd.DataFrame(halves), use_container_width=True,
+                         hide_index=True)
+
+        worst = sorted(recs, key=lambda r: -r['brier'])[:8]
+        with st.expander('Worst misses'):
+            st.dataframe(pd.DataFrame([
+                {'date': r['date'], 'city': r['city'], 'model said': r['top_k'],
+                 'at': f"{r['top_p'] * 100:.0f}%", 'settled': r['actual'],
+                 'odds given to truth': f"{r['p_actual'] * 100:.0f}%"}
+                for r in worst]), use_container_width=True, hide_index=True)
 
 st.markdown('<div class="sec">🎯 Today\'s Consensus</div>', unsafe_allow_html=True)
 
