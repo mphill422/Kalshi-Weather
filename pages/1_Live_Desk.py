@@ -1,5 +1,5 @@
 """
-Live Desk — V1.6 (2026-09-20)  ·  V1.6: CLI as-of stamp is local clock time, not standard (was an hour ahead)  ·  V1.5: official-high fix — overnight partial report no longer read as FINAL  ·  V1.4: Synoptic + aviationweather fast feeds, STEPPED UP / NEW HIGH flash, :51 countdown  ·  V1.3: official NWS high (whole °F) card; locks the call when posted  ·  V1.2: KBOS/KMSP on-grid readings shown as ranges  ·  V1.1: 📊 Mac / 📱 iPhone toggle; Celsius straddle cards
+Live Desk — V1.7 (2026-09-23)  ·  V1.7: MADIS fast feed, two-bracket duel panel, exact-reading alert with sound  ·  V1.6: CLI as-of stamp is local clock time, not standard (was an hour ahead)  ·  V1.5: official-high fix — overnight partial report no longer read as FINAL  ·  V1.4: Synoptic + aviationweather fast feeds, STEPPED UP / NEW HIGH flash, :51 countdown  ·  V1.3: official NWS high (whole °F) card; locks the call when posted  ·  V1.2: KBOS/KMSP on-grid readings shown as ranges  ·  V1.1: 📊 Mac / 📱 iPhone toggle; Celsius straddle cards
 
 What this page is for: the last hour of a bet. Hold, or cash out?
 
@@ -43,6 +43,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytz
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Live Desk", page_icon="🌡️", layout="wide")
 
@@ -298,7 +299,64 @@ def fetch_awc(stids):
     return out
 
 
-def merge_rows(stn, day_start, nws_rows, nws_max6, syn, awc):
+MADIS_URL = ("https://madis-data.ncep.noaa.gov/madisPublic1/data/stations/"
+             "HF-METAR.dat")
+METAR_TIME = re.compile(r"\b(\d{2})(\d{2})(\d{2})Z\b")
+METAR_TEMP = re.compile(r"\s(M?\d{2})/(M?\d{2}|//)\s")
+
+
+def fetch_madis(stids, now_utc):
+    """NOAA's high-frequency 5-minute file — the same readings as Synoptic and
+    NWS, but usually 1-2 minutes behind the sensor instead of 5-15.
+
+    ⚠️ NO EXTRA PRECISION. The FAA hands temperature to NOAA in whole degrees
+    Celsius on this feed, so it steps 1.8F exactly like everything else. Speed
+    only. The hourly report is still the only exact reading.
+
+    Parsed defensively: the layout is not contractual, so anything that does
+    not look like a METAR body is skipped and the other feeds carry the page.
+    """
+    r = requests.get(MADIS_URL, headers={"User-Agent": NWS_HDR["User-Agent"]},
+                     timeout=20)
+    r.raise_for_status()
+    text = r.content.decode("utf-8", "ignore")
+    want = set(stids)
+    out = {}
+    for line in text.splitlines():
+        if len(line) < 20:
+            continue
+        for stid in want:
+            i = line.find(stid + " ")
+            if i < 0:
+                continue
+            body = line[i:]
+            mt = METAR_TIME.search(body)
+            if not mt:
+                break
+            day, hh, mm = (int(mt.group(1)), int(mt.group(2)), int(mt.group(3)))
+            base = now_utc.replace(minute=0, second=0, microsecond=0)
+            try:
+                ts = base.replace(day=day, hour=hh, minute=mm)
+            except ValueError:
+                break
+            if ts > now_utc + dt.timedelta(minutes=10):     # last month's day
+                ts -= dt.timedelta(days=28)
+            tg = TGROUP.search(body)
+            if tg:
+                c = int(tg.group(2)) / 10.0 * (-1 if tg.group(1) == "1" else 1)
+            else:
+                mtemp = METAR_TEMP.search(body)
+                if not mtemp:
+                    break
+                raw_c = mtemp.group(1)
+                c = float(raw_c.replace("M", "-")) if raw_c[0] != "M" \
+                    else -float(raw_c[1:])
+            out.setdefault(stid, []).append((ts, c * 1.8 + 32.0))
+            break
+    return out
+
+
+def merge_rows(stn, day_start, nws_rows, nws_max6, syn, awc, madis=None):
     """One timeline. Same minute from two sources -> keep the exact one."""
     rows = list(nws_rows)
     max6 = list(nws_max6)
@@ -306,6 +364,11 @@ def merge_rows(stn, day_start, nws_rows, nws_max6, syn, awc):
         if ts >= day_start:
             rd = parse_reading(stn, ts, (f - 32) / 1.8, "")
             rd["src"] = "Synoptic"
+            rows.append(rd)
+    for ts, f in (madis or []):
+        if ts >= day_start:
+            rd = parse_reading(stn, ts, (f - 32) / 1.8, "")
+            rd["src"] = "MADIS"
             rows.append(rd)
     for ts, raw in (awc or []):
         if ts < day_start or not TGROUP.search(raw or ""):
@@ -644,7 +707,7 @@ def verdict(b, s, odds):
 
 
 # ── Fetch everything, in parallel, once a minute ─────────────────────────────
-def load_city(city, now_utc, syn_all, awc_all):
+def load_city(city, now_utc, syn_all, awc_all, madis_all):
     stn, series, tz = CITIES[city]
     day_start, local_date = climate_day_start(tz, now_utc)
     out = dict(city=city, stn=stn, tz=tz, rows=[], s=None, ladder=[],
@@ -656,7 +719,8 @@ def load_city(city, now_utc, syn_all, awc_all):
             nws_rows, nws_max6 = [], []
             out["obs_err"] = "NWS: " + str(e)[:80]
         rows, max6 = merge_rows(stn, day_start, nws_rows, nws_max6,
-                                (syn_all or {}).get(stn), (awc_all or {}).get(stn))
+                                (syn_all or {}).get(stn), (awc_all or {}).get(stn),
+                                (madis_all or {}).get(stn))
         out["rows"] = rows
         out["s"] = summarize(rows, max6, now_utc)
         if out["s"]:
@@ -675,8 +739,14 @@ def load_city(city, now_utc, syn_all, awc_all):
 def load_all(minute_key):
     now_utc = dt.datetime.now(pytz.utc)
     stids = [v[0] for v in CITIES.values()]
-    feeds = {"Synoptic": "no token in secrets", "AWC": "ok"}
-    syn_all, awc_all = None, None
+    feeds = {"MADIS": "ok", "Synoptic": "no token in secrets", "AWC": "ok"}
+    syn_all, awc_all, madis_all = None, None, None
+    try:
+        madis_all = fetch_madis(stids, now_utc)
+        n = sum(len(v) for v in (madis_all or {}).values())
+        feeds["MADIS"] = f"ok ({n} rows)" if n else "no rows parsed"
+    except Exception as e:
+        feeds["MADIS"] = "error: " + str(e)[:50]
     tok = synoptic_token()
     if tok:
         try:
@@ -689,8 +759,8 @@ def load_all(minute_key):
     except Exception as e:
         feeds["AWC"] = "error: " + str(e)[:60]
     with ThreadPoolExecutor(max_workers=10) as ex:
-        res = list(ex.map(lambda c: load_city(c, now_utc, syn_all, awc_all),
-                          CITIES))
+        res = list(ex.map(lambda c: load_city(c, now_utc, syn_all, awc_all,
+                                             madis_all), CITIES))
     return {r["city"]: r for r in res}, now_utc, feeds
 
 
@@ -713,6 +783,9 @@ is_mobile = view_mode == "📱 iPhone"
 if is_mobile:
     st.markdown("<style>.big{font-size:28px}.card{padding:10px 12px}"
                 ".verdict{font-size:22px}</style>", unsafe_allow_html=True)
+
+sound_on = st.checkbox("🔔 Sound when a new exact reading lands", value=True,
+                       key="desk_sound")
 
 if "desk_city" not in st.session_state:
     st.session_state["desk_city"] = "Miami"
@@ -756,8 +829,9 @@ def desk():
         f"<div class='sm'>⏱ next hourly report in <b style='color:#fff'>{mins_to} min</b> "
         f"({nxt.strftime('%-I:%M%p').lower()} local, exact reading usually posts "
         f"by :55) · latest reading via {last.get('src', 'NWS')}, "
-        f"{s['age_min']:.0f} min old · feeds: Synoptic {feeds['Synoptic']}, "
-        f"aviationweather {feeds['AWC']}</div>", unsafe_allow_html=True)
+        f"{s['age_min']:.0f} min old · feeds: MADIS {feeds['MADIS']}, "
+        f"Synoptic {feeds['Synoptic']}, aviationweather {feeds['AWC']}</div>",
+        unsafe_allow_html=True)
     odds = settle_odds(s, diffs)
     top = [kv for kv in sorted(odds.items(), key=lambda kv: -kv[1])[:3]
            if kv[1] >= 0.01]
@@ -832,8 +906,75 @@ def desk():
         f"{'' if s['past_peak'] else ' · ⚠️ not past peak — high can still rise'}"
         f"</div></div>", unsafe_allow_html=True)
 
-    # ── Celsius straddle: which brackets the readings can really be in ──
+    # ── New exact reading: the hourly report is the only precise number, and
+    # it is what settles a two-bracket duel. Announce it the moment it lands.
+    ex_rows = [r for r in d["rows"] if r["exact"]]
+    if ex_rows:
+        newest_ex = max(ex_rows, key=lambda r: r["ts"])
+        key = f"lastex_{city}"
+        prev = st.session_state.get(key)
+        fresh = (now_utc - newest_ex["ts"]).total_seconds() <= 25 * 60
+        if prev != newest_ex["ts"].isoformat() and fresh:
+            st.session_state[key] = newest_ex["ts"].isoformat()
+            st.markdown(
+                f"<div class='verdict v-hold'>🔔 EXACT READING "
+                f"{newest_ex['f']:.1f}° at {local_hm(newest_ex['ts'], d['tz'])}"
+                f"<div class='v-why'>Precise to a tenth. The high can only be "
+                f"this or higher.</div></div>", unsafe_allow_html=True)
+            if st.session_state.get("desk_sound"):
+                components.html(
+                    "<script>try{const a=new (window.AudioContext||"
+                    "window.webkitAudioContext)();const o=a.createOscillator();"
+                    "const g=a.createGain();o.connect(g);g.connect(a.destination);"
+                    "o.frequency.value=880;g.gain.value=0.15;o.start();"
+                    "setTimeout(()=>o.stop(),220);}catch(e){}</script>", height=0)
+        elif prev is None:
+            st.session_state[key] = newest_ex["ts"].isoformat()
+
+    # ── The duel: when two brackets are genuinely in the fight ──
     ladder = d["ladder"]
+    if ladder and not s.get("locked"):
+        live = [b for b in ladder if not is_dead(b, s)]
+        ranked = sorted(live, key=lambda b: -bracket_prob(b, odds))[:2]
+        if len(ranked) == 2:
+            pa, pb = (bracket_prob(b, odds) * 100 for b in ranked)
+            if pb >= 12:                       # a real fight, not a formality
+                hi_b = max(ranked, key=lambda b: (b["lo"] if b["lo"] is not None
+                                                  else -999))
+                lo_b = ranked[0] if ranked[1] is hi_b else ranked[1]
+                need = hi_b["lo"]
+                cells = []
+                for b, pct in zip(ranked, (pa, pb)):
+                    if b is hi_b and need is not None:
+                        req = f"needs a reading of {need}.0° or higher"
+                    elif need is not None:
+                        req = f"wins if nothing reaches {need}.0°"
+                    else:
+                        req = ""
+                    ask = f"{b['ask']}¢" if b.get("ask") else "—"
+                    cells.append(
+                        f"<div class='card' style='border:1px solid #3b5f8f'>"
+                        f"<div class='lbl'>{b['label']} · market {ask}</div>"
+                        f"<div class='big'>{pct:.0f}%</div>"
+                        f"<div class='sm'>{req}</div></div>")
+                st.markdown("<div class='lbl'>The duel · high so far "
+                            f"{s['true_lo']:.1f}–{s['true_hi']:.1f}°, "
+                            f"floor {s['floor_settle']}°</div>",
+                            unsafe_allow_html=True)
+                if is_mobile:
+                    for c in cells:
+                        st.markdown(c, unsafe_allow_html=True)
+                else:
+                    for col, c in zip(st.columns(2), cells):
+                        col.markdown(c, unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='sm'>Settles at the next exact reading: the "
+                    f"hourly report at :51 (posts by :55) and the afternoon "
+                    f"6-hour maximum. One reading of {need}.0°+ ends it; "
+                    f"nothing above that by dark ends it the other way.</div>"
+                    if need is not None else "", unsafe_allow_html=True)
+
+    # ── Celsius straddle: which brackets the readings can really be in ──
     if not s.get("locked"):       # once the official high locks, ranges are moot
         sc1, sc2 = (st.container(), st.container()) if is_mobile else st.columns(2)
         sc1.markdown(straddle_html("High so far can be", s["true_lo"],
