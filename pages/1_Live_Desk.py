@@ -1,5 +1,5 @@
 """
-Live Desk — V1.7 (2026-09-23)  ·  V1.7: MADIS fast feed, two-bracket duel panel, exact-reading alert with sound  ·  V1.6: CLI as-of stamp is local clock time, not standard (was an hour ahead)  ·  V1.5: official-high fix — overnight partial report no longer read as FINAL  ·  V1.4: Synoptic + aviationweather fast feeds, STEPPED UP / NEW HIGH flash, :51 countdown  ·  V1.3: official NWS high (whole °F) card; locks the call when posted  ·  V1.2: KBOS/KMSP on-grid readings shown as ranges  ·  V1.1: 📊 Mac / 📱 iPhone toggle; Celsius straddle cards
+Live Desk — V1.8 (2026-09-24)  ·  V1.8: off-grid readings can no longer set the day's high  ·  V1.7: MADIS fast feed, two-bracket duel panel, exact-reading alert with sound  ·  V1.6: CLI as-of stamp is local clock time, not standard (was an hour ahead)  ·  V1.5: official-high fix — overnight partial report no longer read as FINAL  ·  V1.4: Synoptic + aviationweather fast feeds, STEPPED UP / NEW HIGH flash, :51 countdown  ·  V1.3: official NWS high (whole °F) card; locks the call when posted  ·  V1.2: KBOS/KMSP on-grid readings shown as ranges  ·  V1.1: 📊 Mac / 📱 iPhone toggle; Celsius straddle cards
 
 What this page is for: the last hour of a bet. Hold, or cash out?
 
@@ -393,14 +393,26 @@ def summarize(rows, max6, now_utc):
     if not rows:
         return None
     last = rows[-1]
-    feed_max = max(r["f"] for r in rows)
+    # ⚠️ OFF-GRID READINGS DO NOT SET THE HIGH. A real 5-minute reading lands
+    # on the feed's own grid (69.8, 71.6, ...). A value in between — 69.9 —
+    # is a bad transmission or a feed artifact, and treating it as the high
+    # drags the whole distribution up a degree. Chicago 2026-09-24: a 69.9
+    # made the model read 70 at 73% while the market had 68-69 at 74%.
+    # Suspect readings still show in the table, flagged, and still widen the
+    # range; they just cannot set the top.
+    trusted = [r for r in rows if r["exact"] or r["kind"] != "unverified"]
+    feed_max = max(r["f"] for r in (trusted or rows))
+    suspect_max = max((r["f"] for r in rows if r["kind"] == "unverified"),
+                      default=None)
+    suspect_high = bool(suspect_max is not None and suspect_max > feed_max)
     exact_vals = [r["f"] for r in rows if r["exact"]] + list(max6)
     exact_max = max(exact_vals) if exact_vals else None
     # An exact reading (hourly tenths / 6-hr max) above the 5-min max wins.
     base = max(feed_max, exact_max) if exact_max is not None else feed_max
     max_row = max(rows, key=lambda r: (r["f"], r["ts"]))
     first_at_max = min(r["ts"] for r in rows if r["f"] >= feed_max - 0.01)
-    true_lo = max([r["lo"] for r in rows] + ([exact_max] if exact_max else []))
+    true_lo = max([r["lo"] for r in (trusted or rows)]
+                  + ([exact_max] if exact_max else []))
     true_hi = max(max(r["hi"] for r in rows), true_lo)
     floor_settle = settle_round(true_lo)
     hour_ago = [r for r in rows if r["ts"] <= last["ts"] - dt.timedelta(minutes=55)]
@@ -419,6 +431,7 @@ def summarize(rows, max6, now_utc):
                 true_hi=true_hi, floor_settle=floor_settle, trend=trend,
                 mins_since_max=mins_since_max, past_peak=past_peak,
                 stepped_up=stepped_up, new_high=new_high,
+                suspect_high=suspect_high, suspect_max=suspect_max,
                 prev_f=(prior[-1]["f"] if prior else None),
                 age_min=(now_utc - last["ts"]).total_seconds() / 60.0,
                 n=len(rows))
@@ -930,6 +943,13 @@ def desk():
                     "setTimeout(()=>o.stop(),220);}catch(e){}</script>", height=0)
         elif prev is None:
             st.session_state[key] = newest_ex["ts"].isoformat()
+
+    if s.get("suspect_high"):
+        st.warning(f"A reading of {s['suspect_max']:.1f}° is off the feed's "
+                   f"own grid, so it is suspect, not precise. It is NOT "
+                   f"setting the high or the odds below. Check it under "
+                   f"Recent readings — if the market disagrees with the model "
+                   f"here, the market is probably right.")
 
     # ── The duel: when two brackets are genuinely in the fight ──
     ladder = d["ladder"]
