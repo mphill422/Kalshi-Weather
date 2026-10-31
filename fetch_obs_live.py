@@ -147,13 +147,15 @@ import requests
 import datetime as dt
 from zoneinfo import ZoneInfo
 
-SYNOPTIC_TOKEN = os.environ["SYNOPTIC_TOKEN"]
+SYNOPTIC_TOKEN = os.environ.get("SYNOPTIC_TOKEN", "")
 SB_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SB_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ["SUPABASE_KEY"]
 
 SYNOPTIC = "https://api.synopticdata.com/v2/stations/timeseries"
+MADIS = ("https://madis-data.ncep.noaa.gov/madisPublic1/data/"
+         "stations/HF-METAR.dat")
 NWS_OBS = "https://api.weather.gov/stations/{stid}/observations"
-NWS_HEADERS = {"User-Agent": "kalshi-obs/2.2", "Accept": "application/geo+json"}
+NWS_HEADERS = {"User-Agent": "kalshi-obs/2.3", "Accept": "application/geo+json"}
 
 # Kalshi settlement stations. Chicago = MIDWAY. Houston = HOBBY.
 STATIONS = {
@@ -268,6 +270,91 @@ def fetch_synoptic():
         print(f"  Synoptic error: {summary.get('RESPONSE_MESSAGE')}")
         return None
     return data
+
+
+MADIS_TIME = re.compile(r"\b(\d{2})(\d{2})(\d{2})Z\b")
+MADIS_TEMP = re.compile(r"\s(M?\d{2})/(M?\d{2}|//)\s")
+
+
+def fetch_madis(now_utc):
+    """NOAA's high-frequency 5-minute ASOS file — the SAME readings Synoptic
+    resells, free and unauthenticated.
+
+    ⚠️ ADDED 2026-10-31 because Synoptic started returning HTTP 403
+    ("Unauthorized. Review your account access settings") on 2026-09-21 when
+    the trial lapsed to web-only. That went unnoticed for 41 days: V2.2
+    degrades instead of aborting, so every run stayed green while writing
+    NULL temp_f / day_max_f. The decision board was blank the whole time.
+
+    Returns data in SYNOPTIC'S SHAPE on purpose, so parse_station() and every
+    caller below work unchanged.
+
+    ⚠️ Same quantization as Synoptic — the FAA hands temperature to NOAA in
+    whole degrees Celsius, so this is 1.8F steps too, not tenths. That is what
+    keeps the calibration comparable to the Sept 7-20 rows.
+    """
+    try:
+        r = requests.get(MADIS, headers={"User-Agent": NWS_HEADERS["User-Agent"]},
+                         timeout=45)
+    except Exception as e:
+        print(f"  MADIS request failed: {type(e).__name__}: {str(e)[:120]}")
+        return None
+    if r.status_code != 200:
+        print(f"  MADIS HTTP {r.status_code}")
+        return None
+
+    want = set(STATIONS.keys())
+    acc = {}
+    for line in r.content.decode("utf-8", "ignore").splitlines():
+        if len(line) < 20:
+            continue
+        for stid in want:
+            i = line.find(stid + " ")
+            if i < 0:
+                continue
+            body = line[i:]
+            mt = MADIS_TIME.search(body)
+            if not mt:
+                break
+            day, hh, mm = int(mt.group(1)), int(mt.group(2)), int(mt.group(3))
+            base = now_utc.replace(minute=0, second=0, microsecond=0)
+            try:
+                ts = base.replace(day=day, hour=hh, minute=mm)
+            except ValueError:
+                break
+            if ts > now_utc + dt.timedelta(minutes=10):   # rolled past month end
+                ts -= dt.timedelta(days=28)
+            tg = parse_t_group(body)
+            if tg is not None:
+                f = tg
+            else:
+                mm2 = MADIS_TEMP.search(body)
+                if not mm2:
+                    break
+                raw_c = mm2.group(1)
+                c = -float(raw_c[1:]) if raw_c[0] == "M" else float(raw_c)
+                f = c * 1.8 + 32.0
+            acc.setdefault(stid, []).append((ts, f))
+            break
+
+    if not acc:
+        print("  MADIS returned no parseable rows for these stations")
+        return None
+
+    # repack into Synoptic's response shape
+    stations = []
+    for stid, pairs in acc.items():
+        pairs.sort(key=lambda x: x[0])
+        stations.append({
+            "STID": stid,
+            "OBSERVATIONS": {
+                "date_time": [t.strftime("%Y-%m-%dT%H:%M:%SZ") for t, _ in pairs],
+                "air_temp_set_1": [v for _, v in pairs],
+            },
+        })
+    n = sum(len(v) for v in acc.values())
+    print(f"  MADIS ok — {len(stations)} stations, {n} readings")
+    return {"SUMMARY": {"RESPONSE_CODE": 1}, "STATION": stations}
 
 
 def fetch_metars(stid, tzname, now_utc):
@@ -433,10 +520,28 @@ def upsert(row):
 
 def main():
     now_utc = dt.datetime.now(dt.timezone.utc)
-    print(f"OBS LIVE v2.2 | {now_utc:%Y-%m-%d %H:%M:%S} UTC | {len(STATIONS)} stations")
+    print(f"OBS LIVE v2.3 | {now_utc:%Y-%m-%d %H:%M:%S} UTC | {len(STATIONS)} stations")
     print("5-min feed = whole degrees C (1.8F steps) | hourly METAR T-group = tenths\n")
 
-    data = fetch_synoptic()
+    # ⚠️ V2.3: 5-MINUTE FEED, IN PRIORITY ORDER — MADIS is the one that works.
+    # Synoptic began returning HTTP 403 on 2026-09-21 when the account lapsed
+    # to web-only. Because V2.2 degrades instead of aborting, every run after
+    # that stayed GREEN while writing NULL temp_f / day_max_f. 41 days of empty
+    # rows; the decision board was blank and nobody was told. MADIS carries the
+    # same 5-minute ASOS readings, free and unauthenticated.
+    feed_src = None
+    data = fetch_synoptic() if SYNOPTIC_TOKEN else None
+    if data is not None:
+        feed_src = "Synoptic"
+    else:
+        if not SYNOPTIC_TOKEN:
+            print("  (no SYNOPTIC_TOKEN set — going straight to MADIS)")
+        data = fetch_madis(now_utc)
+        if data is not None:
+            feed_src = "MADIS"
+
+    # ⚠️ COLUMN NAME KEPT, MEANING WIDENED: synoptic_ok now reads
+    # "a 5-minute feed worked", whichever one. max_vs_settled filters on it.
     synoptic_ok = data is not None
 
     if not synoptic_ok:
@@ -444,10 +549,13 @@ def main():
         # V2.1 returned here. Every city kept its previous row, the panel had
         # no way to tell, and San Antonio displayed an 8:24am number in a green
         # box at 5:19pm while the station was 16 degrees hotter.
-        print("⚠️ SYNOPTIC UNAVAILABLE — continuing on METARs only.")
-        print("   Rows WILL still be written, flagged synoptic_ok=false.\n")
+        print("⚠️ NO 5-MINUTE FEED (Synoptic and MADIS both unavailable)")
+        print("   — continuing on hourly METARs only. Rows WILL still be")
+        print("   written, flagged synoptic_ok=false, with temp_f/day_max_f")
+        print("   filled from the hourly T-group so the board is not blank.\n")
         by_stid = {}
     else:
+        print(f"  5-minute feed: {feed_src}\n")
         stations = data.get("STATION") or []
         by_stid = {(e.get("STID") or "").upper(): e for e in stations}
 
@@ -528,7 +636,25 @@ def main():
             })
             continue
 
+        # ⚠️ FALLBACK so the decision board is never blank. With no 5-minute
+        # feed, fill temp_f / day_max_f from the hourly T-group instead of
+        # writing NULL. These rows carry synoptic_ok=false and the
+        # max_vs_settled view MUST filter on it: the hourly max runs +0.83F
+        # against the 5-minute max (sd 0.80 vs 0.60, measured 2026-10-31 on
+        # 679 city-days), because it only samples once an hour and misses
+        # peaks in between. Mixing the two silently corrupts the calibration.
+        used_metar_fallback = False
+        if not synoptic_ok:
+            if last_v is None and m_last_v is not None:
+                last_v, last_t, age_min = m_last_v, m_last_t, m_age
+                used_metar_fallback = True
+            if max_v is None and pm_v is not None:
+                max_v, max_t = pm_v, pm_t
+                used_metar_fallback = True
+
         flag = ""
+        if used_metar_fallback:
+            flag += "  (hourly fallback)"
         if is_stale:
             flag = f"  ⚠️ {stale_reason}"
         # the gap that cost a decision on 2026-09-08
