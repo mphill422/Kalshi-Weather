@@ -1,5 +1,5 @@
 """
-Live Desk — V1.8 (2026-09-24)  ·  V1.8: off-grid readings can no longer set the day's high  ·  V1.7: MADIS fast feed, two-bracket duel panel, exact-reading alert with sound  ·  V1.6: CLI as-of stamp is local clock time, not standard (was an hour ahead)  ·  V1.5: official-high fix — overnight partial report no longer read as FINAL  ·  V1.4: Synoptic + aviationweather fast feeds, STEPPED UP / NEW HIGH flash, :51 countdown  ·  V1.3: official NWS high (whole °F) card; locks the call when posted  ·  V1.2: KBOS/KMSP on-grid readings shown as ranges  ·  V1.1: 📊 Mac / 📱 iPhone toggle; Celsius straddle cards
+Live Desk — V1.9 (2026-10-31)  ·  V1.9: OVERNIGHT HIGH detection — flags days that peaked before dawn, prices the floor bracket, and shows in the all-cities scan  ·  V1.8: off-grid readings can no longer set the day's high  ·  V1.7: MADIS fast feed, two-bracket duel panel, exact-reading alert with sound  ·  V1.6: CLI as-of stamp is local clock time, not standard (was an hour ahead)  ·  V1.5: official-high fix — overnight partial report no longer read as FINAL  ·  V1.4: Synoptic + aviationweather fast feeds, STEPPED UP / NEW HIGH flash, :51 countdown  ·  V1.3: official NWS high (whole °F) card; locks the call when posted  ·  V1.2: KBOS/KMSP on-grid readings shown as ranges  ·  V1.1: 📊 Mac / 📱 iPhone toggle; Celsius straddle cards
 
 What this page is for: the last hour of a bet. Hold, or cash out?
 
@@ -389,7 +389,7 @@ def merge_rows(stn, day_start, nws_rows, nws_max6, syn, awc, madis=None):
     return out, sorted(set(round(v, 1) for v in max6))
 
 
-def summarize(rows, max6, now_utc):
+def summarize(rows, max6, now_utc, tz_name=None):
     if not rows:
         return None
     last = rows[-1]
@@ -423,6 +423,25 @@ def summarize(rows, max6, now_utc):
     stepped_up = bool(prior and not last["exact"]
                       and last["f"] - prior[-1]["f"] >= 1.5
                       and (now_utc - last["ts"]).total_seconds() <= 20 * 60)
+    # ⚠️ OVERNIGHT HIGH. Nov-Feb, warm advection ahead of a front routinely
+    # peaks overnight and the temperature falls all day. CLI records the
+    # CALENDAR-day max whenever it happened, so the market is decided before
+    # the first snapshot. Measured 2026-10-31 on 160 Northeast city-days since
+    # 09-19: 12% had their warmest hourly METAR at the 0451Z report (12:51am
+    # ET). Everything else on this page assumes the peak is still coming.
+    overnight_high = False
+    if tz_name:
+        try:
+            tzi = pytz.timezone(tz_name)
+            max_local = first_at_max.astimezone(tzi)
+            now_local = now_utc.astimezone(tzi)
+            overnight_high = bool(
+                max_local.hour < 10              # peaked before 10am local
+                and now_local.hour >= 13         # and it is now afternoon
+                and last["f"] <= feed_max - 3.0  # cooled 3F+ off that max
+                and (trend is None or trend <= 0.4))   # and not climbing
+        except Exception:
+            overnight_high = False
     new_high = bool(len(rows) > 1 and last["f"] >= feed_max - 0.01
                     and last["f"] > max(r["f"] for r in rows[:-1]) + 0.01
                     and (now_utc - last["ts"]).total_seconds() <= 20 * 60)
@@ -432,6 +451,7 @@ def summarize(rows, max6, now_utc):
                 mins_since_max=mins_since_max, past_peak=past_peak,
                 stepped_up=stepped_up, new_high=new_high,
                 suspect_high=suspect_high, suspect_max=suspect_max,
+                overnight_high=overnight_high,
                 prev_f=(prior[-1]["f"] if prior else None),
                 age_min=(now_utc - last["ts"]).total_seconds() / 60.0,
                 n=len(rows))
@@ -735,7 +755,7 @@ def load_city(city, now_utc, syn_all, awc_all, madis_all):
                                 (syn_all or {}).get(stn), (awc_all or {}).get(stn),
                                 (madis_all or {}).get(stn))
         out["rows"] = rows
-        out["s"] = summarize(rows, max6, now_utc)
+        out["s"] = summarize(rows, max6, now_utc, tz)
         if out["s"]:
             out["obs_err"] = None
             apply_official(out["s"], fetch_official(stn, tz, local_date))
@@ -856,8 +876,12 @@ def desk():
     trend_txt = ("—" if trend is None else
                  f"{'▲' if trend > 0.4 else '▼' if trend < -0.4 else '▶'} "
                  f"{trend:+.1f}° last hour")
-    peak_txt = ("PAST PEAK" if s["past_peak"] else "STILL IN PLAY")
-    peak_col = "#00ff88" if s["past_peak"] else "#fbbf24"
+    if s.get("overnight_high"):
+        peak_txt, peak_col = "OVERNIGHT HIGH", "#00ff88"
+    elif s["past_peak"]:
+        peak_txt, peak_col = "PAST PEAK", "#00ff88"
+    else:
+        peak_txt, peak_col = "STILL IN PLAY", "#fbbf24"
     stale = s["age_min"] > 25
 
     off = s.get("official")
@@ -916,7 +940,7 @@ def desk():
         f"<div class='card'><span class='lbl'>If the high is in, CLI prints</span>"
         f"<br><span style='color:#fff;font-size:20px'>{top_txt}</span>"
         f"<div class='sm'>odds from {diff_src}"
-        f"{'' if s['past_peak'] else ' · ⚠️ not past peak — high can still rise'}"
+        f"{'' if (s['past_peak'] or s.get('overnight_high')) else ' · ⚠️ not past peak — high can still rise'}"
         f"</div></div>", unsafe_allow_html=True)
 
     # ── New exact reading: the hourly report is the only precise number, and
@@ -950,6 +974,51 @@ def desk():
                    f"setting the high or the odds below. Check it under "
                    f"Recent readings — if the market disagrees with the model "
                    f"here, the market is probably right.")
+
+    # ── Overnight high: the day peaked before dawn and has been falling ──
+    # Not a lock. A cold morning with afternoon sun can still exceed it, so
+    # this is a strong warning, the same standard as "past peak" — only the
+    # official NWS report locks anything.
+    if s.get("overnight_high") and not s.get("locked"):
+        st.markdown(
+            f"<div class='verdict v-hold'>🌙 OVERNIGHT HIGH — {s['base']:.0f}° "
+            f"set {local_hm(s['first_at_max'], d['tz'])}"
+            f"<div class='v-why'>Now {last['f']:.0f}° and "
+            f"{'falling' if (s['trend'] or 0) < -0.4 else 'flat'}. The peak was "
+            f"before dawn, so the afternoon logic on this page does not apply. "
+            f"Unless it warms past {s['base']:.1f}°, the answer is already in: "
+            f"settles {s['floor_settle']}° or higher.</div></div>",
+            unsafe_allow_html=True)
+
+        fb = next((b for b in d["ladder"]
+                   if in_bracket(s["floor_settle"], b)), None)
+        if fb:
+            pf = bracket_prob(fb, odds) * 100
+            ask_f = fb.get("ask")
+            if ask_f:
+                edge = pf - ask_f
+                if edge >= 8:
+                    cls, head = "v-hold", (f"MARKET HAS NOT REPRICED  "
+                                           f"({edge:+.0f}¢)")
+                    why = (f"<b>{fb['label']}</b> contains the floor and the "
+                           f"model gives it {pf:.0f}%, but it trades at "
+                           f"{ask_f}¢. The book has not caught up to a reading "
+                           f"that already happened.")
+                elif edge <= -8:
+                    cls, head = "v-sell", f"FLOOR BRACKET IS RICH ({edge:+.0f}¢)"
+                    why = (f"<b>{fb['label']}</b> trades at {ask_f}¢ against a "
+                           f"model {pf:.0f}%. Nothing to buy here.")
+                else:
+                    cls, head = "v-wait", "MARKET HAS IT — NOTHING TO DO"
+                    why = (f"<b>{fb['label']}</b> at {ask_f}¢ vs model "
+                           f"{pf:.0f}%. Fairly priced; this is the usual case.")
+                st.markdown(f"<div class='verdict {cls}'>{head}"
+                            f"<div class='v-why'>{why}</div></div>",
+                            unsafe_allow_html=True)
+            else:
+                st.markdown(f"<div class='sm'>Floor bracket "
+                            f"<b>{fb['label']}</b> has no ask quoted.</div>",
+                            unsafe_allow_html=True)
 
     # ── The duel: when two brackets are genuinely in the fight ──
     ladder = d["ladder"]
@@ -1065,7 +1134,8 @@ def desk():
             "Official": (f"{ss['official']['max_f']}°" if ss.get("official")
                          else "—"),
             "At least": f"{ss['floor_settle']}°",
-            "Peak": "past" if ss["past_peak"] else "in play",
+            "Peak": ("🌙 overnight" if ss.get("overnight_high")
+                     else "past" if ss["past_peak"] else "in play"),
             "Favorite": f"{fav['label']} @ {fav['ask']}¢" if fav else "—",
             "Updated": f"{ss['age_min']:.0f}m ago",
         })
