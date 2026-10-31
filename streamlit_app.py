@@ -357,6 +357,18 @@ def local_hour(city):
         return None
 
 
+def local_hm(city):
+    """Local clock time HH:MM. The board used to print the HOUR with ':00'
+    hardcoded, so at 11:55 it read '11:00' and looked an hour stale."""
+    tzname = CITY_TZ.get(city)
+    if not tzname:
+        return None
+    try:
+        return datetime.now(pytz.timezone(tzname)).strftime('%H:%M')
+    except Exception:
+        return None
+
+
 # ── Auth ─────────────────────────────────────────────────────────────────────
 def check_password():
     try:
@@ -954,7 +966,7 @@ else:
                       top_share if not (dead or closed) else 9,
                       -(fmax or 0)),
             'City': city,
-            'Local': f'{lh:02d}:00' if lh is not None else '—',
+            'Local': (local_hm(city) or '—'),
             'Day Max': '⛔' if dead else (f'{fmax:.1f}' if fmax is not None else '—'),
             'Most likely': likely,
             'Also possible': alts,
