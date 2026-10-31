@@ -377,8 +377,15 @@ def fetch_metars(stid, tzname, now_utc):
     back a window that ends hours ago, that is reported as truncation rather
     than silently believed.
 
-    Returns (rows, n, truncated) where rows is [(when_utc, temp_f), ...] for
-    TODAY in the station's LOCAL calendar day, sorted oldest first.
+    Returns (rows, n, truncated, five_min) where rows is the T-GROUP record
+    [(when_utc, temp_f), ...] for TODAY in the station's LOCAL calendar day,
+    and five_min is EVERY temperature reading from the same response.
+
+    ⚠️ V2.4: five_min was always here and was always thrown away. This endpoint
+    returns the 5-minute ASOS observations as well as the hourly METARs — the
+    Live Desk has run on exactly this since V1.0 — but V2.0-V2.3 dropped any
+    feature without a T-group, so obs_live paid for Synoptic to resell data it
+    was already downloading. Same call, same response, no new dependency.
     """
     tz = ZoneInfo(tzname)
     today_local = now_utc.astimezone(tz).date()
@@ -412,14 +419,26 @@ def fetch_metars(stid, tzname, now_utc):
             url = nxt
     except Exception as e:
         print(f"    {stid} METAR fetch failed: {type(e).__name__}")
-        return [], 0, True
+        return [], 0, True, []
 
     rows = []
+    five_min = []
     for f in features:
         props = f.get("properties") or {}
         raw = props.get("rawMessage")
         ts = props.get("timestamp")
-        if not raw or not ts:
+        if not ts:
+            continue
+        # every reading, T-group or not — this is the 5-minute feed
+        c5 = (props.get("temperature") or {}).get("value")
+        if c5 is not None:
+            try:
+                w5 = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if w5.astimezone(tz).date() == today_local:
+                    five_min.append((w5, round(float(c5) * 9.0 / 5.0 + 32.0, 2)))
+            except Exception:
+                pass
+        if not raw:
             continue
         t_f = parse_t_group(raw)
         if t_f is None:
@@ -441,7 +460,8 @@ def fetch_metars(stid, tzname, now_utc):
         newest_age_min = (now_utc - rows[-1][0]).total_seconds() / 60.0
         if newest_age_min > METAR_STALE_MIN:
             truncated = True
-    return rows, len(rows), truncated
+    five_min.sort(key=lambda x: x[0])
+    return rows, len(rows), truncated, five_min
 
 
 def parse_station(entry, tzname, now_utc):
@@ -520,7 +540,7 @@ def upsert(row):
 
 def main():
     now_utc = dt.datetime.now(dt.timezone.utc)
-    print(f"OBS LIVE v2.3 | {now_utc:%Y-%m-%d %H:%M:%S} UTC | {len(STATIONS)} stations")
+    print(f"OBS LIVE v2.4 | {now_utc:%Y-%m-%d %H:%M:%S} UTC | {len(STATIONS)} stations")
     print("5-min feed = whole degrees C (1.8F steps) | hourly METAR T-group = tenths\n")
 
     # ⚠️ V2.3: 5-MINUTE FEED, IN PRIORITY ORDER — MADIS is the one that works.
@@ -549,10 +569,11 @@ def main():
         # V2.1 returned here. Every city kept its previous row, the panel had
         # no way to tell, and San Antonio displayed an 8:24am number in a green
         # box at 5:19pm while the station was 16 degrees hotter.
-        print("⚠️ NO 5-MINUTE FEED (Synoptic and MADIS both unavailable)")
-        print("   — continuing on hourly METARs only. Rows WILL still be")
-        print("   written, flagged synoptic_ok=false, with temp_f/day_max_f")
-        print("   filled from the hourly T-group so the board is not blank.\n")
+        print("  no bulk 5-minute feed (Synoptic and MADIS both unavailable)")
+        print("  — falling back to api.weather.gov per station, which carries")
+        print("    the same 5-minute observations. If that is empty too, the")
+        print("    hourly T-group fills temp_f/day_max_f so the board is not")
+        print("    blank, and those rows are flagged synoptic_ok=false.\n")
         by_stid = {}
     else:
         print(f"  5-minute feed: {feed_src}\n")
@@ -588,7 +609,21 @@ def main():
             last_t = last_v = age_min = max_t = max_v = trend = next_step = None
 
         # ---- hourly METAR T-groups (the precise record) ----
-        metars, n_metars, truncated = fetch_metars(stid, tzname, now_utc)
+        metars, n_metars, truncated, nws_5min = fetch_metars(stid, tzname, now_utc)
+
+        # ⚠️ V2.4: api.weather.gov carries the 5-MINUTE observations too, and
+        # we just downloaded them in the call above. If no dedicated feed came
+        # back, use them — same cadence Synoptic sold, no extra request.
+        if not rows and nws_5min:
+            rows = nws_5min
+            nws_five_min_used = True
+            last_t, last_v = rows[-1]
+            age_min = round((now_utc - last_t).total_seconds() / 60.0, 1)
+            max_t, max_v = max(rows, key=lambda x: x[1])
+            trend = trend_over(rows, TREND_WINDOW_MIN)
+            next_step = next_celsius_step_f(max_v)
+        else:
+            nws_five_min_used = False
         if metars:
             m_last_t, m_last_v = metars[-1]
             m_age = round((now_utc - m_last_t).total_seconds() / 60.0, 1)
@@ -599,9 +634,11 @@ def main():
         metar_ok = bool(metars) and not truncated
 
         # ---- staleness verdict -------------------------------------------
+        five_min_ok = synoptic_ok or nws_five_min_used
+
         reasons = []
-        if not synoptic_ok:
-            reasons.append("synoptic down")
+        if not five_min_ok:
+            reasons.append("no 5-min feed")
         elif not rows:
             reasons.append("no feed obs today")
         elif age_min > STALE_WARN_MIN:
@@ -644,7 +681,7 @@ def main():
         # 679 city-days), because it only samples once an hour and misses
         # peaks in between. Mixing the two silently corrupts the calibration.
         used_metar_fallback = False
-        if not synoptic_ok:
+        if not five_min_ok:
             if last_v is None and m_last_v is not None:
                 last_v, last_t, age_min = m_last_v, m_last_t, m_age
                 used_metar_fallback = True
@@ -653,10 +690,12 @@ def main():
                 used_metar_fallback = True
 
         flag = ""
-        if used_metar_fallback:
-            flag += "  (hourly fallback)"
         if is_stale:
             flag = f"  ⚠️ {stale_reason}"
+        if nws_five_min_used:
+            flag += "  (NWS 5-min)"
+        if used_metar_fallback:
+            flag += "  (hourly fallback)"
         # the gap that cost a decision on 2026-09-08
         if pm_v is not None and max_v is not None and abs(max_v - pm_v) >= 0.8:
             flag += f"  ⚠️ feed/T-grp gap {max_v - pm_v:+.1f}F"
@@ -692,7 +731,7 @@ def main():
             "n_metars_today": n_metars,
             "is_stale": is_stale,
             "stale_reason": stale_reason,
-            "synoptic_ok": synoptic_ok,
+            "synoptic_ok": five_min_ok,
             "metar_ok": metar_ok,
             "updated_at": now_utc.isoformat(),
         }):
