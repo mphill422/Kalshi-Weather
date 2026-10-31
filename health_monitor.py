@@ -12,6 +12,14 @@ It checks the exact things that died unnoticed:
   CHECK 5  bet settlement lag — are FAV bets resolving? (favorites_bets)
   CHECK 6  bets written       — did yesterday's FAV runs actually write rows?
   CHECK 7  snapshots written  — did yesterday's snapshot hours write rows?
+  CHECK 8  obs_live CONTENTS    — are the rows actually FULL? (the 41-day one)
+
+  V3 (2026-10-31): CHECK 8 added. Synoptic began returning HTTP 403 on
+  2026-09-21 when the trial lapsed to web-only. obs_live V2.2 degrades
+  instead of aborting, so it kept writing 20 rows a day with NULL temp_f and
+  day_max_f. Every check here passed — rows existed, they were fresh, the
+  job was green — and the decision board was blank for 41 days before anyone
+  noticed. Counting rows is not the same as counting values.
 
   V2 (2026-09-20): CHECK 5 pointed at the retired V5 `bets` table, which
   nothing settles any more — it failed every night on 29 dead rows. It now
@@ -168,6 +176,34 @@ def main():
                         'then the Favorites run log for PGRST204.' if not ok7 else ''))
     except Exception as e:
         results.append((False, 'snapshots written yesterday', f'read failed: {str(e)[:80]}', ''))
+
+    # CHECK 8 — obs_live CONTENTS, not just row count.
+    # ⚠️ THE ONE THAT WOULD HAVE CAUGHT THE 41-DAY OUTAGE. Rows present and
+    # fresh while every field inside them was NULL.
+    try:
+        obs = sb_get('obs_live', {'local_date': 'eq.' + yday,
+                                  'select': 'city,temp_f,day_max_f,synoptic_ok',
+                                  'limit': '100'})
+        n_obs = len(obs)
+        filled = sum(1 for r in obs if r.get('day_max_f') is not None)
+        five_min = sum(1 for r in obs if r.get('synoptic_ok'))
+        pct = (100.0 * filled / n_obs) if n_obs else 0.0
+        ok8 = n_obs > 0 and pct >= 80.0
+        detail = (f'{filled}/{n_obs} obs_live rows have day_max_f '
+                  f'({pct:.0f}%), {five_min} on a 5-minute feed, on {yday}')
+        action = ''
+        if not ok8:
+            action = ('obs_live is writing EMPTY rows. Open the Obs Live log '
+                      'and read the feed lines: Synoptic 403 means the account '
+                      'lapsed; MADIS/NWS errors mean the fallbacks failed too.')
+        elif five_min < filled:
+            action = ''
+            detail += ' — ⚠️ some rows are hourly fallback, not 5-minute'
+        results.append((ok8, 'obs_live contents', detail, action))
+    except Exception as e:
+        results.append((False, 'obs_live contents',
+                        f'could not read obs_live: {str(e)[:80]}',
+                        'Check SUPABASE_KEY can read obs_live.'))
 
     # ── report ────────────────────────────────────────────────────────────────
     any_fail = False
