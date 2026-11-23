@@ -163,6 +163,39 @@ def live_events(series, today):
     return found
 
 
+def _num(mk, *keys):
+    """First present key as a float. Kalshi returns prices as DOLLAR STRINGS
+    ('0.4900') under *_dollars names; older shapes used integer cents under
+    bare names. Handles both."""
+    for k in keys:
+        v = mk.get(k)
+        if v is None or v == "":
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        return f * 100.0 if k.endswith("_dollars") else f
+    return None
+
+
+def _cents(mk, *keys):
+    f = _num(mk, *keys)
+    return int(round(f)) if f is not None else None
+
+
+def _int(mk, *keys):
+    for k in keys:
+        v = mk.get(k)
+        if v is None or v == "":
+            continue
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def floor_30(ts):
     return ts.replace(minute=(ts.minute // 30) * 30, second=0, microsecond=0)
 
@@ -208,11 +241,20 @@ def main():
             for mk in m.get("markets", []):
                 global _SAMPLE_PRINTED
                 if not _SAMPLE_PRINTED:
-                    print("\n    SAMPLE MARKET OBJECT (field names, one time):")
-                    print("    " + json.dumps(mk, indent=2)[:1800].replace("\n", "\n    "))
+                    print("    market object keys: " + ", ".join(sorted(mk.keys())))
                     print()
                     _SAMPLE_PRINTED = True
-                bid, ask = mk.get("yes_bid"), mk.get("yes_ask")
+                bid = _cents(mk, "yes_bid_dollars", "yes_bid")
+                ask = _cents(mk, "yes_ask_dollars", "yes_ask")
+                # A binary market's YES side is the mirror of its NO side.
+                # Derive it when only the NO side is published.
+                if bid is None:
+                    na = _cents(mk, "no_ask_dollars", "no_ask")
+                    bid = (100 - na) if na is not None else None
+                if ask is None:
+                    nb = _cents(mk, "no_bid_dollars", "no_bid")
+                    ask = (100 - nb) if nb is not None else None
+                last = _cents(mk, "last_price_dollars", "last_price")
                 both = bid is not None and ask is not None
                 rows.append({
                     "snap_utc": now.isoformat(),
@@ -229,8 +271,9 @@ def main():
                     "yes_ask": ask,
                     "mid": round((bid + ask) / 2.0, 1) if both else None,
                     "spread": (ask - bid) if both else None,
-                    "volume": mk.get("volume"),
-                    "open_interest": mk.get("open_interest"),
+                    "last_price": last,
+                    "volume": _int(mk, "volume", "volume_24h"),
+                    "open_interest": _int(mk, "open_interest"),
                 })
                 n += 1
         ok.append(city)
