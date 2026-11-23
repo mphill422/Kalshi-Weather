@@ -50,7 +50,8 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 BASE = "https://api.elections.kalshi.com"
 TABLE = "kalshi_prices"
-MIN_SERIES_OK = 10          # below this during US hours, something is wrong
+MIN_SERIES_OK = 10
+_SAMPLE_PRINTED = False          # below this during US hours, something is wrong
 
 KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "").strip()
 PEM = os.environ.get("KALSHI_PRIVATE_KEY", "").strip()
@@ -205,6 +206,12 @@ def main():
             if not m:
                 continue
             for mk in m.get("markets", []):
+                global _SAMPLE_PRINTED
+                if not _SAMPLE_PRINTED:
+                    print("\n    SAMPLE MARKET OBJECT (field names, one time):")
+                    print("    " + json.dumps(mk, indent=2)[:1800].replace("\n", "\n    "))
+                    print()
+                    _SAMPLE_PRINTED = True
                 bid, ask = mk.get("yes_bid"), mk.get("yes_ask")
                 both = bid is not None and ask is not None
                 rows.append({
@@ -239,6 +246,12 @@ def main():
         return 1
 
     print(f"wrote {written} rows | {len(ok)} series with live markets, {len(empty)} without")
+
+    priced = sum(1 for r in rows if r["yes_ask"] is not None)
+    print(f"rows with a usable yes_ask: {priced} of {len(rows)}")
+    if priced == 0 and rows:
+        print("  ^^ NO PRICES CAPTURED. Read the SAMPLE MARKET OBJECT above and")
+        print("     compare its key names to yes_bid / yes_ask / volume / open_interest.")
 
     if written == 0:
         print("FAIL: nothing written.")
