@@ -1,0 +1,36 @@
+name: Log Kalshi Prices
+
+# Records the market side every 30 minutes. READ-ONLY -- GET endpoints only,
+# no order placement anywhere in the script.
+#
+# Save as .github/workflows/log_kalshi_prices.yml
+# Run kalshi_prices_table.sql in Supabase FIRST, or every run exits 1 with 42P01.
+#
+# Uses the same four secrets kalshi_settlements.py already uses. Nothing new.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'      # every 30 min, all hours (UTC)
+  workflow_dispatch:            # manual button for the first test run
+
+concurrency:
+  group: log-kalshi-prices
+  cancel-in-progress: false     # never cancel a run mid-write
+
+jobs:
+  log:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests cryptography
+      - name: Capture market snapshot
+        env:
+          KALSHI_API_KEY_ID:    ${{ secrets.KALSHI_API_KEY_ID }}
+          KALSHI_PRIVATE_KEY:   ${{ secrets.KALSHI_PRIVATE_KEY }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python log_kalshi_prices.py
