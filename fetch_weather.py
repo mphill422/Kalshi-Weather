@@ -93,38 +93,34 @@ SIGN CONVENTION — read before interpreting any bias number.
 
 HISTORY WORTH KEEPING
 =====================
-V5.31.0 BIAS LOOP FIX. compute_bias_correction() learned from
-`actual - consensus`. But consensus is rewritten through 5pm and carries an
-obs_high floor, so by settlement it is anchored to the observed high and the
-residual is ~0 BY CONSTRUCTION. The loop was grading itself against an answer
-it had already peeked at. It converged to zero: monthly avg bias_correction ran
-0.16, 0.13, 0.00, 0.07, 0.14 from Jul-Nov 2026 while the real NWS cold bias was
-+1.3F and rising. Now it learns from `actual - forecast` (the NWS column, which
-observations never overwrite).
+V5.32.0 WETHR REMOVED FROM OBSERVATIONS. The wethr API is a Pro-plan feature
+and that subscription was retired, so WETHR_API_KEY stopped authenticating
+around 2026-11-08. Three call sites, three different outcomes:
 
-V5.31.0 STALE WINDOW FIX. sb_fetch_city() asks for order=date.asc limit=200.
-Most cities now have more than 200 settled days, so it was returning the OLDEST
-200 rows and stopping roughly a month short of today -- the bias was learned
-from stale data and drifting further out of date daily. compute_bias_correction
-now uses sb_fetch_city_recent(), which orders date.desc explicitly.
-sb_fetch_city() is UNCHANGED for its other callers.
+  fetch_nws_forecast  - had an api.weather.gov fallback, so `forecast` kept
+                        populating but FROM A DIFFERENT SOURCE from 11-08 on.
+                        Wethr returned a 'high' field; the fallback takes the
+                        max of hourly daytime temps. Not identical. The Nov
+                        bias jump (+1.23 Oct -> +1.68 Nov) is partly this, not
+                        seasonality. Treat any bias window spanning 11-08 as
+                        mixed-source.
+  fetch_current_temp  - no fallback, returned None. `cur` then fell back to the
+                        forecast, so compute_consensus collapsed to fc*0.93 +
+                        fc*0.07 = pure NWS. The cold-morning-blend concern was
+                        accidentally neutralised for that period.
+  fetch_obs_high      - no fallback, returned None. CHECK 2 of health_monitor
+                        has been red since, correctly.
 
-V5.31.0 n_recent 10 -> 30. A 10-day trimmed mean of a signal whose daily
-scatter (~2.3F) is twice its mean (~1.3F) is mostly noise. 30 days measured
-+3.7pp on exact 2F-bracket hit rate across 3,661 city-days, six of seven months
-positive, >3 sigma.
+Do NOT re-subscribe. Both observation feeds already exist for free in
+obs_live, from the same stations, at 100% fill: precise_max_f (METAR T-group,
+exact tenths), day_max_f (5-minute feed max), temp_f (latest reading). The
+original fetch_obs_high docstring already said to do this -- wethr once
+reported a 79.0F obs high on 2026-09-06 when the actual was 78, wrongly
+eliminating "78 or below".
 
-⚠️ NWS_BIAS_BOOST_MULTIPLIER (1.2x for DC, OKC, Denver, Austin, San Antonio)
-was tuned against the OLD consensus-based signal, which had collapsed to ~0 --
-so the boost was multiplying nothing. It now multiplies a live number for the
-first time. Left in place deliberately (do not change two things at once), but
-re-check those five cities after a month and remove it if they over-correct.
-
-⚠️ The correction is measured on NWS but ADDED to consensus, and consensus is
-not NWS (it blends current temp, ~0.90/0.10 before 10am local). The adjustment
-is therefore approximate rather than exact. It is strictly better than the ~0
-it replaces, but the +3.7pp figure was measured on NWS+bias, not consensus+bias;
-expect somewhat less.
+fetch_nws_forecast still tries wethr first and falls through; harmless, and
+left alone so the forecast source does not change a second time without a
+deliberate decision.
 
 V5.30.0 CONSENSUS FLOOR FIX. An observed high is a MEASUREMENT, not a forecast
 base. compute_consensus() used to do `consensus = obs_high` then add the city
@@ -271,27 +267,6 @@ def sb_fetch_city(city):
         return []
 
 
-def sb_fetch_city_recent(city, limit=120):
-    """Most recent settlements for a city, returned OLDEST-first.
-
-    sb_fetch_city() uses order=date.asc with limit=200. Once a city has more
-    than 200 settled days that returns the OLDEST 200 and silently stops about
-    a month short of today, so anything learned from rows[-n:] is a month
-    stale. This asks for the newest rows explicitly and reverses them so the
-    caller's rows[-n:] still means "the most recent n".
-
-    sb_fetch_city() is left untouched for its other callers.
-    """
-    try:
-        r = requests.get(sb_url('settlements'), headers=sb_headers(),
-                         params={'city': 'eq.' + city, 'order': 'date.desc',
-                                 'limit': str(limit)}, timeout=10)
-        rows = r.json() if r.status_code == 200 else []
-        return list(reversed(rows))
-    except Exception:
-        return []
-
-
 def sb_fetch_today(city):
     today = get_eastern_date()
     try:
@@ -360,54 +335,26 @@ def _trimmed_mean(errors):
     return sum(s) / len(s)
 
 
-def compute_bias_correction(city, n_recent=30):
-    """V5.31.0. Learn the cold bias from actual - FORECAST, not actual - consensus.
-
-    WHY THE OLD VERSION COULD NOT WORK. consensus is rewritten through 5pm and
-    carries an obs_high floor, so the stored value is anchored to the observed
-    high -- very close to actual. `actual - consensus` therefore measures ~0 by
-    construction, no matter how wrong the MORNING forecast was. The loop graded
-    itself against an answer it had already seen and zeroed itself out:
-
-        monthly avg bias_correction, 2026
-        Mar 0.08  Apr 0.70  May 0.46  Jun 0.59
-        Jul 0.16  Aug 0.13  Sep 0.00  Oct 0.07  Nov 0.14
-
-    while the real NWS bias over the same window ran +0.70 to +1.68F.
-
-    `forecast` is the raw NWS point forecast and is never overwritten by
-    observations, so actual - forecast is a clean read on how cold the public
-    forecast ran. Positive = settlement came in WARMER than forecast = the
-    forecast runs COLD = add it. Same sign convention as the rest of this file.
-
-    MEASURED: +3.7 percentage points on exact 2F-bracket hit rate across 3,661
-    city-days (2026-05 to 2026-11), positive in six months of seven, >3 sigma.
-    November exact-bracket hit went 27.5% -> 33.1%.
-
-    n_recent 10 -> 30: daily scatter around this bias is ~2.3F, nearly twice
-    the ~1.3F mean, so a 10-day window is mostly noise.
-    """
-    rows = sb_fetch_city_recent(city, limit=max(120, n_recent * 3))
+def compute_bias_correction(city, n_recent=10):
+    rows = sb_fetch_city(city)
     complete = [r for r in rows
-                if r.get('actual') is not None and r.get('forecast') is not None]
+                if r.get('actual') is not None and r.get('consensus') is not None]
     if len(complete) < 3:
         prior_city = REGIONAL_PRIOR_BIAS.get(city)
         if prior_city:
-            prior_rows = sb_fetch_city_recent(prior_city, limit=max(120, n_recent * 3))
+            prior_rows = sb_fetch_city(prior_city)
             prior_complete = [r for r in prior_rows
                               if r.get('actual') is not None
-                              and r.get('forecast') is not None]
+                              and r.get('consensus') is not None]
             if len(prior_complete) >= 3:
                 recent = prior_complete[-n_recent:]
-                errors = [r['actual'] - r['forecast'] for r in recent]
+                errors = [r['actual'] - r['consensus'] for r in recent]
                 return round(max(-3.0, min(3.0, _trimmed_mean(errors))), 2), len(complete)
         return 0.0, len(complete)
     recent = complete[-n_recent:]
-    errors = [r['actual'] - r['forecast'] for r in recent]
+    errors = [r['actual'] - r['consensus'] for r in recent]
     med_error = _trimmed_mean(errors)
     if city in NWS_BIAS_BOOST_CITIES:
-        # Tuned against the OLD (collapsed-to-zero) signal. It is multiplying a
-        # live number for the first time -- re-check these five after a month.
         med_error = med_error * NWS_BIAS_BOOST_MULTIPLIER
     return round(max(-3.0, min(3.0, med_error)), 2), len(recent)
 
@@ -475,48 +422,73 @@ def fetch_nws_forecast(city):
     return None
 
 
-def fetch_current_temp(city):
-    station = WETHR_STATIONS.get(city)
-    if not station:
-        return None
+_OBS_LIVE_CACHE = {}
+
+
+def _obs_live_row(city):
+    """Today's obs_live row for a city, cached for the life of the run.
+
+    obs_live is written by fetch_obs_live.py from the 5-minute NWS feed and
+    hourly METAR T-groups, for the SAME settlement stations wethr used. Free,
+    already running, 100% fill per health_monitor CHECK 8.
+    """
+    if city in _OBS_LIVE_CACHE:
+        return _OBS_LIVE_CACHE[city]
+    row = None
     try:
         r = requests.get(
-            'https://wethr.net/api/v2/observations.php',
-            params={'station_code': station, 'mode': 'latest'},
-            headers=WETHR_HEADERS, timeout=12)
+            sb_url('obs_live'), headers=sb_headers(),
+            params={'city': 'eq.' + city, 'local_date': 'eq.' + get_eastern_date(),
+                    'select': 'temp_f,day_max_f,precise_max_f,obs_age_min,is_stale',
+                    'limit': '1'}, timeout=10)
         if r.status_code == 200:
-            temp = r.json().get('temperature_display')
-            if temp is not None:
-                return round(float(temp), 1)
+            rows = r.json()
+            if rows and not rows[0].get('is_stale'):
+                row = rows[0]
     except Exception:
-        pass
-    return None
+        row = None
+    _OBS_LIVE_CACHE[city] = row
+    return row
 
 
 def fetch_obs_high(city):
-    """⚠️ This reads Wethr's summary field, not the station directly.
+    """Day's observed high so far. V5.32.0: from obs_live, not wethr.
 
-    On 2026-09-06 it reported an obs high of 79.0F on a day the actual high was
-    78, which eliminated "78 or below" from the model. fetch_obs_live.py now
-    computes a running max from raw observations and from hourly METAR T-groups
-    for the same stations. If this ever becomes load-bearing again, read
-    obs_live.precise_max_f instead.
+    Prefers precise_max_f (METAR T-group, exact tenths) over day_max_f (the
+    5-minute feed max). Returns None when the obs row is stale or absent --
+    a MISSING floor is safe; a WRONG floor is not. That is the 2026-09-06
+    lesson, when wethr's 79.0F on a 78F day eliminated "78 or below".
     """
-    station = WETHR_STATIONS.get(city)
-    if not station:
+    row = _obs_live_row(city)
+    if not row:
         return None
+    v = row.get('precise_max_f')
+    if v is None:
+        v = row.get('day_max_f')
     try:
-        r = requests.get(
-            'https://wethr.net/api/v2/observations.php',
-            params={'station_code': station, 'mode': 'wethr_high', 'logic': 'nws'},
-            headers=WETHR_HEADERS, timeout=12)
-        if r.status_code == 200:
-            wethr_high = r.json().get('wethr_high')
-            if wethr_high is not None:
-                return round(float(wethr_high), 1)
-    except Exception:
-        pass
-    return None
+        return round(float(v), 1) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_current_temp(city):
+    """Latest observation. V5.32.0: from obs_live, not wethr.
+
+    Discards readings older than 90 minutes -- a stale 'current' temp is worse
+    than none, because main() substitutes the forecast when this returns None,
+    which is a safe default.
+    """
+    row = _obs_live_row(city)
+    if not row:
+        return None
+    age = row.get('obs_age_min')
+    try:
+        if age is not None and float(age) > 90:
+            return None
+        v = row.get('temp_f')
+        return round(float(v), 1) if v is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 # ── GFS ensemble ──────────────────────────────────────────────────────────────
