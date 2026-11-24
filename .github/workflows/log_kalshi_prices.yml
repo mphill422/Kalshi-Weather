@@ -1,21 +1,35 @@
 name: Log Kalshi Prices
 
-# Records the market side every 30 minutes. READ-ONLY -- GET endpoints only,
-# no order placement anywhere in the script.
+# Records the market side. READ-ONLY -- GET endpoints only, no order placement
+# anywhere in the script.
 #
 # Save as .github/workflows/log_kalshi_prices.yml
-# Run kalshi_prices_table.sql in Supabase FIRST, or every run exits 1 with 42P01.
-#
 # Uses the same four secrets kalshi_settlements.py already uses. Nothing new.
+#
+# ── WHY HOURLY AND NOT */30 ────────────────────────────────────────────────
+# First attempt used '*/30 * * * *'. Over the first 21 hours GitHub honoured
+# exactly ONE of ~42 scheduled fires (run #5, 2026-11-23 09:20). Scheduled
+# workflows are best-effort and high-frequency crons are the first thing
+# dropped under load.
+#
+# Hourly is what every other job in this repo already runs at successfully --
+# health_monitor confirms the snapshots job hitting "10 of 10 hours" -- so the
+# throttling is specific to the */30 pattern, not to this repo.
+#
+# If 30-minute granularity is ever genuinely needed (the repricing-lag
+# question), the fix is NOT a faster cron. It is one long-running job that
+# loops internally and sleeps between captures, fired a few times a day.
+# Overlapping runs are harmless: the unique index on
+# (market_ticker, snap_slot) makes duplicate captures no-ops.
 
 on:
   schedule:
-    - cron: '*/30 * * * *'      # every 30 min, all hours (UTC)
-  workflow_dispatch:            # manual button for the first test run
+    - cron: '0 * * * *'       # top of every hour, UTC
+  workflow_dispatch:          # manual button
 
 concurrency:
   group: log-kalshi-prices
-  cancel-in-progress: false     # never cancel a run mid-write
+  cancel-in-progress: false   # never cancel a run mid-write
 
 jobs:
   log:
