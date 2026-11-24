@@ -93,6 +93,37 @@ SIGN CONVENTION — read before interpreting any bias number.
 
 HISTORY WORTH KEEPING
 =====================
+V5.33.0 BIAS LOOP FIX (the V5.31 change, which was lost). compute_bias_correction
+learned from `actual - consensus`. But consensus is rewritten through 5pm and
+carries an obs_high floor, so by settlement it is anchored to the observed high
+and the residual is ~0 BY CONSTRUCTION -- the loop graded itself against an
+answer it had already peeked at. It converged to zero: monthly avg
+bias_correction ran 0.16, 0.13, 0.00, 0.07, 0.14 Jul-Nov 2026 while the real
+NWS cold bias was +1.3F and rising. Now it learns from `actual - forecast`
+(the NWS column, which observations never overwrite).
+
+V5.33.0 STALE WINDOW FIX. sb_fetch_city() asks for order=date.asc limit=200.
+Most cities now have more than 200 settled days, so it returned the OLDEST 200
+and stopped roughly a month short of today -- bias learned from stale rows,
+drifting further out of date daily. compute_bias_correction now uses
+sb_fetch_city_recent(), which orders date.desc explicitly. sb_fetch_city() is
+UNCHANGED for its other callers.
+
+V5.33.0 n_recent 10 -> 30. Daily scatter around this bias is ~2.3F, nearly
+twice its ~1.3F mean, so a 10-day trimmed mean is mostly noise. 30 days
+measured +3.7pp on exact 2F-bracket hit rate across 3,661 city-days, six of
+seven months positive, >3 sigma.
+
+⚠️ NWS_BIAS_BOOST_MULTIPLIER (1.2x for DC, OKC, Denver, Austin, San Antonio)
+was tuned against the OLD consensus-based signal, which had collapsed to ~0, so
+it was multiplying nothing. It now multiplies a live number for the first time.
+Left in deliberately (do not change two things at once) -- re-check those five
+after a month and remove it if they over-correct.
+
+⚠️ The correction is measured on NWS but ADDED to consensus, and consensus is
+not NWS. Approximate rather than exact; strictly better than the ~0 it
+replaces, but the +3.7pp figure was measured on NWS+bias, not consensus+bias.
+
 V5.32.0 WETHR REMOVED FROM OBSERVATIONS. The wethr API is a Pro-plan feature
 and that subscription was retired, so WETHR_API_KEY stopped authenticating
 around 2026-11-08. Three call sites, three different outcomes:
@@ -267,6 +298,27 @@ def sb_fetch_city(city):
         return []
 
 
+def sb_fetch_city_recent(city, limit=120):
+    """Most recent settlements for a city, returned OLDEST-first.
+
+    sb_fetch_city() uses order=date.asc with limit=200. Once a city has more
+    than 200 settled days that returns the OLDEST 200 and silently stops about
+    a month short of today, so anything read from rows[-n:] is a month stale.
+    This asks for the newest rows explicitly and reverses them, so the caller's
+    rows[-n:] still means "the most recent n".
+
+    sb_fetch_city() is left untouched for its other callers.
+    """
+    try:
+        r = requests.get(sb_url('settlements'), headers=sb_headers(),
+                         params={'city': 'eq.' + city, 'order': 'date.desc',
+                                 'limit': str(limit)}, timeout=10)
+        rows = r.json() if r.status_code == 200 else []
+        return list(reversed(rows))
+    except Exception:
+        return []
+
+
 def sb_fetch_today(city):
     today = get_eastern_date()
     try:
@@ -335,26 +387,54 @@ def _trimmed_mean(errors):
     return sum(s) / len(s)
 
 
-def compute_bias_correction(city, n_recent=10):
-    rows = sb_fetch_city(city)
+def compute_bias_correction(city, n_recent=30):
+    """V5.33.0. Learn the cold bias from actual - FORECAST, not actual - consensus.
+
+    WHY THE OLD VERSION COULD NOT WORK. consensus is rewritten through 5pm and
+    carries an obs_high floor, so the stored value is anchored to the observed
+    high -- very close to actual. `actual - consensus` therefore measures ~0 by
+    construction, however wrong the MORNING forecast was. The loop graded
+    itself against an answer it had already seen and zeroed itself out:
+
+        monthly avg bias_correction, 2026
+        Mar 0.08  Apr 0.70  May 0.46  Jun 0.59
+        Jul 0.16  Aug 0.13  Sep 0.00  Oct 0.07  Nov 0.14
+
+    while the real NWS bias over the same window ran +0.70 to +1.68F.
+
+    `forecast` is the raw NWS point forecast and is never overwritten by
+    observations, so actual - forecast is a clean read on how cold the public
+    forecast ran. Positive = settlement came in WARMER than forecast = the
+    forecast runs COLD = add it. Same sign convention as the rest of this file.
+
+    MEASURED: +3.7 percentage points on exact 2F-bracket hit rate across 3,661
+    city-days (2026-05 to 2026-11), positive in six months of seven, >3 sigma.
+    November exact-bracket hit went 27.5% -> 33.1%.
+
+    n_recent 10 -> 30: daily scatter around this bias is ~2.3F, nearly twice
+    the ~1.3F mean, so a 10-day window is mostly noise.
+    """
+    rows = sb_fetch_city_recent(city, limit=max(120, n_recent * 3))
     complete = [r for r in rows
-                if r.get('actual') is not None and r.get('consensus') is not None]
+                if r.get('actual') is not None and r.get('forecast') is not None]
     if len(complete) < 3:
         prior_city = REGIONAL_PRIOR_BIAS.get(city)
         if prior_city:
-            prior_rows = sb_fetch_city(prior_city)
+            prior_rows = sb_fetch_city_recent(prior_city, limit=max(120, n_recent * 3))
             prior_complete = [r for r in prior_rows
                               if r.get('actual') is not None
-                              and r.get('consensus') is not None]
+                              and r.get('forecast') is not None]
             if len(prior_complete) >= 3:
                 recent = prior_complete[-n_recent:]
-                errors = [r['actual'] - r['consensus'] for r in recent]
+                errors = [r['actual'] - r['forecast'] for r in recent]
                 return round(max(-3.0, min(3.0, _trimmed_mean(errors))), 2), len(complete)
         return 0.0, len(complete)
     recent = complete[-n_recent:]
-    errors = [r['actual'] - r['consensus'] for r in recent]
+    errors = [r['actual'] - r['forecast'] for r in recent]
     med_error = _trimmed_mean(errors)
     if city in NWS_BIAS_BOOST_CITIES:
+        # Tuned against the OLD (collapsed-to-zero) signal. Multiplying a live
+        # number for the first time -- re-check these five after a month.
         med_error = med_error * NWS_BIAS_BOOST_MULTIPLIER
     return round(max(-3.0, min(3.0, med_error)), 2), len(recent)
 
