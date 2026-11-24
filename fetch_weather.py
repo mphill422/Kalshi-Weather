@@ -93,6 +93,18 @@ SIGN CONVENTION — read before interpreting any bias number.
 
 HISTORY WORTH KEEPING
 =====================
+V5.34.0 STALENESS GATE SPLIT. V5.32's _obs_live_row() rejected any row with
+is_stale=true, so obs_high came back null for every city -- obs_live flags
+stale at well under an hour and obs_age_min sits at 45-50m most of the day, so
+the gate was effectively always closed. The data was fine the whole time
+(day_max_f and precise_max_f populated for all 20 cities); the filter was wrong.
+
+Staleness means different things for the two readings:
+  temp_f     - a 45-minute-old "current" temperature IS misleading. Still gated.
+  day_max_f  - a running maximum can only go UP, so an old one is a conservative
+               floor. That is exactly what a max() clamp wants. No longer gated
+               on is_stale; only an absurd age (>6h) is rejected.
+
 V5.33.0 BIAS LOOP FIX (the V5.31 change, which was lost). compute_bias_correction
 learned from `actual - consensus`. But consensus is rewritten through 5pm and
 carries an obs_high floor, so by settlement it is anchored to the observed high
@@ -523,8 +535,8 @@ def _obs_live_row(city):
                     'limit': '1'}, timeout=10)
         if r.status_code == 200:
             rows = r.json()
-            if rows and not rows[0].get('is_stale'):
-                row = rows[0]
+            if rows:
+                row = rows[0]       # staleness is judged by the CALLER, not here
     except Exception:
         row = None
     _OBS_LIVE_CACHE[city] = row
@@ -542,6 +554,14 @@ def fetch_obs_high(city):
     row = _obs_live_row(city)
     if not row:
         return None
+    # NOT gated on is_stale: a running max only ever rises, so a slightly old
+    # one is a conservative floor. Only an absurd age is rejected.
+    age = row.get('obs_age_min')
+    try:
+        if age is not None and float(age) > 360:
+            return None
+    except (TypeError, ValueError):
+        pass
     v = row.get('precise_max_f')
     if v is None:
         v = row.get('day_max_f')
@@ -560,6 +580,8 @@ def fetch_current_temp(city):
     """
     row = _obs_live_row(city)
     if not row:
+        return None
+    if row.get('is_stale'):
         return None
     age = row.get('obs_age_min')
     try:
