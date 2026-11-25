@@ -6,45 +6,62 @@ name: Log Kalshi Prices
 # Save as .github/workflows/log_kalshi_prices.yml
 # Uses the same four secrets kalshi_settlements.py already uses. Nothing new.
 #
-# ── WHY HOURLY AND NOT */30 ────────────────────────────────────────────────
-# First attempt used '*/30 * * * *'. Over the first 21 hours GitHub honoured
-# exactly ONE of ~42 scheduled fires (run #5, 2026-11-23 09:20). Scheduled
-# workflows are best-effort and high-frequency crons are the first thing
-# dropped under load.
+# ── WHY A LOOP INSTEAD OF A FREQUENT CRON ─────────────────────────────────
+# Attempt 1: '*/30 * * * *'. Over 21 hours GitHub honoured ONE of ~42 fires.
+# Attempt 2: '0 * * * *'  . Over 26 hours GitHub honoured ~ONE of ~26 fires.
+# Other jobs in this repo run fine, so this is GitHub deprioritising scheduled
+# workflows generally -- they are best-effort and get dropped under load.
 #
-# Hourly is what every other job in this repo already runs at successfully --
-# health_monitor confirms the snapshots job hitting "10 of 10 hours" -- so the
-# throttling is specific to the */30 pattern, not to this repo.
+# So: stop depending on how OFTEN the cron fires, and depend on it firing at
+# all. Each start now captures for 5h30m, taking a snapshot on every :00 and
+# :30 boundary -- about 11 per start. Four starts a day, deliberately
+# overlapping, so a dropped fire is covered by its neighbour.
 #
-# If 30-minute granularity is ever genuinely needed (the repricing-lag
-# question), the fix is NOT a faster cron. It is one long-running job that
-# loops internally and sleeps between captures, fired a few times a day.
-# Overlapping runs are harmless: the unique index on
-# (market_ticker, snap_slot) makes duplicate captures no-ops.
+# Overlap is free: the unique index on (market_ticker, snap_slot) makes a
+# duplicate capture a no-op insert. Two jobs hitting the same slot write one row.
+#
+# Runner cost is zero -- public repos get unlimited GitHub-hosted minutes.
 
 on:
   schedule:
-    - cron: '0 * * * *'       # top of every hour, UTC
-  workflow_dispatch:          # manual button
+    # 4 overlapping starts, covering the US trading day and then some
+    - cron: '0 13,16,19,22 * * *'
+  workflow_dispatch:
 
-concurrency:
-  group: log-kalshi-prices
-  cancel-in-progress: false   # never cancel a run mid-write
+# NO concurrency group on purpose. Overlapping runs are the redundancy that
+# makes this work, and the DB index already de-duplicates them.
 
 jobs:
   log:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 345          # must exceed the 330-minute loop below
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - run: pip install requests cryptography
-      - name: Capture market snapshot
+      - name: Capture market snapshots for 5h30m
         env:
           KALSHI_API_KEY_ID:    ${{ secrets.KALSHI_API_KEY_ID }}
           KALSHI_PRIVATE_KEY:   ${{ secrets.KALSHI_PRIVATE_KEY }}
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: python log_kalshi_prices.py
+        run: |
+          END=$(( $(date +%s) + 19800 ))     # 5h30m from now
+          N=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            N=$((N+1))
+            echo "::group::capture $N  $(date -u +%H:%M:%SZ)"
+            # '|| true' is load-bearing: the script exits 1 when too few series
+            # have live markets, which is normal overnight. One bad capture must
+            # not end a 5-hour run.
+            python log_kalshi_prices.py || echo "capture $N failed, continuing"
+            echo "::endgroup::"
+            NOW=$(date +%s)
+            NEXT=$(( (NOW / 1800 + 1) * 1800 + 5 ))   # next :00 or :30, +5s
+            [ "$NEXT" -ge "$END" ] && break
+            echo "sleeping $(( NEXT - NOW ))s until $(date -u -d "@$NEXT" +%H:%M:%SZ)"
+            sleep $(( NEXT - NOW ))
+          done
+          echo "done: $N captures this run"
